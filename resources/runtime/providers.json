@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "providers": {
+    "openai": {
+      "name": "OpenAI",
+      "driver": "openai",
+      "baseURL": "https://api.openai.com/v1",
+      "api": "https://developers.openai.com/api/docs",
+      "auth": "api",
+      "models": []
+    },
+    "anthropic": {
+      "name": "Anthropic",
+      "driver": "anthropic",
+      "baseURL": "https://api.anthropic.com/v1",
+      "api": "https://platform.claude.com/docs/en/api/overview",
+      "auth": "api",
+      "models": []
+    },
+    "mimo": {
+      "name": "Xiaomi MiMo",
+      "driver": "openai-compatible",
+      "baseURL": "https://token-plan-cn.xiaomimimo.com/v1",
+      "auth": "api",
+      "models": [
+        {
+          "id": "mimo-v2.5-pro",
+          "name": "MiMo V2.5 Pro",
+          "context": 300000,
+          "output": 131072,
+          "reasoning": true,
+          "attachment": false
+        },
+        {
+          "id": "mimo-v2.5",
+          "name": "MiMo V2.5",
+          "context": 300000,
+          "output": 131072,
+          "reasoning": true,
+          "attachment": true
+        }
+      ]
+    }
+  }
+}

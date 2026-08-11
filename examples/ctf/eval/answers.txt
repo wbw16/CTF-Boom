@@ -1,0 +1,7 @@
+# slug<TAB>flag. This file is never copied into a run workspace.
+warmup-base64	flag{layers_all_the_way_down}
+xor-repeating	flag{xor_is_not_encryption_either}
+zip-comment	flag{comments_are_metadata_too}
+elf-strcmp	flag{static_analysis_beats_guessing}
+png-lsb	flag{look_between_the_pixels}
+pcap-creds	flag{plaintext_protocols_leak}

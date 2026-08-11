@@ -1,0 +1,262 @@
+import { afterEach, expect, test } from "bun:test"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+import { submitCandidate } from "../src/candidate-submission.ts"
+import { GuiRunner } from "../src/runner.ts"
+import type {
+  AgentRuntime,
+  RuntimeConversation,
+  RuntimeEvent,
+  RuntimeHandle,
+  RuntimeProviderCatalog,
+} from "../src/runtime-contract.ts"
+
+const temporary: string[] = []
+afterEach(async () => Promise.all(
+  temporary.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+))
+
+const usage = { input: 10, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }
+
+async function hotSwitchFixture() {
+  const interpreter = Bun.which("python3")
+  if (!interpreter) throw new Error("python3 is required for this test")
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-hot-switch-"))
+  temporary.push(root)
+  const source = path.join(root, "challenges", "sample")
+  await mkdir(source, { recursive: true })
+  await writeFile(path.join(source, "README.md"), "continue across a model switch")
+
+  let releaseTool: (() => void) | undefined
+  const toolMayFinish = new Promise<void>((resolve) => { releaseTool = resolve })
+  let promptCount = 0
+  let oldPromptResolve: (() => void) | undefined
+  let oldAborts = 0
+  const prompts: Array<{ model: string; text: string }> = []
+  const resumed: string[] = []
+  const closed: number[] = []
+  let generation = 0
+
+  const catalog = (): RuntimeProviderCatalog => ({
+    connected: ["openai"],
+    all: [{
+      id: "openai",
+      name: "OpenAI",
+      models: {
+        old: {
+          id: "old",
+          name: "Old",
+          limit: { context: 300_000, output: 16_384 },
+          reasoning: true,
+          attachment: true,
+        },
+        next: {
+          id: "next",
+          name: "Next",
+          limit: { context: 300_000, output: 16_384 },
+          reasoning: true,
+          attachment: false,
+        },
+      },
+    }],
+  })
+
+  const conversation = (directory: string, id: string): RuntimeConversation => ({
+    id,
+    async events() {
+      const turn = promptCount
+      return {
+        async *[Symbol.asyncIterator]() {
+          if (turn !== 0) return
+          yield {
+            type: "tool-state",
+            sessionID: id,
+            callID: "tool-1",
+            tool: "bash",
+            state: { status: "running", input: { command: "extract" } },
+          } as RuntimeEvent
+          await toolMayFinish
+          yield {
+            type: "tool-state",
+            sessionID: id,
+            callID: "tool-1",
+            tool: "bash",
+            state: { status: "completed", title: "artifact extracted" },
+          } as RuntimeEvent
+        },
+      }
+    },
+    async prompt(request) {
+      const turn = promptCount++
+      prompts.push({ model: request.model, text: request.text })
+      if (turn === 0) {
+        await new Promise<void>((resolve) => { oldPromptResolve = resolve })
+        return { usage, cost: 0, finish: "cancelled", parts: [{ type: "text", text: "old partial" }] }
+      }
+      await submitCandidate({
+        directory,
+        sessionID: id,
+        candidate: "flag{switched}",
+      })
+      return { usage, cost: 0, finish: "stop", parts: [{ type: "text", text: "continued" }] }
+    },
+    async abort() {
+      oldAborts += 1
+      oldPromptResolve?.()
+    },
+    async activeContext() {
+      return [{
+        id: "tool-result-1",
+        role: "tool",
+        parts: [{
+          type: "tool",
+          tool: "bash",
+          callID: "tool-1",
+          state: "completed",
+          input: '{"command":"extract"}',
+          output: "artifact path: work/result.bin",
+        }],
+      }]
+    },
+  })
+
+  const launcher = async (): Promise<RuntimeHandle> => {
+    const current = ++generation
+    const agent: AgentRuntime = {
+      async createConversation(input) {
+        return conversation(input.directory, "session-hot")
+      },
+      async resumeConversation(input) {
+        resumed.push(input.id)
+        return conversation(input.directory, input.id)
+      },
+    }
+    return {
+      backend: `fake-${current}`,
+      version: "test",
+      capabilities: {
+        eventStreaming: true,
+        toolCalls: true,
+        reasoning: true,
+        attachments: true,
+        web: true,
+        cancellation: true,
+        providerManagement: true,
+        providerOAuth: true,
+        compaction: false,
+      },
+      agent,
+      provider: {
+        async listProviders() { return catalog() },
+        async discoverModels() { return Object.values(catalog().all[0]!.models) },
+        async listProviderAuth() { return { openai: [{ type: "api", label: "API Key" }] } },
+        async setProviderCredential() {},
+        async authorizeProviderOAuth() { return { url: "https://example.test/oauth" } },
+        async completeProviderOAuth() {},
+        async removeProviderCredential() {},
+      },
+      close() { closed.push(current) },
+    }
+  }
+
+  const runner = new GuiRunner(root, launcher)
+  await runner.enqueue({
+    challenges: [{
+      slug: "sample",
+      directory: source,
+      description: "continue across a model switch",
+      files: [],
+      flagFormat: "flag\\{[^}]+\\}",
+    }],
+    model: "openai/old",
+    modelPolicy: { economy: "openai/old", strong: "openai/old" },
+    limits: { tokens: 100_000, repeats: 5, timeout: 60_000 },
+    flagFormat: "flag\\{[^}]+\\}",
+    pythonInterpreter: interpreter,
+  })
+  for (let attempt = 0; attempt < 1_000 && promptCount === 0; attempt += 1)
+    await Bun.sleep(2)
+  expect(promptCount).toBe(1)
+
+  return {
+    root,
+    runner,
+    releaseTool: () => releaseTool?.(),
+    prompts,
+    resumed,
+    closed,
+    get oldAborts() { return oldAborts },
+    get generation() { return generation },
+  }
+}
+
+async function waitForIdle(runner: GuiRunner) {
+  for (let attempt = 0; attempt < 1_000 && runner.hasWork(); attempt += 1)
+    await Bun.sleep(5)
+  expect(runner.hasWork()).toBe(false)
+}
+
+test("hot-switches an active model only after its running tool completes", async () => {
+  const fixture = await hotSwitchFixture()
+  try {
+    const result = await fixture.runner.applyLiveModelSettings({
+      economyModel: "openai/old",
+      strongModel: "openai/next",
+      consultModels: [],
+      blindReview: false,
+      consultOnCompaction: false,
+    })
+    expect(result.active).toBe(1)
+    expect(result.warnings).toContain("新模型不支持图片附件；需要通过文件或命令行工具读取相关内容")
+    expect(fixture.oldAborts).toBe(0)
+
+    fixture.releaseTool()
+    await waitForIdle(fixture.runner)
+
+    expect(fixture.oldAborts).toBe(1)
+    expect(fixture.prompts.map((item) => item.model)).toEqual(["openai/old", "openai/next"])
+    expect(fixture.prompts[1]?.text).toContain("兼容性影响：新模型不支持图片附件")
+    expect(fixture.resumed).toEqual(["session-hot"])
+    const [runID] = await readdir(path.join(fixture.root, "runs", "sample"))
+    const task = JSON.parse(await readFile(path.join(fixture.root, "runs", "sample", runID!, "task.json"), "utf8"))
+    expect(task.turns).toMatchObject([
+      { model: "openai/old", stop: "switched" },
+      { model: "openai/next", candidates: ["flag{switched}"] },
+    ])
+  } finally {
+    await fixture.runner.close()
+  }
+})
+
+test("reloads an active Provider without closing the old runtime before handoff", async () => {
+  const previousHome = process.env.BOOM_HOME
+  const boomHome = await mkdtemp(path.join(os.tmpdir(), "boom-hot-provider-home-"))
+  temporary.push(boomHome)
+  process.env.BOOM_HOME = boomHome
+  const fixture = await hotSwitchFixture()
+  try {
+    await fixture.runner.saveProvider({
+      id: "openai",
+      custom: false,
+      disabled: false,
+      name: "OpenAI updated",
+      models: [],
+      hiddenModels: [],
+    })
+    expect(fixture.generation).toBe(2)
+    expect(fixture.closed).not.toContain(1)
+    expect(fixture.oldAborts).toBe(0)
+
+    fixture.releaseTool()
+    await waitForIdle(fixture.runner)
+
+    expect(fixture.resumed).toEqual(["session-hot"])
+    expect(fixture.prompts.map((item) => item.model)).toEqual(["openai/old", "openai/old"])
+    expect(fixture.closed).toContain(1)
+  } finally {
+    await fixture.runner.close()
+    if (previousHome === undefined) delete process.env.BOOM_HOME
+    else process.env.BOOM_HOME = previousHome
+  }
+})

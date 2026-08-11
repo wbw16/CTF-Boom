@@ -1,0 +1,257 @@
+{
+  "version": 1,
+  "tools": {
+    "bash": {
+      "description": "Run full Bash syntax in the isolated task workspace with bounded output, clean environment, and task-scoped process lifetime.",
+      "implementation": "boom",
+      "sideEffect": "process",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1, "maxLength": 1048576 },
+          "workdir": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "timeout": { "type": "integer", "minimum": 100, "maximum": 600000 }
+        }
+      }
+    },
+    "read": {
+      "description": "Read bounded, line-numbered content from a task-relative regular file without following symbolic links.",
+      "implementation": "boom",
+      "sideEffect": "read",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["filePath"],
+        "properties": {
+          "filePath": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "offset": { "type": "integer", "minimum": 1, "maximum": 1000000000 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 2000 }
+        }
+      }
+    },
+    "edit": {
+      "description": "Replace an exact string in an existing task-relative file under work/ without following symbolic links.",
+      "implementation": "boom",
+      "sideEffect": "write",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["filePath", "oldString", "newString"],
+        "properties": {
+          "filePath": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "oldString": { "type": "string", "minLength": 1, "maxLength": 1048576 },
+          "newString": { "type": "string", "maxLength": 1048576 },
+          "replaceAll": { "type": "boolean" }
+        }
+      }
+    },
+    "write": { "description": "Write a file through the compatibility runtime.", "implementation": "compatibility", "sideEffect": "write", "schema": { "source": "opencode-compatibility", "version": 1 } },
+    "list": {
+      "description": "List bounded entries in a task-relative directory without following symbolic links.",
+      "implementation": "boom",
+      "sideEffect": "read",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "offset": { "type": "integer", "minimum": 1, "maximum": 1000000000 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+        }
+      }
+    },
+    "glob": {
+      "description": "Find bounded task-relative paths matching a glob pattern without traversing symbolic links.",
+      "implementation": "boom",
+      "sideEffect": "read",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pattern"],
+        "properties": {
+          "pattern": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+        }
+      }
+    },
+    "grep": {
+      "description": "Search bounded text files under a task-relative directory with a regular expression and no symbolic-link traversal.",
+      "implementation": "boom",
+      "sideEffect": "read",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pattern"],
+        "properties": {
+          "pattern": { "type": "string", "minLength": 1, "maxLength": 1000 },
+          "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "include": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+        }
+      }
+    },
+    "task": {
+      "description": "Run a bounded Boom worker in an isolated child workspace and return its final report to this tool call.",
+      "implementation": "runtime",
+      "sideEffect": "process",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["description", "prompt", "subagent_type"],
+        "properties": {
+          "description": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "prompt": { "type": "string", "minLength": 1, "maxLength": 65536 },
+          "subagent_type": { "enum": ["boom-worker"] }
+        }
+      }
+    },
+    "skill": {
+      "description": "Load one named Boom-owned skill resource and its bounded supporting-file inventory.",
+      "implementation": "boom",
+      "sideEffect": "read",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }
+      }
+    },
+    "websearch": {
+      "description": "Search the public web through Boom's bounded Network Broker and configured search provider.",
+      "implementation": "boom",
+      "sideEffect": "network",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string", "minLength": 1, "maxLength": 2000 },
+          "numResults": { "type": "integer", "minimum": 1, "maximum": 20 },
+          "livecrawl": { "enum": ["fallback", "preferred"] },
+          "type": { "enum": ["auto", "fast", "deep"] },
+          "contextMaxCharacters": { "type": "integer", "minimum": 1000, "maximum": 50000 }
+        }
+      }
+    },
+    "webfetch": {
+      "description": "Fetch one HTTP(S) resource through Boom's DNS-pinned, redirect-bounded Network Broker.",
+      "implementation": "boom",
+      "sideEffect": "network",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string", "minLength": 1, "maxLength": 8192 },
+          "format": { "enum": ["text", "markdown", "html"] },
+          "timeout": { "type": "integer", "minimum": 1, "maximum": 120 }
+        }
+      }
+    },
+    "todowrite": {
+      "description": "Replace the current runtime session's bounded, ephemeral todo list.",
+      "implementation": "boom",
+      "sideEffect": "memory",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["todos"],
+        "properties": {
+          "todos": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["content", "status", "priority"],
+              "properties": {
+                "content": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                "status": { "enum": ["pending", "in_progress", "completed", "cancelled"] },
+                "priority": { "enum": ["high", "medium", "low"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "boom-exec": {
+      "description": "Run one argv-based command through Boom's controlled executor.",
+      "implementation": "boom",
+      "sideEffect": "process",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["program"],
+        "properties": {
+          "program": { "type": "string", "minLength": 1 },
+          "args": { "type": "array", "items": { "type": "string" } },
+          "cwd": { "type": "string" },
+          "mode": { "enum": ["managed", "isolated", "static-only"] },
+          "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000 },
+          "maxOutputBytes": { "type": "integer", "minimum": 1024, "maximum": 1000000 },
+          "network": { "type": "boolean" },
+          "purpose": { "enum": ["analysis", "install"] }
+        }
+      }
+    },
+    "ctf-note": {
+      "description": "Maintain durable cross-turn findings in NOTES.md.",
+      "implementation": "boom",
+      "sideEffect": "memory",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "text"],
+        "properties": {
+          "kind": { "enum": ["note", "ruled-out", "checkpoint"] },
+          "text": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "ctf-consult": {
+      "description": "Request an independent 2-4 model consultation when the current solving approach needs new ideas; ends this solve turn and resumes it with the synthesized plan.",
+      "implementation": "boom",
+      "sideEffect": "memory",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reason"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        }
+      }
+    },
+    "ctf-submit": {
+      "description": "Record the current candidate and end the active solver turn.",
+      "implementation": "boom",
+      "sideEffect": "write",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["candidate"],
+        "properties": {
+          "candidate": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        }
+      }
+    }
+  },
+  "profiles": {
+    "solver": {
+      "tools": ["bash", "read", "edit", "write", "list", "glob", "grep", "task", "skill", "websearch", "webfetch", "todowrite", "boom-exec", "ctf-note", "ctf-consult", "ctf-submit"],
+      "effects": { "write": "run", "process": "allow", "network": "allow", "memory": "allow", "submit": "allow", "delegate": "allow" }
+    },
+    "worker": {
+      "tools": ["bash", "read", "edit", "write", "list", "glob", "grep", "task", "skill", "websearch", "webfetch", "todowrite", "boom-exec", "ctf-note", "ctf-submit"],
+      "effects": { "write": "branch", "process": "allow", "network": "allow", "memory": "allow", "submit": "allow", "delegate": "allow" }
+    },
+    "reasoning": {
+      "tools": ["read", "list", "glob", "grep"],
+      "effects": { "write": "none", "process": "deny", "network": "deny", "memory": "deny", "submit": "deny", "delegate": "deny" }
+    }
+  }
+}

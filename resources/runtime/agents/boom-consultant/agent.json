@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "id": "boom-consultant",
+  "mode": "primary",
+  "role": "consultant",
+  "description": "Boom's read-only planning role for one multi-model consultation turn.",
+  "color": "#A78BFA",
+  "temperature": 0.4,
+  "toolProfile": "reasoning",
+  "output": "prompt-contract"
+}

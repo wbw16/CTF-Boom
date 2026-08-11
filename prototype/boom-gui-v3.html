@@ -1,0 +1,919 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boom</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#161920; --panel2:#1c2028; --raise:#222730;
+  --line:#282d36; --line2:#353b46;
+  --tx:#e6eaef; --mu:#8b929c; --dim:#5a6170;
+  --blue:#58a6ff; --green:#3fb950; --amber:#d29922; --red:#f85149; --purple:#bc8cff;
+  --mono:"SF Mono",Menlo,Consolas,"Cascadia Code",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  --listw:420px;
+  --radius:8px;
+  --radius-sm:5px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--tx);
+  font:13px/1.5 var(--sans);-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:var(--radius-sm)}
+code,.m{font-family:var(--mono)}
+::-webkit-scrollbar{width:7px;height:7px}
+::-webkit-scrollbar-thumb{background:#2d333b;border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:#3b424c}
+::-webkit-scrollbar-track{background:transparent}
+
+.app{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto 1fr auto;
+  height:100%;width:100%;min-width:0}
+
+/* ───── top bar ───── */
+.top{display:flex;align-items:center;gap:12px;padding:10px 16px;
+  background:linear-gradient(180deg,#1a1f27 0%,var(--panel) 100%);
+  border-bottom:1px solid var(--line);flex-wrap:wrap;min-width:0}
+.root{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 300px}
+.root .path{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;
+  font-family:var(--mono);font-size:11px;color:var(--mu);padding:2px 6px;
+  background:var(--panel2);border-radius:var(--radius-sm);max-width:320px}
+.btn{background:var(--raise);border:1px solid var(--line2);border-radius:var(--radius-sm);
+  padding:5px 12px;font-size:12px;white-space:nowrap;transition:all .15s}
+.btn:hover{background:#2b313a;border-color:#4a525c;transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+.btn.go{background:linear-gradient(135deg,#1f6feb,#388bfd);border-color:#4a9eff;
+  color:#fff;font-weight:600;box-shadow:0 2px 8px rgba(31,111,235,.3)}
+.btn.go:hover{background:linear-gradient(135deg,#388bfd,#58a6ff);
+  box-shadow:0 4px 12px rgba(31,111,235,.4)}
+.btn.stop{background:linear-gradient(135deg,#6e2b2b,#8b3434);border-color:#a34444;
+  color:#ffb4ab;box-shadow:0 2px 8px rgba(158,50,50,.25)}
+.btn.stop:hover{background:linear-gradient(135deg,#8b3434,#a34444)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--mu);padding:5px 8px}
+.btn.ghost:hover{background:var(--raise);color:var(--tx);transform:none}
+.btn.tiny{padding:3px 9px;font-size:11px;border-radius:4px}
+.knobs{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--mu);
+  flex:0 1 auto;flex-wrap:wrap}
+.knob{display:flex;align-items:center;gap:5px}
+.knob select,.knob input{background:var(--panel2);border:1px solid var(--line2);
+  border-radius:var(--radius-sm);padding:4px 7px;font-size:11px;font-family:var(--mono);
+  transition:border-color .15s}
+.knob select:hover,.knob input:hover{border-color:#4a525c}
+.knob select:focus,.knob input:focus{border-color:var(--blue);outline:none}
+.knob select{width:210px;max-width:34vw}
+.knob input{width:62px;text-align:right}
+.sep{width:1px;height:24px;background:linear-gradient(180deg,transparent,var(--line2),transparent)}
+
+/* pending-flag counter */
+.pending{display:flex;align-items:center;gap:8px;background:linear-gradient(135deg,#0d2818,#162b1e);
+  border:1px solid #2c5a30;border-radius:var(--radius);padding:5px 14px;
+  box-shadow:0 2px 8px rgba(63,185,80,.1);transition:all .2s;cursor:pointer}
+.pending:hover{border-color:#3fb950;box-shadow:0 4px 12px rgba(63,185,80,.2)}
+.pending b{font:700 20px var(--mono);color:var(--green);line-height:1}
+.pending span{font-size:10px;color:#6fbf73;line-height:1.15}
+.pending.zero{background:var(--panel2);border-color:var(--line2);box-shadow:none}
+.pending.zero b{color:var(--dim)}
+.pending.zero span{color:var(--dim)}
+
+/* ───── body split ───── */
+.body{display:grid;grid-template-columns:minmax(280px,var(--listw)) minmax(0,1fr);
+  min-height:0;min-width:0;overflow:hidden}
+.left{display:flex;flex-direction:column;min-height:0;min-width:0;
+  border-right:1px solid var(--line);
+  background:var(--panel)}
+.right{display:flex;flex-direction:column;min-height:0;min-width:0;
+  overflow:hidden;background:var(--bg)}
+
+/* ───── queue ───── */
+.qhead{display:flex;align-items:center;gap:8px;padding:10px 14px;
+  border-bottom:1px solid var(--line);background:var(--panel2)}
+.qhead .lbl{font-size:10px;font-weight:700;letter-spacing:.6px;color:var(--mu);
+  text-transform:uppercase}
+.qhead .find{flex:1;background:var(--bg);border:1px solid var(--line2);
+  border-radius:var(--radius-sm);padding:5px 10px;font-size:12px;min-width:0;
+  transition:border-color .15s}
+.qhead .find::placeholder{color:var(--dim)}
+.qhead .find:focus{border-color:var(--blue);outline:none}
+.queue{flex:1;overflow:auto;min-height:0;padding:4px 0}
+
+.grp{padding:12px 14px 5px;font-size:10px;font-weight:700;letter-spacing:.5px;
+  color:var(--dim);text-transform:uppercase;display:flex;align-items:center;gap:8px;
+  cursor:pointer;user-select:none}
+.grp:hover{color:var(--mu)}
+.grp .caret{font-size:9px;width:8px;flex:none;font-weight:400}
+.grp.shut{padding-bottom:12px}
+.grp i{flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent);font-style:normal}
+.grp em{font-style:normal;font-family:var(--mono);color:var(--dim);
+  background:var(--panel2);padding:1px 6px;border-radius:3px;font-size:9px}
+
+.item{display:block;width:100%;text-align:left;background:transparent;border:0;
+  border-left:3px solid transparent;padding:10px 14px 10px 12px;position:relative;
+  cursor:pointer;transition:all .12s}
+.item:hover{background:var(--panel2)}
+.item.sel{background:var(--raise);border-left-color:var(--blue);
+  box-shadow:inset 0 0 0 1px rgba(88,166,255,.08)}
+.item.done{opacity:.55}
+.item.done:hover,.item.sel{opacity:1}
+.item .r1{display:flex;align-items:center;gap:8px}
+.item .r3{display:flex;align-items:center;gap:8px;margin-top:6px}
+.mtag{background:transparent;border:1px solid var(--line2);border-radius:4px;color:var(--dim);
+  font:10px var(--mono);padding:2px 7px;flex:none;transition:all .15s}
+.mtag:hover{border-color:var(--blue);color:var(--tx);background:rgba(88,166,255,.08)}
+.mtag.pin{border-color:#4a6a9a;background:#1a2540;color:#9dc2ff}
+.ctag{font-size:10px;color:var(--purple);flex:none}
+.kebab{background:transparent;border:0;color:var(--dim);font-size:14px;line-height:1;
+  padding:0 4px;flex:none;opacity:0;transition:opacity .15s}
+.item:hover .kebab,.item.sel .kebab{opacity:1}
+.kebab:hover{color:var(--tx)}
+
+/* row menu */
+.menu{position:fixed;z-index:50;background:var(--raise);border:1px solid var(--line2);
+  border-radius:var(--radius);padding:4px;box-shadow:0 12px 32px #000c;min-width:180px;
+  backdrop-filter:blur(8px)}
+.menu button{display:flex;width:100%;align-items:center;gap:8px;background:transparent;border:0;
+  border-radius:var(--radius-sm);padding:6px 10px;font-size:12px;color:var(--tx);text-align:left;
+  transition:background .1s}
+.menu button:hover{background:#343b44}
+.menu button.danger{color:#ffb4ab}
+.menu button.danger:hover{background:#3d2124}
+.menu button span:first-child{width:16px;color:var(--dim);text-align:center;font-family:var(--mono)}
+.menu hr{border:0;border-top:1px solid var(--line2);margin:4px 0}
+.menu .hd{padding:6px 10px 4px;font-size:9px;color:var(--dim);text-transform:uppercase;
+  letter-spacing:.5px}
+.menu button.on span:first-child{color:var(--blue)}
+
+.item .slug{font-family:var(--mono);font-size:13px;font-weight:500;color:var(--tx);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item.done .slug{color:var(--mu);font-weight:400}
+.item .runs{font:9px var(--mono);color:var(--dim);border:1px solid var(--line2);
+  border-radius:10px;padding:1px 6px;flex:none}
+.item .st{margin-left:auto;font-size:11px;flex:none;font-weight:600}
+.item .r2{display:flex;align-items:center;gap:6px;margin-top:4px;
+  font:11px var(--mono);color:var(--mu);min-height:15px}
+.item .r2 .why{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;opacity:.8}
+.item .r2 .num{flex:none;color:var(--dim)}
+.item .flag-list{display:grid;grid-template-columns:minmax(0,1fr);gap:4px;margin-top:5px}
+.item .flag{display:block;width:100%;max-width:100%;font:11px var(--mono);color:#7ee787;text-align:left;
+  background:linear-gradient(135deg,#0d2818,#162220);
+  border:1px solid #244a2a;border-radius:var(--radius-sm);padding:3px 8px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:copy}
+.item .flag:hover{border-color:#3fb950;background:#173222}
+.item .flag-source{color:#6fbf73}
+.item .flag.muted{color:var(--mu);background:var(--panel2);border-color:var(--line2)}
+.item .flag.muted:hover{border-color:#4a525c;background:var(--raise)}
+.item .flag.muted .flag-source{color:var(--dim)}
+.bar{height:3px;background:var(--line);border-radius:2px;margin-top:6px;overflow:hidden}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),#79c0ff);
+  transition:width .3s;border-radius:2px}
+.bar i.hot{background:linear-gradient(90deg,var(--amber),#e3b341)}
+.bar i.max{background:linear-gradient(90deg,var(--red),#ff7b72)}
+
+.c-run{color:var(--blue)} .c-ok{color:var(--green)} .c-warn{color:var(--amber)}
+.c-err{color:var(--red)} .c-dim{color:var(--dim)}
+.item .flag.miss{color:#e3b341;background:#241f14;border-color:#5a4a1e}
+.vflag.miss{color:#e3b341}
+
+/* ───── detail ───── */
+.dhead{display:flex;align-items:center;gap:10px;padding:12px 16px;
+  border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap;min-width:0}
+.dhead h2{margin:0;min-width:0;max-width:100%;font:600 16px var(--mono);
+  letter-spacing:-.3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dmeta{min-width:0;font-size:12px;color:var(--mu);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.dhead .sp{flex:1}
+
+/* flag output card */
+.verdict{margin:12px 16px 0;border:1px solid var(--line2);border-radius:var(--radius);
+  background:var(--panel);overflow:hidden;transition:border-color .2s}
+.verdict.candidate{border-color:#5a4a1e;
+  background:linear-gradient(135deg,#1d190f,#211d13);
+  box-shadow:0 2px 12px rgba(227,179,65,.06)}
+.verdict.accepted{border-color:#2c5a30;
+  background:linear-gradient(135deg,#0d1a12,#162018);
+  box-shadow:0 2px 12px rgba(63,185,80,.08)}
+.vrow{display:flex;align-items:center;gap:10px;padding:12px 14px}
+.vflag{flex:1;min-width:0;font:14px/1.4 var(--mono);color:#e3b341;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;user-select:all;font-weight:500}
+.verdict.accepted .vflag{color:#7ee787}
+.vflag.none{color:var(--dim);font-size:12px;font-weight:400}
+#flagActions{display:flex;gap:7px;align-items:center;flex:none}
+.vwhy{padding:0 14px 12px;font-size:11px;color:var(--mu);line-height:1.6}
+.vwhy:empty{display:none}
+.vwhy .src{font-family:var(--mono);color:var(--dim)}
+.vwhy .alt{display:inline-block;font-family:var(--mono);color:var(--mu);background:var(--panel2);
+  border:1px solid var(--line2);border-radius:4px;padding:1px 6px;margin:2px 4px 0 0;
+  cursor:pointer;transition:all .15s}
+.vwhy .alt:hover{border-color:var(--blue);color:var(--tx);background:rgba(88,166,255,.08)}
+.fmt{width:124px!important;text-align:left!important}
+.fmt.bad{border-color:var(--red)!important;color:#ff9b95}
+
+.alert{display:flex;gap:10px;align-items:flex-start;margin:12px 16px 0;padding:10px 14px;
+  border-radius:var(--radius);font-size:12px;line-height:1.6}
+.alert.warn{background:linear-gradient(135deg,#2a2415,#2e2818);border:1px solid #5a4a1e;color:#e3b341}
+.alert.err{background:linear-gradient(135deg,#2a1a1c,#2e1e20);border:1px solid #5a2d31;color:#ff9b95}
+.alert b{display:block;margin-bottom:3px;font-size:12px}
+.alert .m{color:inherit;opacity:.85;word-break:break-all}
+.alert .act{margin-left:auto;flex:none}
+
+.consultation{padding:14px 16px;display:grid;gap:12px}
+.consultation .cmeta{font:11px var(--mono);color:var(--dim)}
+.consultation section{border:1px solid var(--line2);border-radius:var(--radius);
+  background:var(--panel);padding:12px 14px}
+.consultation section.merged{border-color:#493b72;
+  background:linear-gradient(135deg,#181522,#201a2d)}
+.consultation h3{margin:0 0 7px;font-size:12px;color:var(--mu)}
+.consultation section.merged h3{color:#c4b5fd}
+.consultation pre{margin:0;white-space:pre-wrap;word-break:break-word;
+  font:12px/1.65 var(--mono);color:#c9d1d9}
+
+/* ───── tabs + panes ───── */
+.tabs{display:flex;gap:3px;padding:12px 16px 0;border-bottom:1px solid var(--line);
+  margin-top:12px;min-width:0;overflow-x:auto}
+.tabs button{background:transparent;border:0;border-bottom:2px solid transparent;
+  padding:6px 12px 8px;font-size:12px;color:var(--mu);transition:all .15s;
+  border-radius:var(--radius-sm) var(--radius-sm) 0 0}
+.tabs button:hover{color:var(--tx);background:rgba(255,255,255,.03)}
+.tabs button.on{color:var(--tx);border-bottom-color:var(--blue);font-weight:600}
+.tabs .sp{flex:1}
+.pane{flex:1;overflow:auto;min-height:0;display:none}
+.pane.on{display:block}
+
+pre.stream{margin:0;padding:14px 16px;font:12px/1.7 var(--mono);white-space:pre-wrap;
+  word-break:break-word;overflow-wrap:anywhere;color:#c9d1d9}
+pre.stream .t{color:var(--dim)}
+pre.stream .tool{color:var(--blue);font-weight:500}
+pre.stream .bad{color:var(--red)}
+pre.stream .good{color:var(--green);font-weight:500}
+pre.stream .say{color:#c9d1d9}
+
+/* ───── rendered markdown (NOTES.md / WRITEUP.md, read-only) ───── */
+.md{padding:14px 16px;font:13px/1.75 var(--sans);color:#c9d1d9}
+.md .md-h{margin:18px 0 8px;font-weight:600;line-height:1.3;color:#e6edf3}
+.md .md-h:first-child{margin-top:0}
+.md h1.md-h{font-size:18px}
+.md h2.md-h{font-size:16px}
+.md h3.md-h{font-size:14px}
+.md h4.md-h,.md h5.md-h,.md h6.md-h{font-size:13px;color:var(--mu)}
+.md p{margin:8px 0}
+.md ul,.md ol{margin:8px 0;padding-left:22px}
+.md li{margin:3px 0}
+.md code{font:12px var(--mono);background:var(--panel2);padding:1px 5px;border-radius:3px;
+  color:#e3b341;overflow-wrap:anywhere}
+.md pre.md-code{margin:10px 0;padding:11px 13px;background:var(--panel2);
+  border:1px solid var(--line);border-radius:var(--radius-sm);overflow-x:auto}
+.md pre.md-code code{background:none;padding:0;color:#c9d1d9;font-size:12px;line-height:1.6;
+  white-space:pre}
+.md blockquote{margin:8px 0;padding:2px 0 2px 12px;border-left:2px solid var(--line2);color:var(--mu)}
+.md a{color:var(--blue)}
+.md hr{border:0;border-top:1px solid var(--line);margin:14px 0}
+.md strong{color:#e6edf3;font-weight:600}
+
+.kv{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px 16px;
+  padding:14px 16px;font-size:12px}
+.kv dt{color:var(--mu)}
+.kv dd{margin:0;min-width:0;font-family:var(--mono);color:var(--tx);
+  overflow-wrap:anywhere}
+
+.files{padding:8px 16px}
+.frow{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)}
+.frow code{flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.frow .sz{font:11px var(--mono);color:var(--dim);flex:none}
+.fdir{border-bottom:1px solid var(--line)}
+.fdir summary{display:flex;align-items:center;gap:10px;min-width:0;padding:6px 0;
+  list-style:none;cursor:pointer;user-select:none}
+.fdir summary::-webkit-details-marker{display:none}
+.fdir summary::before{content:"›";width:12px;color:var(--dim);font:16px/1 var(--mono);
+  transition:transform .15s;flex:none}
+.fdir[open]>summary::before{transform:rotate(90deg)}
+.fdir-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font:12px var(--mono);color:var(--tx)}
+.fdir .sz{font:11px var(--mono);color:var(--dim);flex:none}
+.fchildren{margin-left:16px;padding-left:10px;border-left:1px solid var(--line)}
+.flag-history{padding:12px 16px;display:grid;gap:7px}
+.flag-history-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;
+  padding:9px 10px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel)}
+.flag-history-actions{display:flex;gap:6px;flex:none}
+.flag-history-main{display:grid;gap:3px;min-width:0}
+.flag-history-value{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:#7ee787;font:12px var(--mono);cursor:copy;background:transparent;border:0;padding:0;text-align:left}
+.flag-history-value:hover{color:#a5f3b4}
+.flag-history-meta{color:var(--dim);font:10px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.flag-history-status{font:10px var(--mono);padding:2px 6px;border:1px solid var(--line2);
+  border-radius:10px;color:var(--mu);white-space:nowrap}
+.flag-history-status.ok{color:#7ee787;border-color:#2c5a30;background:#13231a}
+.flag-history-status.rejected{color:#e3b341;border-color:#5a4a1e;background:#241f14}
+
+/* ───── rerun bar ───── */
+.rerun{display:flex;gap:8px;align-items:center;padding:10px 16px;
+  border-top:1px solid var(--line);background:var(--panel)}
+.rerun input{flex:1;background:var(--bg);border:1px solid var(--line2);
+  border-radius:var(--radius-sm);padding:6px 10px;font-size:12px;min-width:0;
+  transition:border-color .15s}
+.rerun input::placeholder{color:var(--dim)}
+.rerun input:focus{border-color:var(--blue);outline:none}
+.rerun select{background:var(--panel2);border:1px solid var(--line2);
+  border-radius:var(--radius-sm);padding:6px;min-width:0;max-width:42%;
+  font:12px var(--mono);
+  transition:border-color .15s}
+.rerun select:hover{border-color:#4a525c}
+
+/* ───── status bar ───── */
+.status{display:flex;align-items:center;gap:14px;padding:6px 16px;
+  background:linear-gradient(180deg,var(--panel) 0%,#12151a 100%);
+  border-top:1px solid var(--line);font-size:11px;color:var(--mu)}
+.status b{color:var(--tx);font-weight:600}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);flex:none;
+  box-shadow:0 0 6px rgba(63,185,80,.4)}
+.dot.busy{background:var(--blue);animation:pulse 1.4s infinite;
+  box-shadow:0 0 6px rgba(88,166,255,.4)}
+@keyframes pulse{50%{opacity:.3}}
+.status .sp{flex:1}
+
+.empty{padding:32px 16px;text-align:center;color:var(--dim);font-size:12px}
+.toast{position:fixed;left:50%;bottom:40px;transform:translate(-50%,16px);
+  background:var(--raise);border:1px solid var(--line2);border-radius:var(--radius);
+  padding:8px 18px;font-size:12px;opacity:0;pointer-events:none;transition:.2s;
+  box-shadow:0 8px 24px #0009}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+.hide{display:none!important}
+
+.grpbtn{background:transparent;border:1px solid var(--line2);border-radius:4px;color:var(--mu);
+  font:9px var(--mono);padding:2px 7px;transition:all .15s}
+.grpbtn:hover{background:var(--raise);color:var(--tx);border-color:#4a525c}
+.grpbtn.primary{border-color:#315f91;color:#9dc2ff;background:rgba(88,166,255,.06)}
+.grpbtn.primary:hover{border-color:var(--blue);color:#c9e1ff;background:rgba(88,166,255,.13)}
+
+/* confirm dialog */
+dialog{border:1px solid var(--line2);border-radius:12px;background:var(--panel);color:var(--tx);
+  padding:0;max-width:440px;box-shadow:0 24px 64px #000d}
+dialog::backdrop{background:#000b;backdrop-filter:blur(4px)}
+.dlg{padding:20px 22px}
+.dlg h3{margin:0 0 10px;font-size:14px}
+.dlg p{margin:0 0 8px;font-size:12px;line-height:1.6;color:var(--mu)}
+.dlg code{font-size:12px;color:#ff9b95;word-break:break-all}
+.dlg .acts{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+#settingsDlg{width:min(620px,calc(100vw - 28px));max-width:620px}
+#armorPromptsDlg{width:min(760px,calc(100vw - 28px));max-width:760px;
+  height:min(720px,calc(100vh - 28px));max-height:720px}
+#providersDlg{width:min(1180px,calc(100vw - 24px));max-width:1180px;height:min(760px,calc(100vh - 24px));
+  max-height:760px}
+#platformsDlg{width:min(960px,calc(100vw - 24px));max-width:960px;height:min(780px,calc(100vh - 24px));
+  max-height:780px}
+#mcpDlg{width:min(900px,calc(100vw - 24px));max-width:900px;height:min(760px,calc(100vh - 24px));
+  max-height:760px}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}
+.settings-grid label{display:flex;flex-direction:column;gap:6px;min-width:0}
+.settings-grid label.wide{grid-column:1/-1}
+.settings-grid label>span{font-size:11px;color:var(--mu)}
+.settings-grid input,.settings-grid select{width:100%;min-width:0;background:var(--bg);
+  border:1px solid var(--line2);border-radius:var(--radius-sm);padding:8px 9px;
+  font:12px var(--mono);color:var(--tx)}
+.settings-grid input:focus,.settings-grid select:focus{border-color:var(--blue);outline:none}
+.settings-grid select[multiple]{min-height:96px}
+.settings-grid .fmt{width:100%!important;text-align:left!important}
+.policy-note{padding:8px 10px;border-left:2px solid #7c5cff;background:#1c1828;color:#b9acd7!important}
+.btn.danger{background:linear-gradient(135deg,#7d2a2a,#9c3535);border-color:#b54545;color:#fff}
+.btn.danger:hover{background:linear-gradient(135deg,#9c3535,#b54545)}
+.provider-launch{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;
+  padding:11px 12px;text-align:left;background:#171d27;border-color:#33445c}
+.provider-launch span{display:block}
+.provider-launch small{display:block;margin-top:2px;color:var(--mu);font-size:10px}
+.armor-editor{height:100%;display:grid;grid-template-rows:auto auto auto 1fr auto;padding:20px 22px;min-height:0}
+.armor-editor h3{margin:0 0 7px;font-size:14px}.armor-editor>p{margin:0;color:var(--mu);font-size:11px;line-height:1.55}
+.armor-toolbar{display:flex;align-items:center;gap:8px;margin:14px 0 10px}
+.armor-toolbar small{color:var(--dim);flex:1}.armor-list{display:grid;align-content:start;gap:10px;overflow:auto;min-height:0;padding-right:3px}
+.armor-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:11px;
+  border:1px solid var(--line);border-radius:var(--radius);background:var(--panel2)}
+.armor-card input,.armor-card textarea{min-width:0;width:100%;background:var(--bg);border:1px solid var(--line2);
+  border-radius:var(--radius-sm);padding:8px;font:11px var(--mono);color:var(--tx)}
+.armor-card textarea{grid-column:1/-1;min-height:120px;resize:vertical;font-family:var(--sans);line-height:1.55}
+.armor-card input:focus,.armor-card textarea:focus{border-color:var(--blue);outline:none}
+.armor-card .armor-remove{align-self:stretch}.armor-empty{display:grid;place-items:center;min-height:180px;
+  border:1px dashed var(--line2);border-radius:var(--radius);color:var(--dim);font-size:12px;text-align:center}
+.armor-editor .acts{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+.provider-app{display:grid;grid-template-rows:auto 1fr;height:100%;min-height:0}
+.provider-head{display:flex;align-items:center;gap:10px;padding:15px 18px;border-bottom:1px solid var(--line)}
+.provider-head h3{margin:0;font-size:14px}.provider-head p{margin:0;color:var(--mu);font-size:11px}
+.provider-head .sp{flex:1}
+.provider-body{display:grid;grid-template-columns:270px minmax(0,1fr);min-height:0}
+.provider-sidebar{display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--line);
+  background:#13171e}
+.provider-tools{display:flex;gap:7px;padding:12px;border-bottom:1px solid var(--line)}
+.provider-tools input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line2);
+  border-radius:var(--radius-sm);padding:7px 9px;font-size:11px}
+.provider-list{flex:1;min-height:0;overflow:auto;padding:5px}
+.provider-item{display:block;width:100%;padding:9px 10px;background:transparent;border:1px solid transparent;
+  border-radius:var(--radius-sm);text-align:left}
+.provider-item:hover{background:var(--panel2)}.provider-item.on{background:#202a38;border-color:#3c526f}
+.provider-item .pname{display:flex;align-items:center;gap:6px;font-size:12px}
+.provider-item .pid{margin-top:3px;font:10px var(--mono);color:var(--dim)}
+.provider-item .pmeta{margin-top:4px;font-size:10px;color:var(--mu)}
+.pstatus{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:none}
+.pstatus.on{background:var(--green);box-shadow:0 0 5px rgba(63,185,80,.45)}
+.pstatus.off{background:var(--red)}.provider-main{min-width:0;min-height:0;overflow:auto;padding:18px}
+.provider-empty{height:100%;display:grid;place-items:center;color:var(--dim);text-align:center}
+.provider-form{display:grid;gap:14px}.provider-title{display:flex;align-items:center;gap:9px}
+.provider-title h4{margin:0;font-size:16px}.provider-title code{color:var(--mu);font-size:11px}
+.provider-title .sp{flex:1}.badge{font:10px var(--mono);padding:2px 7px;border-radius:10px;
+  border:1px solid var(--line2);color:var(--mu)}
+.badge.good{border-color:#2c5a30;color:#7ee787;background:#13231a}
+.badge.bad{border-color:#5a2d31;color:#ff9b95;background:#271719}
+.provider-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.provider-grid label{display:flex;flex-direction:column;gap:5px;min-width:0}
+.provider-grid .wide{grid-column:1/-1}.provider-grid label>span{font-size:10px;color:var(--mu)}
+.provider-grid input,.provider-grid select{width:100%;min-width:0;background:var(--bg);border:1px solid var(--line2);
+  border-radius:var(--radius-sm);padding:8px;font:11px var(--mono)}
+.provider-grid input:disabled{opacity:.55}
+.credential-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
+.provider-auth{display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:9px 10px;
+  border:1px solid var(--line);border-radius:var(--radius-sm);background:#151922}
+.provider-auth>span{font-size:10px;color:var(--mu);margin-right:3px}
+.model-head{display:flex;align-items:center;gap:8px;padding-top:4px}
+.model-head h5{margin:0;font-size:12px}.model-head .sp{flex:1}.model-head small{color:var(--dim)}
+.model-table{overflow-x:auto;padding-bottom:2px}.model-list{display:grid;gap:6px;min-width:800px}
+.model-row{display:grid;grid-template-columns:28px minmax(110px,1fr) minmax(130px,1.2fr) 82px 82px 76px 76px 150px 90px 34px;
+  gap:6px;align-items:center;padding:7px;border:1px solid var(--line);border-radius:var(--radius-sm);
+  background:var(--panel2)}
+.model-row input[type="text"],.model-row input[type="number"],.model-row select{min-width:0;width:100%;background:var(--bg);
+  border:1px solid var(--line2);border-radius:4px;padding:6px;font:10px var(--mono)}
+.model-row input:disabled{border-color:transparent;background:transparent;color:var(--mu)}
+.model-caps{display:flex;gap:6px;color:var(--mu);font-size:9px;white-space:nowrap}
+.model-caps label{display:flex;align-items:center;gap:2px}
+.model-row .remove-model{background:transparent;border:0;color:var(--red);font-size:15px}
+.model-labels{display:grid;grid-template-columns:28px minmax(110px,1fr) minmax(130px,1.2fr) 82px 82px 76px 76px 150px 90px 34px;
+  gap:6px;padding:0 7px;color:var(--dim);font-size:9px;min-width:800px}
+.provider-actions{display:flex;gap:8px;align-items:center;padding-top:4px;border-top:1px solid var(--line)}
+.provider-actions .sp{flex:1}
+.platform-app{height:100%;display:grid;grid-template-rows:auto 1fr;min-height:0}
+.platform-head{display:flex;align-items:center;gap:10px;padding:15px 18px;border-bottom:1px solid var(--line)}
+.platform-head h3{margin:0;font-size:14px}.platform-head p{margin:2px 0 0;color:var(--mu);font-size:11px}
+.platform-head .sp{flex:1}.platform-body{min-height:0;overflow:auto;padding:18px;display:grid;align-content:start;gap:14px}
+.platform-card{display:grid;gap:10px;padding:13px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel2)}
+.platform-card h4{margin:0;font-size:12px}.platform-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.platform-grid label{display:flex;flex-direction:column;gap:5px;min-width:0}.platform-grid label.wide{grid-column:1/-1}
+.platform-grid label>span{font-size:10px;color:var(--mu)}
+.platform-grid input,.platform-grid select,.platform-grid textarea{width:100%;min-width:0;background:var(--bg);
+  border:1px solid var(--line2);border-radius:var(--radius-sm);padding:8px;font:11px var(--mono);color:var(--tx)}
+.platform-grid textarea{resize:vertical}.platform-grid input:focus,.platform-grid select:focus,
+.platform-grid textarea:focus{border-color:var(--blue);outline:none}
+.platform-inline{display:flex;gap:8px;align-items:center}.platform-inline>*:first-child{flex:1;min-width:0}
+.platform-inline select{background:var(--bg);border:1px solid var(--line2);border-radius:var(--radius-sm);
+  padding:8px;font:11px var(--mono);color:var(--tx)}
+.platform-state{display:flex;gap:7px;align-items:center;flex-wrap:wrap;color:var(--mu);font-size:11px}
+.platform-warnings{margin:0;white-space:pre-wrap;max-height:90px;overflow:auto;color:#e3b341;font:10px/1.5 var(--mono)}
+#platformManifest{min-height:260px}#platformVariables{min-height:64px}
+.platform-actions{display:flex;gap:8px;align-items:center}.platform-actions .sp{flex:1}
+.mcp-agents{display:flex;gap:8px 12px;flex-wrap:wrap;padding:8px;border:1px solid var(--line);border-radius:var(--radius-sm)}
+.mcp-agents label{display:flex;flex-direction:row;align-items:center;gap:5px;color:var(--mu);font:10px var(--mono)}
+.mcp-agents input{width:auto;accent-color:var(--blue)}
+#mcpCommand,#mcpEnvironment,#mcpHeaders{min-height:78px;font:10px/1.5 var(--mono)}
+.platform-catalog-tools{display:grid;grid-template-columns:minmax(180px,1fr) 160px 140px auto;gap:8px}
+.platform-catalog-tools input,.platform-catalog-tools select{width:100%;min-width:0;background:var(--bg);color:var(--tx);
+  border:1px solid var(--line2);border-radius:var(--radius-sm);padding:8px 9px;font:11px var(--sans)}
+.platform-catalog-select{display:flex;align-items:center;gap:12px;flex-wrap:wrap;color:var(--mu);font-size:11px}
+.platform-catalog-select label{display:flex;align-items:center;gap:6px;color:var(--tx)}
+.platform-catalog-select input{accent-color:var(--blue)}
+.platform-challenges{display:grid;border:1px solid var(--line);border-radius:var(--radius-sm);overflow:hidden;min-height:76px;
+  max-height:340px;overflow-y:auto;background:var(--bg)}
+.platform-challenge{display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:9px;align-items:center;padding:9px 10px;
+  border-bottom:1px solid var(--line);cursor:pointer}.platform-challenge:last-child{border-bottom:0}
+.platform-challenge:hover{background:var(--panel)}.platform-challenge input{accent-color:var(--blue)}
+.platform-challenge-main{min-width:0}.platform-challenge-title{font-size:11px;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.platform-challenge-meta{font:9px/1.5 var(--mono);color:var(--mu);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.platform-challenge-points{font:10px var(--mono);color:var(--mu)}
+.platform-catalog-empty{display:grid;place-items:center;min-height:76px;color:var(--mu);font-size:11px;padding:16px;text-align:center}
+.platform-pager{display:flex;align-items:center;justify-content:flex-end;gap:8px;color:var(--mu);font-size:10px}
+@media(max-width:760px){.platform-catalog-tools{grid-template-columns:1fr 1fr}.platform-catalog-tools input{grid-column:1/-1}}
+
+/* drop target */
+.drop{position:fixed;inset:0;z-index:80;background:rgba(13,16,23,.92);display:grid;
+  place-items:center;outline:2px dashed var(--blue);outline-offset:-12px;pointer-events:none;
+  backdrop-filter:blur(4px)}
+.drop div{text-align:center;font-size:15px}
+.drop small{display:block;margin-top:6px;font-size:12px;color:var(--mu)}
+
+@media (max-width:1000px){
+  :root{--listw:320px}
+  .top{gap:8px;padding:8px 10px}
+  .root{flex-basis:100%}
+  .root .path{flex:1;max-width:none}
+  .knobs{flex:1 1 100%;gap:8px}
+  .knob select{width:190px;max-width:42vw}
+  .dhead,.rerun{padding-left:12px;padding-right:12px}
+  .verdict,.alert{margin-left:12px;margin-right:12px}
+  .tabs{padding-left:12px;padding-right:12px}
+  .status{gap:10px;padding-left:10px;padding-right:10px}
+}
+@media (max-width:620px){
+  /* stack queue above detail: side-by-side squeezes the detail pane below usable width */
+  .body{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(110px,34vh) minmax(0,1fr)}
+  .left{border-right:0;border-bottom:1px solid var(--line)}
+  .settings-grid{grid-template-columns:1fr}
+  .settings-grid label.wide{grid-column:auto}
+  #flagActions{width:100%;justify-content:flex-end}
+  .vrow{flex-wrap:wrap}
+}
+
+@media (max-width:760px){
+  :root{--listw:280px}
+  .top>.sep{display:none}
+  .knob select{width:160px}
+  .dhead h2{flex:1 1 100%}
+  .verdict,.alert{margin-left:8px;margin-right:8px}
+  .dhead,.rerun{padding-left:8px;padding-right:8px}
+  .tabs{padding-left:8px;padding-right:8px}
+}
+@media (max-width:820px){
+  .provider-body{grid-template-columns:220px minmax(0,1fr)}
+  .model-row,.model-labels{grid-template-columns:28px minmax(100px,1fr) minmax(120px,1.1fr) 72px 72px 68px 68px 140px 76px 30px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ TOP: root + run settings + pending flags ============ -->
+  <header class="top">
+    <div class="root">
+      <button class="btn" id="pick" title="选择题库根目录">目录</button>
+      <span class="path m" id="path">/Volumes/Storage/Code/boom/examples/ctf</span>
+      <button class="btn ghost" id="rescan" title="重新扫描 challenges/">↻</button>
+      <button class="btn" id="addCh" title="选择一个本地目录并加入题目">+ 题目</button>
+      <span class="m" id="found" style="color:var(--dim);font-size:11px;flex:none">8 题</span>
+    </div>
+
+    <button class="btn" id="settingsOpen" title="运行参数会独立保存">⚙ 设置</button>
+    <span class="m" id="settingsSummary" style="color:var(--dim);font-size:11px"></span>
+
+    <span class="sep"></span>
+    <button class="btn go" id="run">▶ 全部开跑</button>
+    <button class="btn stop hide" id="halt">■ 停止</button>
+
+    <span class="sep"></span>
+    <div class="pending" id="pending" title="点击复制全部 flag（slug + flag）">
+      <b id="pendN">0</b><span>待确认<br>flag</span>
+    </div>
+  </header>
+
+  <div class="body">
+
+    <!-- ============ LEFT: triage queue ============ -->
+    <div class="left">
+      <div class="qhead">
+        <span class="lbl">待处理</span>
+        <input class="find" id="find" placeholder="过滤 slug / flag / 原因…">
+      </div>
+      <div class="queue" id="queue"></div>
+    </div>
+
+    <!-- ============ RIGHT: evidence, wide ============ -->
+    <div class="right" id="right">
+      <div class="dhead">
+        <h2 id="dSlug">—</h2>
+        <span class="dmeta" id="dMeta"></span>
+        <span class="sp"></span>
+        <button class="btn tiny stop hide" id="stopOne">■ 停止本题</button>
+        <button class="btn tiny" id="switchEnvironment">切换任务环境</button>
+        <button class="btn tiny" id="openWork">打开 work/</button>
+      </div>
+
+      <!-- flag output — the single deliverable -->
+      <div class="verdict" id="verdict">
+        <div class="vrow">
+          <span class="vflag" id="vFlag">—</span>
+          <button class="btn tiny" id="copyFlag">复制 <span class="m" style="color:var(--dim)">c</span></button>
+          <span id="flagActions">
+            <button class="btn tiny danger" id="flagWrong">不正确，继续</button>
+            <button class="btn tiny go" id="flagCorrect">确认正确，生成 Writeup</button>
+            <button class="btn tiny" id="flagWriteup">生成 Writeup</button>
+          </span>
+        </div>
+        <div class="vwhy" id="vWhy"></div>
+      </div>
+
+      <div id="alerts"></div>
+
+      <div class="tabs" id="tabs">
+        <button data-p="stream" class="on">运行流</button>
+        <button data-p="consult">会诊 / 检查点</button>
+        <button data-p="notes">NOTES.md</button>
+        <button data-p="writeup">Writeup</button>
+        <button data-p="flags">Flag 历史</button>
+        <button data-p="files">文件</button>
+        <button data-p="meta">运行信息</button>
+        <span class="sp"></span>
+      </div>
+
+      <div class="pane on" id="p-stream"><pre class="stream" id="stream"></pre></div>
+      <div class="pane" id="p-consult"><div class="consultation" id="consultation"></div></div>
+      <div class="pane" id="p-notes"><div class="md" id="notes"></div></div>
+      <div class="pane" id="p-writeup"><div class="md" id="writeup"></div></div>
+      <div class="pane" id="p-flags"><div class="flag-history" id="flagHistory"></div></div>
+      <div class="pane" id="p-files"><div class="files" id="files"></div></div>
+      <div class="pane" id="p-meta"><dl class="kv" id="meta"></dl></div>
+
+      <!-- Continue the same durable task. Model policy is configured once in Settings. -->
+      <div class="rerun">
+        <input id="hint" placeholder="给当前任务追加提示（可留空）">
+        <button class="btn" id="consult" title="让 2–4 个独立模型提出方案并综合后继续">⚖ 会诊</button>
+        <button class="btn go" id="rerun">继续 <span class="m" style="opacity:.6">r</span></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ STATUS ============ -->
+  <footer class="status">
+    <i class="dot" id="rtDot"></i><span>runtime <b id="rtTxt">ready</b></span>
+    <span>并发 <b id="concStatus">1</b></span>
+    <span>tokens <b id="tokTotal">0</b></span>
+    <span>$<b id="costTotal">0.00</b></span>
+  </footer>
+</div>
+
+<div class="toast" id="toast" role="status"></div>
+<div id="menuRoot"></div>
+
+<dialog id="settingsDlg"><div class="dlg">
+  <h3>运行设置</h3>
+  <p>这些参数独立保存。任务继续运行时，预算与超时只约束新的一轮。</p>
+  <div class="settings-grid">
+    <label><span>Economy 模型</span><select id="economyModel"></select></label>
+    <label><span>Strong 模型</span><select id="strongModel"></select></label>
+    <label class="wide"><span>多模型会诊池（选择 2–4 项；Command/Ctrl 点击多选）</span>
+      <select id="consultModels" multiple size="4"></select></label>
+    <label class="wide" style="flex-direction:row;align-items:center"><input id="blindReview" type="checkbox" style="width:auto">
+      <span>得到候选 Flag 时自动从会诊池抽取一个模型盲审</span></label>
+    <label class="wide"><span class="policy-note">模型只在这里选择一次。整理、规则比较和可自动验收工作使用 Economy；求解、开放推理、检查点分析与裁决使用 Strong。两个档次可以选择同一个模型。</span></label>
+    <label class="wide"><button class="btn provider-launch" id="providersOpen" type="button">
+      <span><b>管理 Boom Provider、API 与模型</b>
+        <small>连接或移除凭据，自定义兼容端点，并控制模型是否出现在上方选择器中。</small></span>
+      <span>打开 →</span>
+    </button></label>
+    <label class="wide"><button class="btn provider-launch" id="mcpOpen" type="button">
+      <span><b>管理 MCP Server</b>
+        <small>由 Boom 保存配置，OpenCode 负责连接、OAuth、工具发现与调用。</small></span>
+      <span>打开 →</span>
+    </button></label>
+    <label class="wide"><button class="btn provider-launch" id="platformsOpen" type="button">
+      <span><b>比赛接口与自动同步</b>
+        <small>从 OpenAPI / Swagger 文档生成适配器，检查请求映射并下载题目。</small></span>
+      <span>打开 →</span>
+    </button></label>
+    <label class="wide"><button class="btn provider-launch" id="armorPromptsOpen" type="button">
+      <span><b>破甲提示词</b>
+        <small>维护可复用的置顶系统提示词；然后在每个 Provider 模型上选择一项。</small></span>
+      <span>打开 →</span>
+    </button></label>
+    <label><span>默认 Python 环境</span><select id="pythonEnvironment"></select></label>
+    <label><span>执行模式</span><select id="executionMode">
+      <option value="managed">managed · 受控宿主工具链</option>
+      <option value="isolated">isolated · 非 root 容器</option>
+      <option value="static-only">static-only · 禁止未知程序</option>
+    </select></label>
+    <label class="wide"><span>手动添加已有 Python / Conda 解释器</span>
+      <div style="display:flex;gap:8px"><input id="pythonInterpreter" class="fmt" placeholder="/path/to/env/bin/python" spellcheck="false">
+      <button class="btn" id="pythonAdd" type="button">测试并添加</button><button class="btn" id="condaDiscover" type="button">发现 Conda</button></div>
+    </label>
+    <label class="wide"><span class="policy-note" id="environmentStatus">必须选择一个已存在的环境；Boom 不创建 venv，也不会回退到系统 Python。</span></label>
+    <label><span>每轮 tokens</span><input id="tokens" type="number" value="200000" min="1000" step="10000"></label>
+    <label><span>重复调用上限</span><input id="repeats" type="number" value="5" min="2"></label>
+    <label><span>每轮分钟</span><input id="minutes" type="number" value="60" min="1"></label>
+    <label><span>并发任务</span><input id="concurrency" type="number" value="1" min="1" max="32"></label>
+    <label class="wide"><span>Flag 格式（正则）</span><input id="fmt" class="fmt" placeholder="留空 = 由模型判断"
+      spellcheck="false" title="正则。设定后按此提取并校验；留空则由模型自行判断哪个是 flag。"></label>
+  </div>
+  <div class="acts">
+    <button class="btn" id="settingsCancel">取消</button>
+    <button class="btn go" id="settingsSave">保存设置</button>
+  </div>
+</div></dialog>
+
+<dialog id="mcpDlg"><div class="platform-app">
+  <div class="platform-head">
+    <div><h3>MCP Server</h3>
+      <p>Boom 管理独立配置并注入隔离的 OpenCode Runtime；不会读取用户或项目 OpenCode MCP 配置。</p></div>
+    <span class="sp"></span>
+    <button class="btn" id="mcpClose" type="button">完成</button>
+  </div>
+  <div class="platform-body">
+    <section class="platform-card">
+      <h4>服务器</h4>
+      <div class="platform-inline">
+        <select id="mcpSelect"></select>
+        <button class="btn" id="mcpReload" type="button">重新读取</button>
+        <button class="btn" id="mcpNew" type="button">＋ 新建</button>
+      </div>
+      <div class="platform-state" id="mcpStatus">尚未选择 MCP Server</div>
+    </section>
+    <section class="platform-card" id="mcpEditor">
+      <h4>配置</h4>
+      <div class="platform-grid">
+        <label><span>Server ID</span><input id="mcpID" placeholder="github" spellcheck="false"></label>
+        <label><span>显示名称</span><input id="mcpName" placeholder="GitHub MCP"></label>
+        <label><span>连接类型</span><select id="mcpType">
+          <option value="remote">远程 HTTP</option><option value="local">本地进程</option>
+        </select></label>
+        <label><span>请求超时（毫秒）</span><input id="mcpTimeout" type="number" min="100" max="120000" value="5000"></label>
+        <label class="wide" style="flex-direction:row;align-items:center"><input id="mcpEnabled" type="checkbox" style="width:auto" checked>
+          <span>Runtime 启动时自动连接</span></label>
+        <label class="wide"><span>可调用此 Server 的 Boom Agent</span><div class="mcp-agents" id="mcpAgents"></div></label>
+        <label class="wide" data-mcp-remote><span>远程 MCP URL</span><input id="mcpURL" placeholder="https://example.com/mcp" spellcheck="false"></label>
+        <label class="wide" data-mcp-remote><span>HTTP Headers（JSON；敏感值必须使用 {env:NAME}）</span>
+          <textarea id="mcpHeaders" spellcheck="false" placeholder='{"Authorization":"Bearer {env:GITHUB_TOKEN}"}'></textarea></label>
+        <label class="wide" data-mcp-remote style="flex-direction:row;align-items:center"><input id="mcpOAuth" type="checkbox" style="width:auto">
+          <span>允许 OpenCode 自动发现 OAuth</span></label>
+        <label class="wide hide" data-mcp-local><span>命令与参数（JSON 数组，不经 Shell）</span>
+          <textarea id="mcpCommand" spellcheck="false" placeholder='["npx","-y","@modelcontextprotocol/server-filesystem","/data"]'></textarea></label>
+        <label class="wide hide" data-mcp-local><span>环境变量映射（JSON：目标变量 → 宿主变量名）</span>
+          <textarea id="mcpEnvironment" spellcheck="false" placeholder='{"GITHUB_TOKEN":"GITHUB_TOKEN"}'></textarea></label>
+      </div>
+      <p class="policy-note" style="margin:0">保存会重启空闲 Runtime。正在运行题目时不能修改 MCP 配置。</p>
+      <div class="platform-actions">
+        <button class="btn danger" id="mcpDelete" type="button">删除</button>
+        <button class="btn" id="mcpTest" type="button">测试连接</button>
+        <button class="btn hide" id="mcpAuth" type="button">OAuth 登录</button>
+        <button class="btn hide" id="mcpAuthRemove" type="button">移除 OAuth</button>
+        <span class="sp"></span>
+        <button class="btn go" id="mcpSave" type="button">保存并重载 OpenCode</button>
+      </div>
+    </section>
+  </div>
+</div></dialog>
+
+<dialog id="platformsDlg"><div class="platform-app">
+  <div class="platform-head">
+    <div><h3>比赛接口适配</h3>
+      <p>题目下载与 flag 提交共享同一份声明式清单；凭证仍只从环境变量读取。</p></div>
+    <span class="sp"></span>
+    <button class="btn" id="platformsClose" type="button">完成</button>
+  </div>
+  <div class="platform-body">
+    <section class="platform-card">
+      <h4>已有适配器</h4>
+      <div class="platform-inline">
+        <select id="platformSelect"></select>
+        <button class="btn" id="platformReload" type="button">重新读取</button>
+      </div>
+      <div class="platform-state" id="platformStatus">尚未选择适配器</div>
+    </section>
+    <section class="platform-card">
+      <h4>从接口文档生成</h4>
+      <div class="platform-grid">
+        <label><span>Adapter ID</span><input id="platformID" placeholder="my-ctf" spellcheck="false"></label>
+        <label><span>显示名称（可选）</span><input id="platformName" placeholder="My CTF"></label>
+        <label class="wide"><span>OpenAPI / Swagger URL 或本地文件路径</span>
+          <input id="platformDocument" placeholder="https://ctf.example/openapi.json" spellcheck="false"></label>
+        <label class="wide"><span>Base URL（文档未声明或需要覆盖时填写）</span>
+          <input id="platformBaseURL" placeholder="https://ctf.example/api" spellcheck="false"></label>
+        <label class="wide" style="flex-direction:row;align-items:center"><input id="platformForce" type="checkbox" style="width:auto">
+          <span>覆盖同 ID 的现有清单</span></label>
+      </div>
+      <div class="platform-actions"><span class="sp"></span>
+        <button class="btn go" id="platformAdapt" type="button">读取文档并生成</button></div>
+    </section>
+    <section class="platform-card">
+      <h4>检查与同步</h4>
+      <p class="policy-note" style="margin:0">自动推断不确定时清单会保持 draft。检查字段路径与提交判定后，再手动将 status 改为 ready 并保存。</p>
+      <pre class="platform-warnings" id="platformWarnings"></pre>
+      <div class="platform-grid">
+        <label class="wide"><span>声明式适配器 JSON</span><textarea id="platformManifest" spellcheck="false"></textarea></label>
+        <label class="wide"><span>本次同步变量，每行 name=value（例如 game_id=42）</span>
+          <textarea id="platformVariables" spellcheck="false" placeholder="game_id=42"></textarea></label>
+      </div>
+      <div class="platform-actions">
+        <button class="btn" id="platformSave" type="button">保存清单</button>
+        <span class="sp"></span>
+      </div>
+    </section>
+    <section class="platform-card">
+      <h4>远端题目清单</h4>
+      <p class="policy-note" style="margin:0">先获取题目元数据，再选择需要同步的题目；只有点击“同步所选”后才会获取题面和附件。</p>
+      <div class="platform-catalog-tools">
+        <input id="platformChallengeSearch" placeholder="搜索题目名称或描述" spellcheck="false">
+        <select id="platformChallengeCategory"><option value="">全部分类</option></select>
+        <select id="platformChallengeDifficulty"><option value="">全部难度</option></select>
+        <button class="btn" id="platformCatalogLoad" type="button">获取题目清单</button>
+      </div>
+      <div class="platform-catalog-select">
+        <label><input id="platformSelectAll" type="checkbox"> 全选当前筛选结果</label>
+        <button class="btn tiny" id="platformSelectionClear" type="button">清空选择</button>
+        <span id="platformSelectionStatus">尚未获取远端题目</span>
+      </div>
+      <div class="platform-challenges" id="platformChallengeList">
+        <div class="platform-catalog-empty">点击“获取题目清单”后选择要同步的题目</div>
+      </div>
+      <div class="platform-pager">
+        <button class="btn tiny" id="platformCatalogPrev" type="button">上一页</button>
+        <span id="platformCatalogPage">第 0 / 0 页</span>
+        <button class="btn tiny" id="platformCatalogNext" type="button">下一页</button>
+      </div>
+      <div class="platform-actions"><span class="sp"></span>
+        <button class="btn go" id="platformSync" type="button" disabled>同步所选</button>
+      </div>
+    </section>
+  </div>
+</div></dialog>
+
+<dialog id="armorPromptsDlg"><div class="armor-editor">
+  <h3>破甲提示词</h3>
+  <p>这里维护具名提示词。模型选中后，内容会置于该模型每次调用的 Agent 系统提示词之前。</p>
+  <div class="armor-toolbar">
+    <small>删除并保存一个提示词时，引用它的模型会自动改为“不使用”。</small>
+    <button class="btn tiny" id="armorPromptAdd" type="button">＋ 提示词</button>
+  </div>
+  <div class="armor-list" id="armorPromptList"></div>
+  <div class="acts">
+    <button class="btn" id="armorPromptsCancel" type="button">取消</button>
+    <button class="btn go" id="armorPromptsSave" type="button">保存提示词</button>
+  </div>
+</div></dialog>
+
+<dialog id="providersDlg"><div class="provider-app">
+  <div class="provider-head">
+    <div><h3>Provider 与模型</h3>
+      <p>OpenCode 管理 Provider、认证与模型目录；Boom 只读取并使用 OpenCode 当前的模型目录。</p></div>
+    <span class="sp"></span>
+    <button class="btn" id="providersClose">完成</button>
+  </div>
+  <div class="provider-body">
+    <aside class="provider-sidebar">
+      <div class="provider-tools">
+        <input id="providerFind" placeholder="搜索 Provider…">
+        <button class="btn tiny" id="providerAdd">＋ 自定义</button>
+      </div>
+      <div class="provider-list" id="providerList"></div>
+    </aside>
+    <main class="provider-main">
+      <div class="provider-empty" id="providerEmpty">从左侧选择 Provider<br>或新增 OpenAI-compatible API</div>
+      <div class="provider-form hide" id="providerForm">
+        <div class="provider-title">
+          <i class="pstatus" id="providerStatusDot"></i>
+          <h4 id="providerTitle">Provider</h4>
+          <code id="providerTitleID"></code>
+          <span class="badge" id="providerKind"></span>
+          <span class="badge" id="providerConnection"></span>
+          <span class="sp"></span>
+        </div>
+        <div class="provider-grid">
+          <label><span>Provider ID</span><input id="providerID" spellcheck="false"></label>
+          <label><span>显示名称</span><input id="providerName"></label>
+          <label><span>Native 协议 Driver</span><select id="providerDriver">
+            <option value="openai-compatible">OpenAI-compatible</option>
+            <option value="openai">OpenAI Responses</option>
+            <option value="anthropic">Anthropic Messages</option>
+          </select></label>
+          <label><span>兼容 Runtime NPM Adapter</span><input id="providerNpm" spellcheck="false"
+            placeholder="@ai-sdk/openai-compatible"></label>
+          <label><span>API / 文档地址（可选）</span><input id="providerApi" spellcheck="false"></label>
+          <label class="wide"><span>Base URL</span><input id="providerBaseURL" spellcheck="false"
+            placeholder="https://api.example.com/v1"></label>
+          <label class="wide"><span>API Key（留空不修改）</span>
+            <span class="credential-row"><input id="providerApiKey" type="password"
+              autocomplete="new-password" placeholder="sk-…">
+              <button class="btn" id="providerCredentialRemove" type="button">移除凭据</button></span>
+          </label>
+          <div class="provider-auth wide" id="providerAuthMethods"></div>
+        </div>
+        <div class="model-head">
+          <h5>可用模型</h5><small>模型目录以 OpenCode 返回为准；保存后会重载 OpenCode 并刷新选择器。</small>
+          <span class="sp"></span>
+          <button class="btn tiny" id="providerModelsFetch" type="button">↻ 应用并刷新 OpenCode</button>
+          <button class="btn tiny" id="providerModelAdd" type="button">＋ 模型</button>
+        </div>
+        <div class="model-table">
+          <div class="model-labels"><span>显示</span><span>Model ID</span><span>名称</span>
+            <span>Context (300k)</span><span>Output</span><span>输入 $/M</span><span>输出 $/M</span>
+            <span>破甲提示词</span><span>能力</span><span></span></div>
+          <div class="model-list" id="providerModels"></div>
+        </div>
+        <div class="provider-actions">
+          <button class="btn danger" id="providerDelete">删除 / 禁用 Provider</button>
+          <span class="sp"></span>
+          <button class="btn" id="providerDiscard">放弃修改</button>
+          <button class="btn go" id="providerSave">保存并重载 OpenCode</button>
+        </div>
+      </div>
+    </main>
+  </div>
+</div></dialog>
+
+<!-- the only irreversible action gets a confirm step -->
+<dialog id="delDlg"><div class="dlg">
+  <h3>删除磁盘上的题目目录？</h3>
+  <p>将永久删除：</p>
+  <p><code id="delPath"></code></p>
+  <p>附件、运行历史和 NOTES.md 都会一起消失，<b>无法撤销</b>。
+     如果只是不想再跑这题，用「放弃」或「从批次移除」，文件会保留。</p>
+  <div class="acts">
+    <button class="btn" id="delCancel">取消</button>
+    <button class="btn" id="delSoft">改为从批次移除</button>
+    <button class="btn danger" id="delOk">永久删除</button>
+  </div>
+</div></dialog>
+
+<div class="drop hide" id="drop"><div>请点「+ 题目」选择目录
+  <small>客户端会打开原生目录选择器；README/题面自动识别，无需 meta.json</small></div></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,251 @@
+import type { Challenge } from "../challenge.ts"
+import type { ModelPolicy } from "../model-policy.ts"
+import type { AgentRuntime } from "../runtime-contract.ts"
+import {
+  assertRuntimeResult,
+  completeRuntimePrompt,
+  runtimeFailureUsage,
+  runtimeReplyText,
+} from "../runtime-turn.ts"
+import { budgetTokens, messageTokens, type Limits } from "../session.ts"
+import type { TaskRecord } from "../task.ts"
+import type { Workspace } from "../workspace.ts"
+import { buildHandoffSummary } from "./handoff.ts"
+import { discoverKeyArtifacts } from "./artifacts.ts"
+import { parseStructuredReport } from "./structured-report.ts"
+import {
+  finishEscalation,
+  loadAutonomyState,
+  startEscalation,
+  type AutonomyEscalationSummary,
+} from "./progress.ts"
+
+export const AUTONOMY_THRESHOLDS = {
+  eligibleActiveMs: 20 * 60_000,
+  eligibleBudgetRatio: 0.30,
+  stalledMs: 5 * 60_000,
+  stalledBudgetRatio: 0.10,
+  cooldownMs: 5 * 60_000,
+  /**
+   * Calibrated by replaying 45 archived runs. This is a share of the whole challenge budget, not the
+   * current turn's remaining budget, so late continuations do not acquire a hair-trigger brake.
+   */
+  stalledInTurnBudgetRatio: 0.25,
+} as const
+
+/** Attach the in-turn dead-end brake to a solve turn's limits. */
+export function withStallBrake(limits: Limits, challengeBudget: number): Limits {
+  if (!Number.isFinite(challengeBudget) || challengeBudget <= 0) return limits
+  return {
+    ...limits,
+    stalledInTurnTokens: Math.floor(
+      challengeBudget * AUTONOMY_THRESHOLDS.stalledInTurnBudgetRatio,
+    ),
+  }
+}
+
+export type AutonomyDecision =
+  | { action: "none"; reason: string }
+  | { action: "continue"; reason: string }
+  | {
+      action: "escalate"
+      level: 1
+      reason: string
+      fingerprint: string
+      early: boolean
+    }
+
+export type AutonomyEscalationResult = {
+  id: string
+  level: 1
+  status: AutonomyEscalationSummary["status"]
+  hint: string
+  tokens: number
+  billable: number
+  cost: number
+}
+
+function validTime(value: string) {
+  const parsed = new Date(value).valueOf()
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+export function agentRequestedEscalation(outcome: { reply: string }) {
+  return /(?:^|\n)\s*BOOM_ESCALATE(?:_REQUEST)?\s*[:：]/i.test(outcome.reply)
+}
+
+export function decideAutonomy(input: {
+  state: Awaited<ReturnType<typeof loadAutonomyState>>
+  outcome: { stop: string; candidates: string[]; reply: string }
+  activeSolveMs: number
+  cumulativeBillable: number
+  challengeTokenBudget: number
+  productiveLongRunningTool?: boolean
+  now?: number
+  manual?: boolean
+}): AutonomyDecision {
+  const now = input.now ?? Date.now()
+  if (input.outcome.candidates.length > 0) return { action: "none", reason: "candidate available" }
+  const explicitlyRequested = input.manual === true || agentRequestedEscalation(input.outcome)
+  if (
+    !explicitlyRequested &&
+    input.outcome.stop === "completed" &&
+    !input.state.automaticContinuationUsedAt
+  ) return { action: "continue", reason: "first normal yield without a candidate" }
+
+  const early = explicitlyRequested || input.state.consecutiveNormalYieldsWithoutDurableProgress >= 2
+  const eligible =
+    input.activeSolveMs >= AUTONOMY_THRESHOLDS.eligibleActiveMs ||
+    input.cumulativeBillable >= input.challengeTokenBudget * AUTONOMY_THRESHOLDS.eligibleBudgetRatio
+  const stalledByTime = now - validTime(input.state.lastProgressAt) >= AUTONOMY_THRESHOLDS.stalledMs
+  const stalledByUsage =
+    input.cumulativeBillable - input.state.billableAtLastProgress >=
+      input.challengeTokenBudget * AUTONOMY_THRESHOLDS.stalledBudgetRatio
+  if (!early && (!eligible || (!stalledByTime && !stalledByUsage))) {
+    return {
+      action: "none",
+      reason: !eligible
+        ? "autonomy eligibility threshold not reached"
+        : "meaningful progress is still recent",
+    }
+  }
+  if (input.productiveLongRunningTool)
+    return { action: "none", reason: "productive long-running tool is still active" }
+
+  const related = input.state.escalations.filter((item) =>
+    item.fingerprint === input.state.progressEpoch && item.level === 1,
+  )
+  if (related.some((item) => item.status === "running"))
+    return { action: "none", reason: "an L1 second opinion is already running" }
+  if (related.some((item) => item.status === "completed" || item.status === "partial"))
+    return { action: "none", reason: "L1 second opinion was already used for this progress fingerprint" }
+  const latest = related.at(-1)
+  if (latest && now - validTime(latest.finishedAt ?? latest.startedAt) < AUTONOMY_THRESHOLDS.cooldownMs)
+    return { action: "none", reason: "matching L1 fingerprint is cooling down" }
+
+  const reason = input.manual
+    ? "user requested a stagnation diagnosis"
+    : agentRequestedEscalation(input.outcome)
+      ? "main agent explicitly requested a stagnation diagnosis"
+      : input.state.consecutiveNormalYieldsWithoutDurableProgress >= 2
+        ? "two normal yields produced no candidate or durable progress"
+        : `eligible and stalled (${stalledByTime ? "time" : "usage"})`
+  return {
+    action: "escalate",
+    level: 1,
+    reason,
+    fingerprint: input.state.progressEpoch,
+    early,
+  }
+}
+
+async function secondOpinionPrompt(input: {
+  challenge: Challenge
+  workspace: Workspace
+  task: TaskRecord
+}) {
+  const [handoff, artifacts] = await Promise.all([
+    buildHandoffSummary({
+      directory: input.workspace.directory,
+      challenge: input.challenge,
+      task: input.task,
+    }),
+    discoverKeyArtifacts(input.workspace.directory),
+  ])
+  return [
+    "You are Boom's one bounded stagnation second opinion.",
+    "Do not solve the whole challenge. Diagnose whether the current direction is earning evidence and",
+    "return one or two cheap, falsifiable experiments. A tool call is not progress unless it produced",
+    "a durable artifact or note. Treat every unsupported conclusion as a hypothesis.",
+    "Before the JSON, answer in at most three short paragraphs:",
+    "1. What real progress is backed by a workspace path?",
+    "2. What is the most likely unsupported premise or blind spot? Say plainly if the route should be abandoned.",
+    "3. What single cheapest experiment would distinguish it from the best alternative, and what result kills it?",
+    "Then return strict JSON in a ```json fenced block with this shape:",
+    JSON.stringify({
+      facts: [{ statement: "path-backed fact", evidence: [{ path: "work/file", description: "support" }] }],
+      hypotheses: [{ statement: "falsifiable premise", evidenceNeeded: ["observable evidence"], nextExperiment: "bounded test" }],
+      experiments: [{ title: "test", objective: "distinguish alternatives", expectedEvidence: "observable result", stopCondition: "bounded stop", tier: "economy", budgetTokens: 8_000 }],
+      risks: ["unverified premise"],
+    }),
+    "",
+    handoff,
+    "",
+    "Hashed key-artifact inventory:",
+    JSON.stringify(artifacts.slice(0, 80), undefined, 2),
+  ].join("\n")
+}
+
+export async function runAutonomyEscalation(input: {
+  runtime: AgentRuntime
+  challenge: Challenge
+  workspace: Workspace
+  task: TaskRecord
+  policy: ModelPolicy
+  limits: Limits
+  decision: Extract<AutonomyDecision, { action: "escalate" }>
+  signal?: AbortSignal
+}): Promise<AutonomyEscalationResult> {
+  const started = await startEscalation({
+    directory: input.workspace.directory,
+    fingerprint: input.decision.fingerprint,
+    level: 1,
+    reason: input.decision.reason,
+  })
+  try {
+    const completed = await completeRuntimePrompt({
+      runtime: input.runtime,
+      directory: input.workspace.directory,
+      title: "Boom stagnation second opinion",
+      agent: "boom-consultant",
+      model: input.policy.economy,
+      prompt: await secondOpinionPrompt(input),
+      signal: input.signal,
+      tokenBudget: Math.max(1_000, Math.min(input.limits.tokens, Math.floor(input.limits.tokens * 0.4))),
+    })
+    const text = runtimeReplyText(completed.parts)
+    const allowedFinishes =
+      completed.finish === "unknown" && text !== "" && !completed.error
+        ? ["stop", "unknown"]
+        : ["stop"]
+    const result = assertRuntimeResult(completed, "Stagnation second opinion", allowedFinishes)
+    if (!text) throw new Error("Stagnation second opinion returned no report")
+    const report = parseStructuredReport(text)
+    if (report.experiments.length === 0)
+      throw new Error("Stagnation second opinion returned no falsifiable experiment")
+    const tokens = result.usage ? messageTokens(result.usage) : 0
+    const billable = result.usage ? Math.round(budgetTokens(result.usage)) : 0
+    await finishEscalation({
+      directory: input.workspace.directory,
+      id: started.id,
+      status: "completed",
+      tokens,
+      billable,
+      cost: result.cost,
+    })
+    return {
+      id: started.id,
+      level: 1,
+      status: "completed",
+      hint: [
+        "Boom's bounded stagnation second opinion:",
+        text,
+        "Treat its claims as hypotheses until workspace evidence supports them. Continue the same task.",
+      ].join("\n\n"),
+      tokens,
+      billable,
+      cost: result.cost,
+    }
+  } catch (error) {
+    const failed = runtimeFailureUsage(error)
+    await finishEscalation({
+      directory: input.workspace.directory,
+      id: started.id,
+      status: input.signal?.aborted ? "cancelled" : "failed",
+      tokens: failed.usage ? messageTokens(failed.usage) : 0,
+      billable: failed.usage ? Math.round(budgetTokens(failed.usage)) : 0,
+      cost: failed.cost,
+    }).catch(() => {})
+    throw error
+  }
+}

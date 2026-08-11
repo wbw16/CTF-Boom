@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "id": "boom-worker",
+  "mode": "subagent",
+  "role": "worker",
+  "description": "Works autonomously on one assigned objective inside a Boom challenge.",
+  "color": "#6366F1",
+  "temperature": 0.3,
+  "toolProfile": "worker",
+  "output": "freeform"
+}

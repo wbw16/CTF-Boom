@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "id": "boom",
+  "mode": "primary",
+  "role": "solver",
+  "description": "Boom's autonomous CTF solver.",
+  "color": "#8B5CF6",
+  "temperature": 0.3,
+  "toolProfile": "solver",
+  "output": "freeform"
+}

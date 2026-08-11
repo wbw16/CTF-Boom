@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "boom",
+  "version": "0.1.0",
+  "description": "CTF-Boom — an autonomous, evidence-driven CTF solving agent and desktop workbench",
+  "keywords": [
+    "ctf",
+    "cybersecurity",
+    "ai-agent",
+    "autonomous-agent",
+    "typescript",
+    "bun"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "bin": {
+    "boom": "./src/index.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.4",
+    "@opencode-ai/sdk": "1.18.4",
+    "lucide-react": "^1.30.0",
+    "opencode-ai": "1.18.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "typescript": "5.9.3",
+    "vite": "^8.2.1"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "prototype/boom-gui-v3.html",
+    "prototype/boom-gui-v3.js",
+    "resources",
+    "scripts/import-ctftiny.ts",
+    "src"
+  ],
+  "scripts": {
+    "dataset:ctftiny": "bun scripts/import-ctftiny.ts",
+    "build:web": "vite build",
+    "dev:web": "vite",
+    "gui": "bun src/index.ts gui",
+    "test": "bun run build:web && bun test test/",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p frontend/tsconfig.json"
+  }
+}
