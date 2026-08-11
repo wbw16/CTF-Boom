@@ -9,7 +9,7 @@
 ![Status](https://img.shields.io/badge/status-experimental-orange)
 ![Bun](https://img.shields.io/badge/Bun-1.3%2B-black?logo=bun)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.9-blue?logo=typescript)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 </div>
 
@@ -284,4 +284,4 @@ CTF 题目附件可能包含不可信二进制文件、脚本或网络目标。�
 
 ## License
 
-[MIT](./LICENSE) © 2026 Boom contributors
+[Apache License 2.0](./LICENSE) © 2026 wbw16 and CTF-Boom contributors

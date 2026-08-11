@@ -11,7 +11,7 @@
     "typescript",
     "bun"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "packageManager": "bun@1.3.14",
   "bin": {
@@ -35,6 +35,7 @@
   },
   "files": [
     "LICENSE",
+    "NOTICE",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
     "prototype/boom-gui-v3.html",
