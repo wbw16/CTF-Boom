@@ -3,10 +3,12 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import os from "node:os"
 import path from "node:path"
 import { submitCandidate } from "../src/candidate-submission.ts"
-import { requestConsultation } from "../src/consultation-request.ts"
+import { loadConsultationRequest, requestConsultation } from "../src/consultation-request.ts"
 import { PlatformAdapterRegistry } from "../src/platform-adapter.ts"
 import { GuiRunner } from "../src/runner.ts"
 import type { RuntimeHandle } from "../src/runtime-contract.ts"
+import { saveTaskRecord } from "../src/task.ts"
+import { prepareWorkspace } from "../src/workspace.ts"
 
 const temporary: string[] = []
 afterEach(async () => Promise.all(
@@ -136,7 +138,7 @@ test("an accepted platform verdict ends the main flow without an automatic write
   }
 })
 
-test("a model-requested consultation runs the expert panel and automatically resumes the task", async () => {
+test("a model-requested consultation uses the new continuation budget and resumes the task", async () => {
   const interpreter = Bun.which("python3")
   if (!interpreter) return
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-runner-consult-"))
@@ -145,6 +147,38 @@ test("a model-requested consultation runs the expert panel and automatically res
   const source = path.join(root, "challenges", "consult-me")
   await mkdir(source, { recursive: true })
   await writeFile(path.join(source, "README.md"), "Use a consultation, then return flag{consulted}")
+
+  const challenge = {
+    slug: "consult-me",
+    directory: source,
+    description: "Use a consultation, then return flag{consulted}",
+    files: [],
+    flagFormat: "flag\\{[^}]+\\}",
+    platform: { adapter: "test-platform", challengeID: "consult-me-1" },
+  }
+  const workspace = await prepareWorkspace(root, challenge, "task")
+  const historicalFinish = Date.now() - 1_000
+  await saveTaskRecord(workspace.directory, {
+    version: 1,
+    id: workspace.runID,
+    slug: challenge.slug,
+    status: "paused",
+    createdAt: new Date(historicalFinish - 120_000).toISOString(),
+    updatedAt: new Date(historicalFinish).toISOString(),
+    currentModel: "test/strong",
+    rejectedFlags: [],
+    turns: [{
+      id: "historic-turn",
+      model: "test/strong",
+      startedAt: new Date(historicalFinish - 120_000).toISOString(),
+      finishedAt: new Date(historicalFinish).toISOString(),
+      stop: "completed",
+      tokens: 160_000,
+      billableTokens: 150_000,
+      cost: 0,
+      candidates: [],
+    }],
+  })
 
   const calls: Array<{ agent: string; title: string }> = []
   let solverTurns = 0
@@ -242,14 +276,7 @@ test("a model-requested consultation runs the expert panel and automatically res
   const runner = new GuiRunner(root, async () => handle, adapters)
   try {
     await runner.enqueue({
-      challenges: [{
-        slug: "consult-me",
-        directory: source,
-        description: "Use a consultation, then return flag{consulted}",
-        files: [],
-        flagFormat: "flag\\{[^}]+\\}",
-        platform: { adapter: "test-platform", challengeID: "consult-me-1" },
-      }],
+      challenges: [challenge],
       model: "test/strong",
       modelPolicy: { economy: "test/economy", strong: "test/strong" },
       consultModels: ["test/expert-a", "test/expert-b", "test/expert-c"],
@@ -257,6 +284,7 @@ test("a model-requested consultation runs the expert panel and automatically res
       limits: { tokens: 100_000, repeats: 5, timeout: 60_000 },
       flagFormat: "flag\\{[^}]+\\}",
       pythonInterpreter: interpreter,
+      workspaces: { "consult-me": workspace.runID },
     })
     for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1)
       await Bun.sleep(10)
@@ -266,8 +294,7 @@ test("a model-requested consultation runs the expert panel and automatically res
     expect(calls.filter((call) => call.agent === "boom")).toHaveLength(2)
     // Three experts, one retry for the failed expert, and one strong synthesis.
     expect(calls.filter((call) => call.agent === "boom-consultant")).toHaveLength(5)
-    const [runID] = await readdir(path.join(root, "runs", "consult-me"))
-    const run = path.join(root, "runs", "consult-me", runID!)
+    const run = workspace.directory
     const result = JSON.parse(await readFile(path.join(run, "result.json"), "utf8"))
     expect(result).toMatchObject({
       orchestration_variant: "consultation",
@@ -282,6 +309,11 @@ test("a model-requested consultation runs the expert panel and automatically res
       },
     })
     expect(await Bun.file(path.join(run, "work", "CONSULTATION.md")).exists()).toBe(true)
+    expect(await loadConsultationRequest(run)).toMatchObject({
+      status: "handled",
+      resolution: "queued",
+      sessionID: solverSessionID,
+    })
     const savedConsultation = JSON.parse(await readFile(path.join(run, "work", "consultation.json"), "utf8"))
     const parts = await readdir(path.join(run, "work", ".boom", "consultations", savedConsultation.id))
     expect(parts.sort()).toEqual(["expert-1.json", "expert-2.json", "expert-3.json"])

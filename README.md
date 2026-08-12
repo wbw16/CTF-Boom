@@ -256,16 +256,18 @@ boom evaluate --root ./ctf
 ```sh
 bun install
 bun run typecheck
-bun test
+bun run test
 ```
 
 打包并测试本地发布物：
 
 ```sh
-bun pm pack
-bun add --global ./boom-0.1.0.tgz
-boom doctor
+bun run pack:check
 ```
+
+该命令会先构建 React 浏览器界面、执行类型检查和测试，再创建 tarball，验证其中包含
+`frontend/dist` 与运行时资源，并在临时目录中从零安装后运行 `boom version` 和 `boom doctor`。
+常规发布可直接运行 `bun pm pack`；`prepack` 钩子会执行相同的构建与质量检查。
 
 核心实现使用 TypeScript、Bun、React 和 Vite。OpenCode 是当前稳定的产品运行时，所有 OpenCode 特定集成都集中在 `src/runtime.ts` 后面；Boom 自己负责 UI、任务生命周期、隔离配置、模型策略、MCP 管理和凭据引用。
 

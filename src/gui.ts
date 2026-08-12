@@ -85,6 +85,7 @@ export type GuiRunnerBackend = Pick<
   | "completeMcpOAuth"
   | "removeMcpOAuth"
   | "enqueue"
+  | "requestConsultation"
   | "stop"
   | "getTransientRuns"
   | "switchTaskEnvironment"
@@ -237,6 +238,20 @@ function decodeSegment(value: string) {
 function containsPath(parent: string, child: string) {
   const relative = path.relative(parent, child)
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
+}
+
+async function staticWebAsset(pathname: string) {
+  if (!webReady) return undefined
+  const assetPath = path.normalize(path.join(WEB_DIST, pathname))
+  if (!containsPath(WEB_DIST, assetPath)) return undefined
+  const file = Bun.file(assetPath)
+  if (!(await file.exists())) return undefined
+  return new Response(file, {
+    headers: {
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  })
 }
 
 export function mergeTransient(history: RunHistory[], transient: RunHistory[]) {
@@ -605,18 +620,9 @@ export async function startGuiServer(options: StartGuiOptions) {
             },
           })
         }
-        if (request.method === "GET" && url.pathname.startsWith("/assets/")) {
-          if (!webReady) return json({ error: "Not found" }, 404)
-          const assetPath = path.normalize(path.join(WEB_DIST, url.pathname))
-          if (!assetPath.startsWith(WEB_DIST)) return json({ error: "Not found" }, 404)
-          const file = Bun.file(assetPath)
-          if (!(await file.exists())) return json({ error: "Not found" }, 404)
-          return new Response(file, {
-            headers: {
-              "Cache-Control": "public, max-age=31536000, immutable",
-              "X-Content-Type-Options": "nosniff",
-            },
-          })
+        if (request.method === "GET" && !url.pathname.startsWith("/api/")) {
+          const asset = await staticWebAsset(url.pathname)
+          if (asset) return asset
         }
         if (request.method === "GET" && url.pathname === "/app.js") {
           return new Response(Bun.file(APP_SCRIPT), {
@@ -1238,9 +1244,59 @@ export async function startGuiServer(options: StartGuiOptions) {
               throw new HttpError(400, "model must be provider/model")
             if (!synthesizerModel.includes("/"))
               throw new HttpError(400, "synthesizerModel must be provider/model")
-            const runs = await readChallengeRuns(root, found.slug)
             const requestedRunID =
               typeof input.sourceRunID === "string" ? input.sourceRunID : undefined
+            const tokens = positive(input.tokens ?? persisted.settings.tokens, "tokens")
+            const repeats = positive(input.repeats ?? persisted.settings.repeats, "repeats", 2)
+            const minutes = positive(input.minutes ?? persisted.settings.minutes, "minutes")
+            const flagFormat =
+              typeof input.flagFormat === "string"
+                ? input.flagFormat
+                : persisted.settings.flagFormat
+            if (flagFormat !== "") {
+              try {
+                new RegExp(flagFormat)
+              } catch {
+                throw new HttpError(400, "flagFormat is not a valid regular expression")
+              }
+            }
+            const scheduled = runner.requestConsultation({
+              slug: found.slug,
+              sourceRunID: requestedRunID,
+              expertModels,
+              synthesizerModel,
+              solverModel,
+              modelPolicy: {
+                economy: persisted.settings.economyModel,
+                strong: persisted.settings.strongModel,
+              },
+              consultModels: persisted.settings.consultModels,
+              blindReview: persisted.settings.blindReview,
+              consultOnCompaction: persisted.settings.consultOnCompaction,
+              limits: {
+                tokens,
+                repeats,
+                timeout: minutes * 60_000,
+                silenceMs: DEFAULT_SILENCE_MS,
+              },
+              flagFormat,
+              requestedAt: Date.now(),
+            })
+            if (scheduled) {
+              const nextChallenge = {
+                ...(persisted.challenges[found.slug] ?? {}),
+              }
+              delete nextChallenge.state
+              persisted.challenges[found.slug] = nextChallenge
+              await saveRootGuiState(root, persisted)
+              return json({
+                queued: [{ slug: found.slug, id: scheduled.runID, model: scheduled.model }],
+                trigger: "manual",
+                mode: scheduled.mode,
+              }, 202)
+            }
+
+            const runs = await readChallengeRuns(root, found.slug)
             const source = requestedRunID
               ? runs.find((run) => run.id === requestedRunID)
               : [...runs]
@@ -1259,20 +1315,6 @@ export async function startGuiServer(options: StartGuiOptions) {
                 : source
                   ? "manual"
                   : "planning"
-            const tokens = positive(input.tokens ?? persisted.settings.tokens, "tokens")
-            const repeats = positive(input.repeats ?? persisted.settings.repeats, "repeats", 2)
-            const minutes = positive(input.minutes ?? persisted.settings.minutes, "minutes")
-            const flagFormat =
-              typeof input.flagFormat === "string"
-                ? input.flagFormat
-                : persisted.settings.flagFormat
-            if (flagFormat !== "") {
-              try {
-                new RegExp(flagFormat)
-              } catch {
-                throw new HttpError(400, "flagFormat is not a valid regular expression")
-              }
-            }
             const queued = await runner.enqueue({
               challenges: [found],
               model: solverModel,
@@ -1302,7 +1344,7 @@ export async function startGuiServer(options: StartGuiOptions) {
             delete nextChallenge.state
             persisted.challenges[found.slug] = nextChallenge
             await saveRootGuiState(root, persisted)
-            return json({ queued, trigger }, 202)
+            return json({ queued, trigger, mode: "queued" }, 202)
           })
         }
 
@@ -1591,7 +1633,7 @@ export async function startGuiServer(options: StartGuiOptions) {
           error instanceof Error && /(?:Path escapes|symbolic link)/i.test(error.message)
         const conflict =
           error instanceof Error &&
-          /(?:already running|already queued|Duplicate challenge|Cannot change providers|Cannot change armor prompts|Cannot change MCP|Cannot test MCP|Cannot authenticate MCP)/i.test(
+          /(?:already running|already queued|Consultation is already|Duplicate challenge|Cannot change providers|Cannot change armor prompts|Cannot change MCP|Cannot test MCP|Cannot authenticate MCP)/i.test(
             error.message,
           )
         const invalidConfiguration =

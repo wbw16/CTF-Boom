@@ -80,7 +80,7 @@ export function Detail() {
       })
       setRemoteDraft(remote)
       await refresh()
-      toast(remote ? "服务地址已保存，下次运行会自动使用" : "服务地址已清除，将继续进行本地分析", "success")
+      toast(remote ? "服务地址已保存，下次继续会进行远程操作" : "服务地址已清除；下次仅进行本地分析，之后等待重新填写", "success")
     } catch (error) {
       toast((error as Error).message, "error")
     } finally {
@@ -205,7 +205,11 @@ export function Detail() {
             >
               从平台获取
             </button>
-            <span className="service-endpoint-help">不填写也会启动任务，并先完成本地分析。</span>
+            <span className="service-endpoint-help">
+              {challenge.remote?.trim()
+                ? "已填写服务地址，继续任务时会进行远程操作。"
+                : "首次运行会先完成本地分析；之后需要填写地址才能继续。"}
+            </span>
           </form>
         ) : null}
         <div className="detail-actions">

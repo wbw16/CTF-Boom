@@ -13,6 +13,10 @@ import {
   type ConsultationTrigger,
 } from "./consultation.ts"
 import {
+  handleConsultationRequest,
+  type ConsultationRequestReference,
+} from "./consultation-request.ts"
+import {
   appendRunEvent,
   assertPathWithin,
   readRunHistory,
@@ -184,7 +188,14 @@ export type EnqueueRunsInput = {
     resumeSessionID?: string
     history?: RuntimeMessage[]
     contextWarning?: string
+    /** Durable agent request whose lifecycle is owned by this consultation job. */
+    request?: ConsultationRequestReference
   }
+}
+
+type AutonomyBaseline = {
+  billableTokens: number
+  activeSolveMs: number
 }
 
 type Job = {
@@ -209,6 +220,8 @@ type Job = {
   pythonInterpreter?: string
   executionMode: ExecutionMode
   autonomyBudget: Pick<Limits, "tokens" | "timeout">
+  /** Task totals at the start of this user-authorized run chain. */
+  autonomyBaseline?: AutonomyBaseline
   autonomyEscalations: AutonomyEscalationResult[]
   autonomyDecision?: AutonomyDecision
   progressBefore?: ProgressSnapshot
@@ -217,6 +230,7 @@ type Job = {
   runtimeVersion?: string
   promptVersion?: string
   consultationInput?: NonNullable<EnqueueRunsInput["consultation"]>
+  consultationPhase?: "queued" | "running" | "complete"
   consultation?: Consultation
   flagFormat: string
   controller: AbortController
@@ -242,6 +256,8 @@ type Job = {
   pendingSwitch?: ModelSwitchRequest
   /** User-requested task environment rebind; observed at the same safe boundary as a model switch. */
   pendingEnvironmentSwitch?: EnvironmentSwitchRequest
+  /** User-requested consultation captured while this job is already running. */
+  pendingConsultation?: ManualConsultationRequest
   /** Durable session/context exported by the previous model during a hot switch. */
   resumeSessionID?: string
   handoffHistory?: RuntimeMessage[]
@@ -266,6 +282,27 @@ type EnvironmentSwitchRequest = {
   reason: string
 }
 
+export type ManualConsultationRequest = {
+  slug: string
+  sourceRunID?: string
+  expertModels: string[]
+  synthesizerModel: string
+  solverModel: string
+  modelPolicy: ModelPolicy
+  consultModels: string[]
+  blindReview: boolean
+  consultOnCompaction: boolean
+  limits: Limits
+  flagFormat: string
+  requestedAt: number
+}
+
+export type ManualConsultationSchedule = {
+  mode: "before-start" | "live-handoff"
+  runID: string
+  model: string
+}
+
 export type LiveModelSettings = {
   economyModel: string
   strongModel: string
@@ -285,6 +322,17 @@ const FALLBACK_MODELS: ModelInfo[] = [
 ]
 
 const RUN_RECOVERY_ATTEMPTS = 2
+const REMOTE_URL_MISSING = "missing remote URL"
+
+function remoteURLBlockedDetail(continuation: boolean) {
+  return continuation
+    ? `${REMOTE_URL_MISSING}: 该题需要远程服务，但尚未填写服务地址；本轮不会启动解题模型，请填写 URL 后再继续。`
+    : `${REMOTE_URL_MISSING}: 本地分析已完成，但尚未填写服务地址；请填写 URL 后再继续。`
+}
+
+function isRemoteURLBlocked(outcome: Pick<Outcome, "stop" | "detail">) {
+  return outcome.stop === "blocked" && outcome.detail?.includes(REMOTE_URL_MISSING) === true
+}
 
 /** Infrastructure and loop-guard stops that are safe to resume in a fresh turn. */
 export function recoverableRunOutcome(
@@ -1189,6 +1237,7 @@ export class GuiRunner {
         pythonInterpreter: input.pythonInterpreters?.[challenge.slug] ?? input.pythonInterpreter,
         executionMode: input.executionMode ?? "managed",
         consultationInput: input.consultation,
+        consultationPhase: input.consultation ? "queued" : undefined,
         flagFormat: input.flagFormats?.[challenge.slug] ?? input.flagFormat,
         controller: new AbortController(),
         switchController: new AbortController(),
@@ -1210,6 +1259,111 @@ export class GuiRunner {
     })
     this.pump()
     return queued
+  }
+
+  /**
+   * Attach a manual consultation to work that is already queued or running for this challenge.
+   *
+   * A live solver is handed off only at a complete message/tool-result boundary. This preserves
+   * completed tool output and the runtime's active context, then the follow-up job runs the expert
+   * panel before resuming the same task. Returning `undefined` means there is no in-flight job and
+   * the caller should enqueue a normal manual-consultation turn instead.
+   */
+  requestConsultation(input: ManualConsultationRequest): ManualConsultationSchedule | undefined {
+    const candidate = this.active.get(input.slug)
+    const active = candidate && (
+      input.sourceRunID === undefined ||
+      input.sourceRunID === candidate.queueID ||
+      input.sourceRunID === candidate.workspace?.runID ||
+      input.sourceRunID === candidate.resumeRunID
+    ) ? candidate : undefined
+    if (active) {
+      if (
+        active.pendingConsultation ||
+        active.consultationPhase === "queued" ||
+        active.consultationPhase === "running"
+      ) throw new Error(`Consultation is already queued or running: ${input.slug}`)
+
+      const runID = active.workspace?.runID ?? active.queueID
+      if (!active.runtime) {
+        active.model = input.solverModel
+        active.modelPolicy = input.modelPolicy
+        active.consultModels = [...input.consultModels]
+        active.blindReview = input.blindReview
+        active.consultOnCompaction = input.consultOnCompaction
+        active.limits = input.limits
+        active.autonomyBudget = { tokens: input.limits.tokens, timeout: input.limits.timeout }
+        if (active.task) {
+          const totals = taskTotals(active.task)
+          active.autonomyBaseline = {
+            billableTokens: totals.billableTokens,
+            activeSolveMs: activeSolveTimeMs(active.task.turns),
+          }
+        } else delete active.autonomyBaseline
+        active.flagFormat = input.flagFormat
+        active.consultationInput = {
+          trigger: "manual",
+          expertModels: [...input.expertModels],
+          synthesizerModel: input.synthesizerModel,
+          sourceRunID: active.workspace?.runID ?? active.resumeRunID ?? input.sourceRunID,
+        }
+        active.consultationPhase = "queued"
+        this.recordEvent(active, {
+          at: input.requestedAt,
+          type: "status",
+          status: "consultation.manual.queued",
+          text: "用户发起多模型会诊；将在 solver 首次调用前执行",
+        })
+        return { mode: "before-start", runID, model: input.solverModel }
+      }
+
+      active.pendingConsultation = input
+      this.recordEvent(active, {
+        at: input.requestedAt,
+        type: "status",
+        status: "consultation.manual.requested",
+        text: "用户在运行中发起多模型会诊；等待当前工具或消息到达安全边界",
+      })
+      if (!active.switchController.signal.aborted)
+        active.switchController.abort(new Error("用户在运行中发起多模型会诊"))
+      return { mode: "live-handoff", runID, model: input.solverModel }
+    }
+
+    const queued = this.queue.find((job) => job.challenge.slug === input.slug)
+    if (!queued) return undefined
+    if (queued.consultationInput)
+      throw new Error(`Consultation is already queued or running: ${input.slug}`)
+    queued.model = input.solverModel
+    queued.modelPolicy = input.modelPolicy
+    queued.consultModels = [...input.consultModels]
+    queued.blindReview = input.blindReview
+    queued.consultOnCompaction = input.consultOnCompaction
+    queued.limits = input.limits
+    queued.autonomyBudget = { tokens: input.limits.tokens, timeout: input.limits.timeout }
+    delete queued.autonomyBaseline
+    queued.flagFormat = input.flagFormat
+    queued.consultationInput = {
+      trigger: "manual",
+      expertModels: [...input.expertModels],
+      synthesizerModel: input.synthesizerModel,
+      sourceRunID: queued.resumeRunID ?? input.sourceRunID,
+    }
+    queued.consultationPhase = "queued"
+    const event: RunEvent = {
+      at: input.requestedAt,
+      type: "status",
+      status: "consultation.manual.queued",
+      text: "用户发起多模型会诊；将在 solver 首次调用前执行",
+    }
+    queued.events.push(event)
+    this.notify({
+      at: event.at,
+      type: "run.consultation.queued",
+      slug: queued.challenge.slug,
+      runID: queued.queueID,
+      event,
+    })
+    return { mode: "before-start", runID: queued.queueID, model: input.solverModel }
   }
 
   private pump() {
@@ -1283,12 +1437,40 @@ export class GuiRunner {
   private remainingAutonomyLimits(job: Job) {
     if (!job.task) return undefined
     const totals = taskTotals(job.task)
-    const tokens = Math.floor(job.autonomyBudget.tokens - totals.billableTokens)
+    const baseline = job.autonomyBaseline ?? { billableTokens: 0, activeSolveMs: 0 }
+    const tokens = Math.floor(
+      job.autonomyBudget.tokens - Math.max(0, totals.billableTokens - baseline.billableTokens),
+    )
     const timeout = Math.floor(
-      job.autonomyBudget.timeout - activeSolveTimeMs(job.task.turns),
+      job.autonomyBudget.timeout -
+        Math.max(0, activeSolveTimeMs(job.task.turns) - baseline.activeSolveMs),
     )
     if (tokens < 1_000 || timeout < 1_000) return undefined
     return { ...job.limits, tokens, timeout } satisfies Limits
+  }
+
+  private async handleAgentConsultationRequest(
+    job: Job,
+    resolution: "queued" | "blocked",
+    detail: string,
+    request: ConsultationRequestReference,
+  ) {
+    if (!job.workspace) return
+    try {
+      await handleConsultationRequest({
+        directory: job.workspace.directory,
+        request,
+        resolution,
+        detail,
+      })
+    } catch (error) {
+      this.recordEvent(job, {
+        at: Date.now(),
+        type: "status",
+        status: "consultation.request.state-error",
+        text: errorText(error),
+      })
+    }
   }
 
   /**
@@ -1370,6 +1552,7 @@ export class GuiRunner {
       consultOnCompaction: job.consultOnCompaction,
       executionMode: job.executionMode,
       autonomyBudget: job.autonomyBudget,
+      autonomyBaseline: job.autonomyBaseline,
       autonomyEscalations: [...job.autonomyEscalations],
       ...(input.consultation
         ? {
@@ -1388,7 +1571,11 @@ export class GuiRunner {
               ...(input.consultation.contextWarning
                 ? { contextWarning: input.consultation.contextWarning }
                 : {}),
+              ...(input.consultation.request
+                ? { request: input.consultation.request }
+                : {}),
             },
+            consultationPhase: "queued" as const,
           }
         : {}),
       flagFormat: job.flagFormat,
@@ -1446,6 +1633,7 @@ export class GuiRunner {
       consultOnCompaction: job.consultOnCompaction,
       executionMode: job.executionMode,
       autonomyBudget: job.autonomyBudget,
+      autonomyBaseline: job.autonomyBaseline,
       autonomyEscalations: [...job.autonomyEscalations],
       flagFormat: job.flagFormat,
       controller: new AbortController(),
@@ -1646,6 +1834,10 @@ export class GuiRunner {
         })
       }
       const prior = taskTotals(job.task)
+      job.autonomyBaseline ??= {
+        billableTokens: prior.billableTokens,
+        activeSolveMs: activeSolveTimeMs(job.task.turns),
+      }
       job.priorTokens = prior.tokens
       job.priorBillableTokens = prior.billableTokens
       job.priorCost = prior.cost
@@ -1686,29 +1878,50 @@ export class GuiRunner {
           job.purpose === "solve" &&
           challenge.serviceRequired === true &&
           !challenge.remote?.trim()
-        if (localFirstWithoutRemote) {
+        const mustWaitForRemote = localFirstWithoutRemote && job.continuation
+        let canSolve = !mustWaitForRemote
+        if (mustWaitForRemote) {
+          outcome = {
+            stop: "blocked",
+            tokens: 0,
+            billable: 0,
+            cost: 0,
+            reply: "",
+            candidates: [],
+            detail: remoteURLBlockedDetail(true),
+          }
+          this.recordEvent(job, {
+            at: Date.now(),
+            type: "status",
+            status: "service.remote.blocked",
+            text: outcome.detail,
+          })
+        } else if (localFirstWithoutRemote) {
           // A missing service address is not a scheduler prerequisite. Attachments and source often
-          // support substantial offline progress, and a URL can be supplied before a later turn.
-          // Keep the slot productive and make the limitation explicit to the solver instead.
+          // support substantial offline progress. This is the one local-first turn; once it ends,
+          // the task enters the explicit remote-address block until the user supplies an endpoint.
           this.recordEvent(job, {
             at: Date.now(),
             type: "status",
             status: "service.remote-missing.local-first",
-            text: "未配置服务地址；本轮先进行本地分析，确实需要联网时再记录具体阻塞点",
+            text: "未配置服务地址；本轮先进行本地分析，结束后等待用户填写 URL",
           })
         }
-        const runtime = await this.ensureRuntime()
-        job.runtime = runtime
-        job.runtimeBackend = runtime.backend
-        job.runtimeVersion = runtime.version
-        job.promptVersion = runtime.promptVersion
+        let runtime: RuntimeHandle | undefined
+        if (canSolve) {
+          runtime = await this.ensureRuntime()
+          job.runtime = runtime
+          job.runtimeBackend = runtime.backend
+          job.runtimeVersion = runtime.version
+          job.promptVersion = runtime.promptVersion
+        }
         let limits = job.limits
         let hint = job.hint
-        let canSolve = true
         let preprocessingTokens = 0
         let preprocessingBillable = 0
         let preprocessingCost = 0
-        if (canSolve && job.consultationInput) {
+        if (canSolve && runtime && job.consultationInput) {
+          job.consultationPhase = "running"
           const consultationBudgets = allocateConsultationBudgets(
             limits.tokens,
             job.consultationInput.expertModels.length,
@@ -1813,8 +2026,15 @@ export class GuiRunner {
               timeout: solverTimeout,
             }
           }
+          job.consultationPhase = "complete"
         }
-        if (canSolve) {
+        if (canSolve && runtime) {
+          if (challenge.remote?.trim()) {
+            hint = [
+              `远程服务地址：${JSON.stringify(challenge.remote.trim())}`,
+              hint,
+            ].filter(Boolean).join("\n\n")
+          }
           if (localFirstWithoutRemote) {
             hint = [
               "该题标记为可能需要外部服务，但当前没有配置 URL 或 host:port。先完成附件、源码、静态分析和所有可离线验证；不要因为缺少地址而等待或立即判定失败。只有在证据表明确实必须连接服务时，才在 NOTES.md 中记录具体阻塞点、所需协议和地址类型，随后结束本轮等待用户补充地址。",
@@ -1852,6 +2072,7 @@ export class GuiRunner {
             handoffHistory: job.handoffHistory,
             handoffWarning: job.handoffWarning,
             handoffSignal: job.switchController.signal,
+            handoffKind: () => job.pendingConsultation ? "consultation" : "model-switch",
             consultOnCompaction: job.consultOnCompaction,
             purpose: job.purpose,
             acceptedFlag: job.task.acceptedFlag?.value,
@@ -1880,6 +2101,24 @@ export class GuiRunner {
               billable: outcome.billable + preprocessingBillable,
               cost: outcome.cost + preprocessingCost,
             }
+        }
+        if (
+          localFirstWithoutRemote &&
+          !mustWaitForRemote &&
+          outcome.stop !== "aborted" &&
+          outcome.stop !== "switched"
+        ) {
+          outcome = {
+            ...outcome,
+            stop: "blocked",
+            detail: remoteURLBlockedDetail(false),
+          }
+          this.recordEvent(job, {
+            at: Date.now(),
+            type: "status",
+            status: "service.remote.blocked",
+            text: outcome.detail,
+          })
         }
       }
     } catch (error) {
@@ -2016,22 +2255,28 @@ export class GuiRunner {
     }
 
     let queuedProductFollowup = false
+    const remoteURLBlocked = isRemoteURLBlocked(outcome)
     if (
       job.task &&
       job.workspace &&
-      outcome.stop === "switched" &&
-      (job.pendingSwitch || job.pendingEnvironmentSwitch) &&
+      (
+        (outcome.stop === "switched" &&
+          (job.pendingSwitch || job.pendingEnvironmentSwitch || job.pendingConsultation)) ||
+        (job.pendingConsultation && job.task.status !== "solved")
+      ) &&
+      !remoteURLBlocked &&
       !job.controller.signal.aborted
     ) {
       const request = job.pendingSwitch
       const environment = job.pendingEnvironmentSwitch
-      const limits = this.remainingAutonomyLimits(job)
+      const manualConsultation = job.pendingConsultation
+      const limits = manualConsultation?.limits ?? this.remainingAutonomyLimits(job)
       if (limits) {
         const at = Date.now()
         const warning = request?.warnings.length
           ? `兼容性影响：${request.warnings.join("；")}`
           : "未发现已知兼容性降级"
-        const hint = request && environment
+        const transitionHint = request && environment
           ? [
               `模型热切换：${job.model} -> ${request.model}。`,
               `任务环境切换：${job.executionMode} -> ${environment.executionMode}（${environment.profileId}）。`,
@@ -2044,20 +2289,33 @@ export class GuiRunner {
                 warning,
                 "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
               ].join("\n")
-            : [
-                "任务环境已切换，下一次会话使用新环境声明。",
-                "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
-              ].join("\n")
+            : environment
+              ? [
+                  "任务环境已切换，下一次会话使用新环境声明。",
+                  "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
+                ].join("\n")
+              : "保留原任务活动上下文、work/、NOTES.md 与已完成工具结果。"
+        const hint = manualConsultation
+          ? [
+              "用户在主 agent 运行过程中发起了多模型会诊。",
+              "先基于刚刚导出的活动上下文完成会诊，再把综合计划交还主 agent 继续当前任务。",
+              transitionHint,
+            ].join("\n")
+          : transitionHint
         const event: RunEvent = {
           at,
           type: "status",
-          status: environment && !request ? "environment.switch.queued" : "model.switch.queued",
+          status: manualConsultation
+            ? "consultation.manual.queued"
+            : environment && !request
+              ? "environment.switch.queued"
+              : "model.switch.queued",
           text: hint,
         }
         const followup: Job = {
           queueID: `queued-${crypto.randomUUID()}`,
           challenge: job.challenge,
-          model: request?.model ?? job.model,
+          model: request?.model ?? manualConsultation?.solverModel ?? job.model,
           limits,
           hint,
           resumeRunID: job.workspace.runID,
@@ -2065,15 +2323,30 @@ export class GuiRunner {
           purpose: job.purpose,
           writeupAttempts: job.writeupAttempts,
           recoveryAttempts: 0,
-          modelPolicy: request?.policy ?? job.modelPolicy,
-          consultModels: request ? [...request.consultModels] : [...job.consultModels],
-          blindReview: request?.blindReview ?? job.blindReview,
-          consultOnCompaction: request?.consultOnCompaction ?? job.consultOnCompaction,
+          modelPolicy: request?.policy ?? manualConsultation?.modelPolicy ?? job.modelPolicy,
+          consultModels: request
+            ? [...request.consultModels]
+            : manualConsultation
+              ? [...manualConsultation.consultModels]
+              : [...job.consultModels],
+          blindReview: request?.blindReview ?? manualConsultation?.blindReview ?? job.blindReview,
+          consultOnCompaction:
+            request?.consultOnCompaction ??
+            manualConsultation?.consultOnCompaction ??
+            job.consultOnCompaction,
           environmentProfileId: environment?.profileId ?? job.environmentProfileId,
           executionMode: environment?.executionMode ?? job.executionMode,
-          autonomyBudget: job.autonomyBudget,
-          autonomyEscalations: [...job.autonomyEscalations],
-          flagFormat: job.flagFormat,
+          autonomyBudget: manualConsultation
+            ? { tokens: limits.tokens, timeout: limits.timeout }
+            : job.autonomyBudget,
+          autonomyBaseline: manualConsultation
+            ? {
+                billableTokens: taskTotals(job.task).billableTokens,
+                activeSolveMs: activeSolveTimeMs(job.task.turns),
+              }
+            : job.autonomyBaseline,
+          autonomyEscalations: manualConsultation ? [] : [...job.autonomyEscalations],
+          flagFormat: manualConsultation?.flagFormat ?? job.flagFormat,
           controller: new AbortController(),
           switchController: new AbortController(),
           queuedAt: at,
@@ -2085,6 +2358,26 @@ export class GuiRunner {
           billableTokens: 0,
           cost: 0,
           eventWrites: Promise.resolve(),
+          ...(manualConsultation
+            ? {
+                consultationInput: {
+                  trigger: "manual" as const,
+                  expertModels: [...manualConsultation.expertModels],
+                  synthesizerModel: manualConsultation.synthesizerModel,
+                  sourceRunID: job.workspace.runID,
+                  ...(outcome.handoff?.resumeSessionID
+                    ? { resumeSessionID: outcome.handoff.resumeSessionID }
+                    : {}),
+                  ...(outcome.handoff?.history
+                    ? { history: outcome.handoff.history }
+                    : {}),
+                  ...(outcome.handoff?.contextWarning
+                    ? { contextWarning: outcome.handoff.contextWarning }
+                    : {}),
+                },
+                consultationPhase: "queued" as const,
+              }
+            : {}),
           ...(outcome.handoff?.resumeSessionID
             ? { resumeSessionID: outcome.handoff.resumeSessionID }
             : {}),
@@ -2105,7 +2398,11 @@ export class GuiRunner {
         this.queue.push(followup)
         this.notify({
           at,
-          type: environment && !request ? "run.environment-switch.queued" : "run.model-switch.queued",
+          type: manualConsultation
+            ? "run.consultation.queued"
+            : environment && !request
+              ? "run.environment-switch.queued"
+              : "run.model-switch.queued",
           slug: job.challenge.slug,
           runID: job.workspace.runID,
           event,
@@ -2143,7 +2440,7 @@ export class GuiRunner {
           hint: "最终中文 WRITEUP.md 尚未包含已确认 flag 和完整可复现步骤，请只补全 Writeup 后结束。",
         })
       }
-    } else if (job.task && outcome.primaryCandidate && candidateDisposition === "rejected") {
+    } else if (!remoteURLBlocked && job.task && outcome.primaryCandidate && candidateDisposition === "rejected") {
       queuedProductFollowup = this.queueTaskFollowup({
         source: job,
         purpose: "solve",
@@ -2158,24 +2455,63 @@ export class GuiRunner {
 
     if (
       !queuedProductFollowup &&
+      !remoteURLBlocked &&
       candidateDisposition === "none" &&
       job.purpose === "solve" &&
       outcome.consultationRequest
     ) {
       const request = outcome.consultationRequest
-      queuedProductFollowup = this.queueTaskFollowup({
-        source: job,
-        purpose: "solve",
-        status: `consultation.${request.trigger}.queued`,
-        hint: request.trigger === "compaction"
-          ? "上下文已完成压缩。先执行多模型会诊，再依据综合计划从 NOTES.md 与工作区状态继续求解。"
-          : `主模型主动请求多模型会诊：${request.reason}`,
-        consultation: request,
-      })
+      const alreadyHandled =
+        request.trigger === "agent-request" &&
+        request.request !== undefined &&
+        job.consultationInput?.request?.sessionID === request.request.sessionID &&
+        job.consultationInput.request.requestedAt === request.request.requestedAt
+      if (alreadyHandled) {
+        // The durable latch is best-effort. This in-memory identity check keeps a harmless state-file
+        // write failure from recursively scheduling the same consultation in the current process.
+        await this.handleAgentConsultationRequest(
+          job,
+          "queued",
+          "duplicate request ignored after its consultation already ran",
+          request.request!,
+        )
+      } else {
+        queuedProductFollowup = this.queueTaskFollowup({
+          source: job,
+          purpose: "solve",
+          status: `consultation.${request.trigger}.queued`,
+          hint: request.trigger === "compaction"
+            ? "上下文已完成压缩。先执行多模型会诊，再依据综合计划从 NOTES.md 与工作区状态继续求解。"
+            : `主模型主动请求多模型会诊：${request.reason}`,
+          consultation: request,
+        })
+      }
+      if (!alreadyHandled && request.trigger === "agent-request" && request.request) {
+        const detail = queuedProductFollowup
+          ? "multi-model consultation is queued"
+          : job.controller.signal.aborted
+            ? "consultation was not queued because the task was cancelled"
+            : "consultation was not queued because the authorized run budget is exhausted"
+        await this.handleAgentConsultationRequest(
+          job,
+          queuedProductFollowup ? "queued" : "blocked",
+          detail,
+          request.request,
+        )
+        if (!queuedProductFollowup) {
+          this.recordEvent(job, {
+            at: Date.now(),
+            type: "status",
+            status: "consultation.agent-request.blocked",
+            text: detail,
+          })
+        }
+      }
     }
 
     if (
       !queuedProductFollowup &&
+      !remoteURLBlocked &&
       candidateDisposition === "none" &&
       job.purpose === "solve" &&
       job.recoveryAttempts < RUN_RECOVERY_ATTEMPTS &&
@@ -2191,7 +2527,7 @@ export class GuiRunner {
       })
     }
 
-    if (!queuedProductFollowup && candidateDisposition === "none" && job.purpose === "solve") {
+    if (!queuedProductFollowup && !remoteURLBlocked && candidateDisposition === "none" && job.purpose === "solve") {
       await this.queueAutonomyFollowup(job, outcome).catch((error) => {
         this.notify({
           at: Date.now(),

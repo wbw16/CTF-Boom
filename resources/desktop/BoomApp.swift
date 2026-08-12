@@ -19,6 +19,15 @@ final class BoomAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let iconURL = Bundle.main.url(forResource: "Boom", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = icon
+            let iconView = NSImageView(frame: NSRect(x: 0, y: 0, width: 512, height: 512))
+            iconView.image = icon
+            iconView.imageScaling = .scaleProportionallyUpOrDown
+            NSApp.dockTile.contentView = iconView
+            NSApp.dockTile.display()
+        }
         installMenus()
 
         let controller = WKUserContentController()

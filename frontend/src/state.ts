@@ -26,7 +26,11 @@ export const isLive = (run?: RunHistory | null) =>
 
 export const isLegacyMissingRemoteBlock = (run?: RunHistory | null) =>
   run?.stop === "blocked" &&
-  /(?:requires an external service|no reachable remote endpoint|missing remote)/i.test(run.detail ?? "")
+  /(?:requires an external service|no reachable remote endpoint)/i.test(run.detail ?? "")
+
+export const isRemoteURLBlocked = (run?: RunHistory | null) =>
+  run?.stop === "blocked" &&
+  /(?:requires an external service|no reachable remote endpoint|missing remote|服务地址)/i.test(run.detail ?? "")
 
 export const confirmedRun = (challenge: ChallengeGui) =>
   [...challenge.runs].reverse().find(
@@ -73,7 +77,8 @@ export const isRunnableChallenge = (challenge: ChallengeGui) =>
   !challenge.state &&
   !confirmedRun(challenge) &&
   !activeCandidate(last(challenge)) &&
-  !isLive(last(challenge))
+  !isLive(last(challenge)) &&
+  !(isRemoteURLBlocked(last(challenge)) && !challenge.remote?.trim())
 
 export const runnableChallenges = (challenges: ChallengeGui[], category?: string) =>
   challenges.filter(
@@ -138,6 +143,8 @@ export function label(challenge: ChallengeGui, flagFormat = "") {
   if (run.stop === "queued") return ["排队中", "c-run"] as const
   if (run.stop === "running") return ["运行中", "c-run"] as const
   if (isLegacyMissingRemoteBlock(run)) return ["待继续", "c-warn"] as const
+  if (isRemoteURLBlocked(run))
+    return [challenge.remote?.trim() ? "待继续" : "等待服务地址", "c-warn"] as const
   if (confirmedRun(challenge)) return ["已归档", "c-ok"] as const
   if (run.taskStatus === "solved") return ["写作中", "c-warn"] as const
   if (activeCandidate(run))
@@ -162,6 +169,10 @@ export function why(challenge: ChallengeGui, flagFormat = "") {
   if (run.stop === "queued") return "等待运行槽位"
   if (run.stop === "running") return run.lastTool || "正在分析"
   if (isLegacyMissingRemoteBlock(run)) return "旧版本因未填服务地址提前停止；现在可直接继续本地分析"
+  if (isRemoteURLBlocked(run))
+    return challenge.remote?.trim()
+      ? "服务地址已填写，点击继续任务"
+      : "本地分析已完成，请填写服务地址后再继续"
   if (activeCandidate(run) && formatMismatch(run, activeCandidate(run), flagFormat))
     return `${primary(run)} 不符合你设定的格式`
   if (run.detail) return run.detail.split("\n")[0] ?? ""

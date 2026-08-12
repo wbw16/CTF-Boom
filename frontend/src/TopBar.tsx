@@ -116,7 +116,10 @@ export function TopBar() {
   return (
     <header className="topbar">
       <nav className="global-nav" aria-label="全局导航">
-        <span className="brand">Boom</span>
+        <span className="brand">
+          <img src="/boom-icon.svg" width="26" height="26" alt="" />
+          <span>Boom</span>
+        </span>
         <button type="button" className="workspace-pill" onClick={pickRoot} title={data.root}>
           <FolderOpen size={13} />
           <span>{workspaceName}</span>

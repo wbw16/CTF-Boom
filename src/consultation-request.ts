@@ -3,13 +3,20 @@ import path from "node:path"
 
 export const CONSULTATION_REQUEST_PATH = "work/.boom/consultation-request.json"
 
+export type ConsultationRequestStatus = "ready" | "handled"
+
 export type ConsultationRequest = {
   version: 1
-  status: "ready"
+  status: ConsultationRequestStatus
   sessionID: string
   reason: string
   requestedAt: string
+  handledAt?: string
+  resolution?: "queued" | "blocked"
+  detail?: string
 }
+
+export type ConsultationRequestReference = Pick<ConsultationRequest, "sessionID" | "requestedAt">
 
 function inside(base: string, target: string) {
   const relative = path.relative(base, target)
@@ -49,13 +56,37 @@ function parseConsultationRequest(value: unknown): ConsultationRequest {
   const requestedAt = requiredString(input.requestedAt, "requestedAt", 64, true)
   if (!Number.isFinite(new Date(requestedAt).valueOf()))
     throw new Error("Consultation request has an invalid requestedAt")
+  const statuses = new Set<ConsultationRequestStatus>(["ready", "handled"])
+  if (typeof input.status !== "string" || !statuses.has(input.status as ConsultationRequestStatus))
+    throw new Error("Consultation request has an invalid status")
+  const handledAt = input.handledAt === undefined
+    ? undefined
+    : requiredString(input.handledAt, "handledAt", 64, true)
+  if (handledAt && !Number.isFinite(new Date(handledAt).valueOf()))
+    throw new Error("Consultation request has an invalid handledAt")
+  if (input.resolution !== undefined && input.resolution !== "queued" && input.resolution !== "blocked")
+    throw new Error("Consultation request has an invalid resolution")
   return {
     version: 1,
-    status: "ready",
+    status: input.status as ConsultationRequestStatus,
     sessionID: requiredString(input.sessionID, "sessionID", 512, true),
     reason: requiredString(input.reason, "reason", 2_000),
     requestedAt,
+    ...(handledAt ? { handledAt } : {}),
+    ...(input.resolution ? { resolution: input.resolution as "queued" | "blocked" } : {}),
+    ...(input.detail === undefined
+      ? {}
+      : { detail: requiredString(input.detail, "detail", 2_000) }),
   }
+}
+
+async function writeConsultationRequest(target: string, request: ConsultationRequest) {
+  const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`
+  await writeFile(temporary, `${JSON.stringify(request, undefined, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  })
+  await rename(temporary, target)
 }
 
 export async function loadConsultationRequest(directory: string) {
@@ -94,11 +125,38 @@ export async function requestConsultation(input: {
     reason: requiredString(input.reason, "reason", 2_000),
     requestedAt: new Date().toISOString(),
   }
-  const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`
-  await writeFile(temporary, `${JSON.stringify(request, undefined, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  })
-  await rename(temporary, target)
+  await writeConsultationRequest(target, request)
   return request
+}
+
+/**
+ * Mark one exact, session-scoped request as handled without touching a newer request in the slot.
+ * This is deliberately a one-way, best-effort latch rather than a workflow state machine.
+ */
+export async function handleConsultationRequest(input: {
+  directory: string
+  request: ConsultationRequestReference
+  resolution: "queued" | "blocked"
+  detail?: string
+}) {
+  const target = await requestPath(input.directory)
+  if (!target) return undefined
+  const current = await loadConsultationRequest(input.directory)
+  if (
+    !current ||
+    current.sessionID !== input.request.sessionID ||
+    current.requestedAt !== input.request.requestedAt ||
+    current.status !== "ready"
+  ) return current
+  const updated: ConsultationRequest = {
+    ...current,
+    status: "handled",
+    handledAt: new Date().toISOString(),
+    resolution: input.resolution,
+    ...(input.detail?.trim()
+      ? { detail: requiredString(input.detail, "detail", 2_000) }
+      : {}),
+  }
+  await writeConsultationRequest(target, updated)
+  return updated
 }

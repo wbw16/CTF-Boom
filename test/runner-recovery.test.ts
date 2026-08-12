@@ -133,4 +133,114 @@ describe("host-level run recovery", () => {
       await runner.close()
     }
   })
+
+  test("blocks a service continuation until its endpoint is supplied", async () => {
+    const interpreter = Bun.which("python3")
+    if (!interpreter) return
+    const root = await mkdtemp(path.join(os.tmpdir(), "boom-remote-continuation-"))
+    temporary.push(root)
+    const source = path.join(root, "challenges", "service-task")
+    await mkdir(source, { recursive: true })
+    await writeFile(path.join(source, "README.md"), "continue against a live target")
+
+    let conversations = 0
+    const handle: RuntimeHandle = {
+      backend: "fake",
+      version: "test",
+      capabilities: {
+        eventStreaming: true,
+        toolCalls: true,
+        reasoning: false,
+        attachments: false,
+        web: false,
+        cancellation: true,
+        providerManagement: false,
+        providerOAuth: false,
+        compaction: false,
+      },
+      agent: {
+        async createConversation() {
+          conversations += 1
+          return {
+            id: `remote-${conversations}`,
+            async events() {
+              return { async *[Symbol.asyncIterator]() {} }
+            },
+            async prompt() {
+              return {
+                usage: { input: 4, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+                cost: 0,
+                finish: "stop" as const,
+                parts: [{ type: "text" as const, text: "local analysis complete" }],
+              }
+            },
+            async abort() {},
+          }
+        },
+      },
+      close() {},
+    }
+    const runner = new GuiRunner(root, async () => handle)
+    const challenge = {
+      slug: "service-task",
+      directory: source,
+      description: "continue against a live target",
+      files: [],
+      flagFormat: "",
+      serviceRequired: true,
+    }
+    const limits = { tokens: 10_000, repeats: 3, timeout: 30_000 }
+    const waitForIdle = async () => {
+      for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1)
+        await Bun.sleep(10)
+    }
+    try {
+      await runner.enqueue({
+        challenges: [challenge],
+        model: "test/solver",
+        limits,
+        flagFormat: "",
+        pythonInterpreter: interpreter,
+      })
+      await waitForIdle()
+      const [runID] = await readdir(path.join(root, "runs", challenge.slug))
+      const runDirectory = path.join(root, "runs", challenge.slug, runID!)
+      expect(JSON.parse(await readFile(path.join(runDirectory, "result.json"), "utf8"))).toMatchObject({
+        stop: "blocked",
+        detail: expect.stringContaining("missing remote URL"),
+      })
+      expect(conversations).toBe(1)
+
+      await runner.enqueue({
+        challenges: [challenge],
+        model: "test/solver",
+        limits,
+        flagFormat: "",
+        workspaces: { [challenge.slug]: runID! },
+        pythonInterpreter: interpreter,
+      })
+      await waitForIdle()
+      expect(conversations).toBe(1)
+      expect(JSON.parse(await readFile(path.join(runDirectory, "result.json"), "utf8"))).toMatchObject({
+        stop: "blocked",
+        detail: expect.stringContaining("本轮不会启动解题模型"),
+      })
+
+      await runner.enqueue({
+        challenges: [{ ...challenge, remote: "https://target.example/task-1" }],
+        model: "test/solver",
+        limits,
+        flagFormat: "",
+        workspaces: { [challenge.slug]: runID! },
+        pythonInterpreter: interpreter,
+      })
+      await waitForIdle()
+      expect(conversations).toBeGreaterThanOrEqual(2)
+      expect(JSON.parse(await readFile(path.join(runDirectory, "result.json"), "utf8"))).toMatchObject({
+        stop: "completed",
+      })
+    } finally {
+      await runner.close()
+    }
+  })
 })

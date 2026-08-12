@@ -56,6 +56,8 @@ async function harness() {
     profileId: string
     executionMode: string
   }> = []
+  const consultationRequests: unknown[] = []
+  let consultationSchedule: ReturnType<GuiRunner["requestConsultation"]>
   let armorPrompts = [
     { id: "general", name: "General", prompt: "PINNED FIRST" },
   ]
@@ -202,6 +204,10 @@ async function harness() {
         model: input.models?.[item.slug] ?? "free/test",
       }))
     },
+    requestConsultation: (input: unknown) => {
+      consultationRequests.push(input)
+      return consultationSchedule
+    },
     stop: (slug?: string) => {
       stops.push(slug)
       return 1
@@ -242,6 +248,10 @@ async function harness() {
     providerChanges,
     mcpChanges,
     envSwitches,
+    consultationRequests,
+    scheduleConsultation(value: ReturnType<GuiRunner["requestConsultation"]>) {
+      consultationSchedule = value
+    },
     notify(value: unknown) {
       subscribed?.(value)
     },
@@ -357,7 +367,12 @@ describe("GUI HTTP surface", () => {
       const html = await page.text()
       expect(html).toContain('<div id="root"></div>')
       expect(html).toContain('type="module"')
+      expect(html).toContain('href="/boom-icon.svg"')
       expect(html).not.toContain('id="consultModels"')
+      const icon = await request(one, "/boom-icon.svg")
+      expect(icon.status).toBe(200)
+      expect(icon.headers.get("content-type")).toContain("image/svg+xml")
+      expect(await icon.text()).toContain("Boom app icon")
       const asset = /\/assets\/index-[^"]+\.js/.exec(html)?.[0]
       expect(asset).toBeTruthy()
       const script = await request(one, asset ?? "/assets/missing.js")
@@ -665,6 +680,55 @@ describe("GUI HTTP surface", () => {
       })
       expect(crossOrigin.status).toBe(403)
 
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("accepts a manual consultation while the challenge agent is live", async () => {
+    const one = await harness()
+    try {
+      await request(one, "/api/settings", "PATCH", {
+        economyModel: "free/economy",
+        strongModel: "free/strong",
+        tokens: 4_000,
+        repeats: 3,
+        minutes: 5,
+        concurrency: 1,
+        flagFormat: "",
+        consultModels: ["free/expert-a", "free/expert-b"],
+        blindReview: false,
+        consultOnCompaction: false,
+      })
+      one.scheduleConsultation({
+        mode: "live-handoff",
+        runID: "queued-live-task",
+        model: "free/strong",
+      })
+
+      const response = await request(one, "/api/consultations", "POST", {
+        slug: "alpha",
+        // This transient ID intentionally does not exist on disk yet. A live request must reach the
+        // runner before the inactive-history validation path.
+        sourceRunID: "queued-live-task",
+        expertModels: ["free/expert-a", "free/expert-b"],
+      })
+
+      expect(response.status).toBe(202)
+      expect(await response.json()).toEqual({
+        queued: [{ slug: "alpha", id: "queued-live-task", model: "free/strong" }],
+        trigger: "manual",
+        mode: "live-handoff",
+      })
+      expect(one.enqueued).toHaveLength(0)
+      expect(one.consultationRequests[0]).toMatchObject({
+        slug: "alpha",
+        sourceRunID: "queued-live-task",
+        expertModels: ["free/expert-a", "free/expert-b"],
+        synthesizerModel: "free/strong",
+        solverModel: "free/strong",
+        limits: { tokens: 4_000, repeats: 3, timeout: 300_000 },
+      })
     } finally {
       await one.close()
     }

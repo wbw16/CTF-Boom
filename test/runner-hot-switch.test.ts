@@ -34,6 +34,7 @@ async function hotSwitchFixture() {
   let oldPromptResolve: (() => void) | undefined
   let oldAborts = 0
   const prompts: Array<{ model: string; text: string }> = []
+  const consultationPrompts: Array<{ model: string; title: string; text: string }> = []
   const resumed: string[] = []
   const closed: number[] = []
   let generation = 0
@@ -121,10 +122,34 @@ async function hotSwitchFixture() {
     },
   })
 
+  const consultationConversation = (title: string): RuntimeConversation => ({
+    id: `consult-${crypto.randomUUID()}`,
+    async events() {
+      return { async *[Symbol.asyncIterator]() {} }
+    },
+    async prompt(request) {
+      consultationPrompts.push({ model: request.model, title, text: request.text })
+      return {
+        usage,
+        cost: 0,
+        finish: "stop",
+        parts: [{
+          type: "text",
+          text: title === "Boom consult synthesis"
+            ? "merged diagnosis from the live context"
+            : `independent diagnosis from ${request.model}`,
+        }],
+      }
+    },
+    async abort() {},
+  })
+
   const launcher = async (): Promise<RuntimeHandle> => {
     const current = ++generation
     const agent: AgentRuntime = {
       async createConversation(input) {
+        if (input.title.startsWith("Boom consult"))
+          return consultationConversation(input.title)
         return conversation(input.directory, "session-hot")
       },
       async resumeConversation(input) {
@@ -184,6 +209,7 @@ async function hotSwitchFixture() {
     runner,
     releaseTool: () => releaseTool?.(),
     prompts,
+    consultationPrompts,
     resumed,
     closed,
     get oldAborts() { return oldAborts },
@@ -224,6 +250,56 @@ test("hot-switches an active model only after its running tool completes", async
       { model: "openai/old", stop: "switched" },
       { model: "openai/next", candidates: ["flag{switched}"] },
     ])
+  } finally {
+    await fixture.runner.close()
+  }
+})
+
+test("runs a user-requested consultation at a safe boundary and resumes the live solver", async () => {
+  const fixture = await hotSwitchFixture()
+  try {
+    const scheduled = fixture.runner.requestConsultation({
+      slug: "sample",
+      expertModels: ["openai/expert-a", "openai/expert-b"],
+      synthesizerModel: "openai/old",
+      solverModel: "openai/old",
+      modelPolicy: { economy: "openai/old", strong: "openai/old" },
+      consultModels: ["openai/expert-a", "openai/expert-b"],
+      blindReview: false,
+      consultOnCompaction: false,
+      limits: { tokens: 100_000, repeats: 5, timeout: 60_000 },
+      flagFormat: "flag\\{[^}]+\\}",
+      requestedAt: Date.now(),
+    })
+    expect(scheduled).toMatchObject({ mode: "live-handoff", model: "openai/old" })
+    expect(fixture.oldAborts).toBe(0)
+
+    fixture.releaseTool()
+    await waitForIdle(fixture.runner)
+
+    expect(fixture.oldAborts).toBe(1)
+    expect(fixture.consultationPrompts.map((item) => item.title)).toEqual([
+      "Boom consult 1/2",
+      "Boom consult 2/2",
+      "Boom consult synthesis",
+    ])
+    for (const prompt of fixture.consultationPrompts)
+      expect(prompt.text).toContain("artifact path: work/result.bin")
+    expect(fixture.prompts.map((item) => item.model)).toEqual(["openai/old", "openai/old"])
+    expect(fixture.prompts[1]?.text).toContain("merged diagnosis from the live context")
+    expect(fixture.resumed).toEqual(["session-hot"])
+
+    const [runID] = await readdir(path.join(fixture.root, "runs", "sample"))
+    const task = JSON.parse(await readFile(path.join(fixture.root, "runs", "sample", runID!, "task.json"), "utf8"))
+    expect(task.turns).toMatchObject([
+      { model: "openai/old", stop: "switched" },
+      { model: "openai/old", candidates: ["flag{switched}"] },
+    ])
+    const consultation = JSON.parse(await readFile(
+      path.join(fixture.root, "runs", "sample", runID!, "work", "consultation.json"),
+      "utf8",
+    ))
+    expect(consultation).toMatchObject({ trigger: "manual", source_run_id: runID })
   } finally {
     await fixture.runner.close()
   }

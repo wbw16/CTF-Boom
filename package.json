@@ -38,6 +38,7 @@
     "NOTICE",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
+    "frontend/dist",
     "prototype/boom-gui-v3.html",
     "prototype/boom-gui-v3.js",
     "resources",
@@ -50,6 +51,8 @@
     "dev:web": "vite",
     "gui": "bun src/index.ts gui",
     "test": "bun run build:web && bun test test/",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p frontend/tsconfig.json"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p frontend/tsconfig.json",
+    "prepack": "bun run typecheck && bun run test",
+    "pack:check": "bun scripts/verify-package.ts"
   }
 }

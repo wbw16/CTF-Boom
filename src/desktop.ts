@@ -5,14 +5,20 @@ import type { NativeClientProcess } from "./gui-command.ts"
 
 const PACKAGE_ROOT = path.resolve(import.meta.dir, "..")
 const SOURCE = path.join(PACKAGE_ROOT, "resources", "desktop", "BoomApp.swift")
+const ICON = path.join(PACKAGE_ROOT, "resources", "desktop", "Boom.icns")
 const COMPILE_FLAGS = ["-O", "-swift-version", "5", "-framework", "AppKit", "-framework", "WebKit"]
 
 export type NativeClientCacheInput = {
   source: string
+  icon: Uint8Array
   compilerVersion: string
   architecture: string
   flags: string[]
   boomVersion: string
+}
+
+export function nativeClientOpenCommand(app: string, url: string) {
+  return ["open", "-n", "-W", app, "--args", url]
 }
 
 export function nativeClientCacheKey(input: NativeClientCacheInput) {
@@ -20,6 +26,7 @@ export function nativeClientCacheKey(input: NativeClientCacheInput) {
     .update(
       JSON.stringify({
         source: input.source,
+        icon: Array.from(input.icon),
         compilerVersion: input.compilerVersion,
         architecture: input.architecture,
         flags: input.flags,
@@ -64,6 +71,7 @@ function infoPlist(version: string) {
   <key>CFBundleExecutable</key><string>Boom</string>
   <key>CFBundleIdentifier</key><string>com.boom.ctf</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleIconFile</key><string>Boom.icns</string>
   <key>CFBundleName</key><string>Boom</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${xml(version)}</string>
@@ -90,10 +98,14 @@ export async function ensureDesktopClient() {
   const source = await readFile(SOURCE, "utf8").catch(() => {
     throw new Error("Boom installation is missing resources/desktop/BoomApp.swift")
   })
+  const icon = await readFile(ICON).catch(() => {
+    throw new Error("Boom installation is missing resources/desktop/Boom.icns")
+  })
   const compilerVersion = await run(["xcrun", "swiftc", "--version"])
   const version = await packageVersion()
   const key = nativeClientCacheKey({
     source,
+    icon,
     compilerVersion,
     architecture: process.arch,
     flags: COMPILE_FLAGS,
@@ -104,32 +116,41 @@ export async function ensureDesktopClient() {
   const contents = path.join(app, "Contents")
   const executable = path.join(contents, "MacOS", "Boom")
   const plist = path.join(contents, "Info.plist")
+  const resources = path.join(contents, "Resources")
+  const bundledIcon = path.join(resources, "Boom.icns")
   const ready = path.join(directory, "ready")
-  const [readyValue, executableInfo, plistInfo] = await Promise.all([
+  const [readyValue, executableInfo, plistInfo, iconInfo] = await Promise.all([
     readFile(ready, "utf8").catch(() => ""),
     stat(executable).catch(() => undefined),
     stat(plist).catch(() => undefined),
+    stat(bundledIcon).catch(() => undefined),
   ])
   if (
     readyValue.trim() === key &&
     executableInfo?.isFile() &&
     executableInfo.size > 0 &&
     (executableInfo.mode & 0o111) !== 0 &&
-    plistInfo?.isFile()
+    plistInfo?.isFile() &&
+    iconInfo?.isFile() &&
+    iconInfo.size > 0
   )
     return { app, executable, key }
 
   await mkdir(path.dirname(executable), { recursive: true })
+  await mkdir(resources, { recursive: true })
   const suffix = `${process.pid}.${crypto.randomUUID()}`
   const temporaryExecutable = path.join(directory, `Boom.${suffix}.tmp`)
   const temporaryPlist = path.join(directory, `Info.${suffix}.tmp`)
   const temporaryReady = path.join(directory, `ready.${suffix}.tmp`)
+  const temporaryIcon = path.join(resources, `Boom.${suffix}.icns.tmp`)
   try {
     await run(["xcrun", "swiftc", ...COMPILE_FLAGS, SOURCE, "-o", temporaryExecutable])
     await chmod(temporaryExecutable, 0o755)
     await writeFile(temporaryPlist, infoPlist(version), "utf8")
+    await writeFile(temporaryIcon, icon)
     await rename(temporaryExecutable, executable)
     await rename(temporaryPlist, plist)
+    await rename(temporaryIcon, bundledIcon)
     await writeFile(temporaryReady, `${key}\n`, "utf8")
     await rename(temporaryReady, ready)
   } finally {
@@ -137,6 +158,7 @@ export async function ensureDesktopClient() {
       rm(temporaryExecutable, { force: true }),
       rm(temporaryPlist, { force: true }),
       rm(temporaryReady, { force: true }),
+      rm(temporaryIcon, { force: true }),
     ])
   }
   return { app, executable, key }
@@ -147,7 +169,7 @@ export async function launchDesktopClient(url: string): Promise<NativeClientProc
   if (target.protocol !== "http:" || target.hostname !== "127.0.0.1")
     throw new Error(`Boom desktop client only accepts a loopback HTTP URL, got: ${url}`)
   const built = await ensureDesktopClient()
-  const child = Bun.spawn([built.executable, target.toString()], {
+  const child = Bun.spawn(nativeClientOpenCommand(built.app, target.toString()), {
     stdin: "ignore",
     stdout: "inherit",
     stderr: "inherit",
@@ -160,7 +182,14 @@ export async function launchDesktopClient(url: string): Promise<NativeClientProc
   return {
     exited,
     terminate() {
-      if (!ended) child.kill()
+      if (!ended) {
+        child.kill()
+        Bun.spawn(["osascript", "-e", 'tell application id "com.boom.ctf" to quit'], {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+        })
+      }
     },
   }
 }

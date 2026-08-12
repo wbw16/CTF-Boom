@@ -87,14 +87,18 @@ export function useActions() {
         return false
       }
       try {
-        await postJSON("/api/consultations", {
+        const result = await postJSON<{ mode?: "queued" | "before-start" | "live-handoff" }>("/api/consultations", {
           slug,
           sourceRunID: runID,
           expertModels: settings.consultModels,
           model: settings.strongModel,
           synthesizerModel: settings.strongModel,
         })
-        toast("多模型会诊已排队，综合后会自动继续求解")
+        toast(
+          result.mode === "live-handoff"
+            ? "会诊请求已接收；当前工具完成后会暂停主 agent，会诊后自动继续"
+            : "多模型会诊已排队，综合后会自动继续求解",
+        )
         await refresh()
         return true
       } catch (error) {

@@ -72,6 +72,11 @@ export type Outcome = {
   consultationRequest?: {
     trigger: "agent-request" | "compaction"
     reason: string
+    /** Exact durable request consumed by the host; absent for compaction-triggered consultations. */
+    request?: {
+      sessionID: string
+      requestedAt: string
+    }
     /** Durable solver session to resume after a live-session consultation. */
     resumeSessionID?: string
     /** Provider-neutral history seen by the live solver, preserved as complete messages. */
@@ -501,6 +506,8 @@ export async function runChallenge(input: {
   handoffWarning?: string
   /** Request a live handoff at the next complete assistant-message or tool-result boundary. */
   handoffSignal?: AbortSignal
+  /** Resolve user-facing events for the reason that requested this otherwise generic handoff. */
+  handoffKind?: () => "model-switch" | "consultation"
   /** Explicit experiment policy. Defaults to the repaired-Boom baseline: consult after compaction. */
   consultOnCompaction?: boolean
   purpose?: "solve" | "writeup"
@@ -527,7 +534,9 @@ export async function runChallenge(input: {
       cost: 0,
       reply: "",
       candidates: [],
-      detail: "model/provider switch requested before the previous model started",
+      detail: input.handoffKind?.() === "consultation"
+        ? "consultation requested before the previous model started"
+        : "model/provider switch requested before the previous model started",
     }
 
   let resumeWarning: string | undefined
@@ -719,7 +728,13 @@ export async function runChallenge(input: {
     if (!handoffRequested || stop !== undefined || runningCalls.size > 0) return false
     // Stop the old provider before reading its durable context. This prevents it from beginning the
     // next model step while the snapshot request is in flight; completed tool results remain durable.
-    await abort("switched", `model/provider switch accepted at ${boundary} boundary`)
+    const consultation = input.handoffKind?.() === "consultation"
+    await abort(
+      "switched",
+      consultation
+        ? `consultation accepted at ${boundary} boundary`
+        : `model/provider switch accepted at ${boundary} boundary`,
+    )
     await captureConsultationHistory(false)
     handoff = {
       resumeSessionID: sessionID,
@@ -728,7 +743,7 @@ export async function runChallenge(input: {
     }
     await emit({
       type: "status",
-      status: "model.switch.boundary",
+      status: consultation ? "consultation.manual.boundary" : "model.switch.boundary",
       text: `${boundary} · ${sessionID}`,
     })
     return true
@@ -739,9 +754,10 @@ export async function runChallenge(input: {
   }
   const externalHandoff = () => {
     handoffRequested = true
+    const consultation = input.handoffKind?.() === "consultation"
     void emit({
       type: "status",
-      status: "model.switch.waiting-boundary",
+      status: consultation ? "consultation.manual.waiting-boundary" : "model.switch.waiting-boundary",
       text: runningCalls.size > 0 ? "等待当前工具返回" : "等待当前消息完成",
     })
   }
@@ -1200,11 +1216,15 @@ export async function runChallenge(input: {
   } else if (input.purpose !== "writeup") {
     try {
       const stored = await loadConsultationRequest(input.workspace.directory)
-      if (stored?.sessionID === sessionID) {
+      if (stored?.status === "ready" && stored.sessionID === sessionID) {
         if (!consultationHistory) await captureConsultationHistory()
         consultationRequest = {
           trigger: "agent-request",
           reason: stored.reason,
+          request: {
+            sessionID: stored.sessionID,
+            requestedAt: stored.requestedAt,
+          },
           resumeSessionID: sessionID,
           ...(consultationHistory ? { history: consultationHistory } : {}),
           ...(contextWarning ? { contextWarning } : {}),
