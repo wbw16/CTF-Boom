@@ -1,6 +1,8 @@
 <div align="center">
 
-# CTF-Boom
+<h1>
+  <img src="./frontend/public/ctf-boom-logo.svg" alt="CTF-Boom" width="720" />
+</h1>
 
 **面向 CTF 的自主 AI 解题 Agent 与桌面工作台**
 
