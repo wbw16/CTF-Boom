@@ -1,6 +1,6 @@
 # Boom project memory
 
-Last updated: 2026-08-09.
+Last updated: 2026-08-13.
 
 Read this first when resuming work. It records what is built, what is proven, and what is not — not
 how the code is structured (read the code for that).
@@ -14,7 +14,8 @@ is `codex/slim-solver`, based on `codex/boom-v3`. The original
 that snapshot wholesale: it includes an unfinished orchestration rewrite.
 
 `docs/BOOM_V3.md` is the historical M0–M8 architecture record; this file and the current code define
-the slimmer product. The runtime milestones M1–M5,
+the slimmer product. The IDA Pro MCP integration landed on `codex/public-release` (commit `397d907`);
+do not treat `codex/slim-solver` as the only active product branch. The runtime milestones M1–M5,
 autonomy-first orchestration, neutral Agent resources, the Tool Host/Policy, Native kernel and first
 party Provider drivers are implemented and covered by the current test suite. The current product
 route keeps OpenCode as the stable bundled Runtime; Native remains an experimental and test asset,
@@ -28,8 +29,9 @@ handoff is injected into every continuation turn, automatic escalation is capped
 second opinion with the economy model, and writeup turns use the economy model. V2 baseline,
 checkpoint roles/API/UI, evidence branches, verifier state, automatic recovery, and their agent
 resources/tests are deleted. CLI now delegates to `GuiRunner`, so active and post-compaction
-consultation have CLI/GUI parity. MCP is intentionally left untouched and
-reserved for future analysis-tool integration (e.g. IDA Pro / Wireshark MCP).
+consultation have CLI/GUI parity. The managed `idalib` (headless IDA Pro) MCP is now product-integrated
+through Boom's own thin result broker; other analysis-tool MCP servers (e.g. Wireshark) remain future
+integration targets.
 
 The user's stated target failure mode is a solver that **tunnels**: it keeps working, does not notice
 it is in a dead end, and digs deeper instead of reconsidering. Three pieces now address it, all built
@@ -189,6 +191,17 @@ summarizing before the provider window is exceeded. A completed main-solver comp
 the same host-side consultation transition as `ctf-consult`, so the solver gets an external plan before
 resuming from compressed memory.
 
+**IDA Pro MCP runs through Boom's thin result broker.** The managed local server `idalib` is wrapped at
+runtime-config compile time (`wrapLocalIdaProxy`) into
+`[bun, src/runtime/ida-proxy.ts, ...idalib-mcp]`. The proxy is a pure stdio passthrough that never
+rewrites tool schemas: oversized results are archived to `work/ida/results/<id>.txt` with a
+pointer+preview left in context, an upstream-truncated `analyze_batch` is re-queried per function,
+dedup is keyed on canonical args plus result hash with an `index.jsonl` ledger, and
+`boom_ida_get`/`boom_ida_list` (surfaced to the model as `idalib_boom_ida_get`/`idalib_boom_ida_list`)
+read archives in bounded line chunks. Offload threshold is `BOOM_IDA_OFFLOAD_CHARS` (default 16K
+chars). Workspace discovery uses MCP `roots/list`; any failure — no root, disk write, upstream error —
+degrades to verbatim pass-through. Upstream `idalib-mcp` and its read-only profile are untouched.
+
 **Writeup is a separate flow, not a main-flow phase.** After acceptance the task stays `solved` until
 the user explicitly triggers it (GUI **生成 Writeup** button / `POST /api/runs/writeup`). That turn
 reads the confirmed flag and run artifacts, writes `work/WRITEUP.md`, and only then archives the
@@ -303,6 +316,10 @@ grid tracks, and wrapping long paths.
 | Task memory | Unit tests prove multi-model turns aggregate in one `task.json`, rejected flags survive in task memory, checkpoint-ready NOTES use the structured skeleton, and host confirmation data is absent from the workspace |
 | Slim orchestration | Tests prove direct L0 solving, one continuation, one L1 per progress fingerprint, read-only consultant isolation, model/post-compaction consultation transitions, and the absence of fixed V2 pre-passes |
 | Runtime replacement boundary | 115 core tests / 537 assertions pass. Shared conformance drives the real OpenCode adapter with a deterministic scripted Provider and covers normalized lifecycle/text/reasoning/tool/usage/retry/finish, cancellation, path/edit/exec/note/submission behavior, tool defaults, role isolation, and stable prompts. |
+| IDA MCP result broker | 8 proxy tests over a fake upstream cover passthrough, tool merge, archiving, per-function split, dedup, error passthrough, chunked retrieval, and no-root degradation. A real-IDA end-to-end using the actual `idalib-mcp` and `task-ef2417cb55`'s binary archived `idb_open`/`survey_binary`/`decompile` to `work/ida/results/`, left small `get_bytes` inline, and read back bounded chunks via `boom_ida_get`/`boom_ida_list`. `runtime-mcp` boots the wrapped command through real OpenCode. |
+| armor-prompt plugin load | The `system.replace is not a function` plugin-load crash is gone from the 2026-08-13 runtime log after removing the stray named export; regression test simulates OpenCode's legacy module loader. |
+| Recovery context handoff | Silent/stalled turns export a ≤200K-char context snapshot into the next recovery prompt; session and runner tests assert the snapshot is rendered and injected. |
+| REVERSE task-ef2417cb55 | Re-run on 2026-08-13 completed with candidate `CTF{upDN_B_a_im_ur_pRoOf_0f_p1y}` (manual verdict pending); no recurrence of the previous provider stalls, and `ctf-note` populated `NOTES.md` this time. |
 
 ## Measured results — the honest number
 
@@ -325,6 +342,12 @@ tasks (`easy_cms`, `Rabbit`, `ddl`, `镜子里面的世界`) burn 8–14M raw to
 main causes are context bloat, repeated reasoning, and escalation overhead — the target of the
 slimming work above. The 300k normalization, compaction consultation, proactive `ctf-consult`, and
 calibrated brake are the current mitigations; they have not yet been measured on the benchmark.
+
+2026-08-13: `task-ef2417cb55` (Hard REVERSE, "Orbit Residue") re-run completed with candidate
+`CTF{upDN_B_a_im_ur_pRoOf_0f_p1y}` after 7.19M raw tokens across two turns
+(`mimo/mimo-v2.5-pro` hot-switched to `deepseek/deepseek-v4-flash`), awaiting manual verdict. The
+earlier 3.30M-token run on the same challenge died of three provider stalls with no notes written;
+this run reached the candidate and wrote full `NOTES.md` findings.
 
 ## Known problems
 
@@ -356,6 +379,19 @@ it is now `stop: "empty"`. `reply` falls back to reasoning text so a stated flag
 **Native is not the current product gate.** The Native kernel and drivers remain useful experimental
 and conformance assets, but the stable product Runtime is OpenCode. New work should close product
 gaps at the Boom boundary instead of expanding Native for replaceability alone.
+
+**Upstream idalib-mcp hides outputs above 50K chars.** ida-pro-mcp replaces oversized structured
+outputs with a preview plus an HTTP download hint; in headless stdio mode there is no HTTP server, so
+the full payload exists only in a bounded in-process cache. Boom's proxy recovers per-function data
+for `analyze_batch` by re-querying, but the durable fix is an upstream PR (expose `get_cached_output`
+in stdio or make the limit configurable).
+
+**Note-taking is not yet guaranteed.** The failed 2026-08-12 run of `task-ef2417cb55` made zero
+`ctf-note` calls across 237 tool events and left `NOTES.md` as the template, even though the solver
+profile permits the tool. The provider stalls cut each turn before any handoff moment, and the model
+stored progress as `work/*.py` scripts instead of conclusions. The 2026-08-13 run did write notes, so
+this is behavioral rather than a tooling failure; consider a hard prompt rule or a soft host check
+(e.g. remind after `idb_open` completes with no note yet) if it recurs.
 
 ## Gotchas
 
@@ -401,6 +437,15 @@ gaps at the Boom boundary instead of expanding Native for replaceability alone.
   the built bundle is served; manual browser QA used Playwright against a running `boom gui`.
   When testing escaping, assert on **which tags the output contains**, not on substrings: an escaped
   payload still contains the text `onerror=`, so a substring assertion reports a false failure.
+- Bun strips the first `--` after a script path from `process.argv`. `ida-proxy.ts` therefore takes
+  the upstream command as plain positional arguments with no separator; do not re-add a `--` marker
+  to the wrapped MCP command.
+- OpenCode prefixes MCP tool names with the server ID (`idalib_*`): the model sees
+  `idalib_boom_ida_get`/`idalib_boom_ida_list`, while the wire `tools/call` to the proxy carries the
+  raw names `boom_ida_get`/`boom_ida_list`. Keep both names straight in prompts and tests.
+- OpenCode truncates every tool result at 50KB/2000 lines by default and stores the remainder in an
+  isolated runtime temp directory that Boom's task-relative file tools cannot read. The IDA proxy
+  must not rely on that spill path; it archives from the response it actually receives.
 - OpenCode SDK/event/session/provider names are allowed only in `src/runtime.ts` and the compatibility
   plugin resources. A core module importing them is a boundary regression.
 - `resources/plugin/boom-exec.ts`, `ctf-note.ts`, and `ctf-submit.ts` remain legacy dedicated OpenCode
@@ -435,5 +480,10 @@ assertion failure.
    challenges) measuring solve rate, wrong-candidate rate, tokens, time and failure category. Let
    those measurements choose the next solver improvement; do not add another runtime subsystem by
    default.
-5. **Keep MCP untouched.** No MCP product expansion for now; reserve the integration surface for
-   analysis-tool MCP servers (IDA Pro, Wireshark) that assist solving.
+5. **Confirm the 2026-08-13 candidate.** Verify or reject `CTF{upDN_B_a_im_ur_pRoOf_0f_p1y}` for
+   `task-ef2417cb55`, then fold the verdict into the measured numbers.
+6. **Upstream ida-pro-mcp PR.** Expose `get_cached_output` in stdio mode or make the 50K-char
+   structured-output limit configurable, then simplify the proxy's per-function re-query path.
+7. **Guarantee note-taking.** If another run burns many tokens without `ctf-note`, add a hard prompt
+   rule (note after key findings) or a soft host check that reminds after `idb_open`/N steps with no
+   note yet.
