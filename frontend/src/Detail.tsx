@@ -8,14 +8,15 @@ import { renderMarkdown } from "./markdown"
 import {
   alternatives,
   categoryOf,
+  currentRun,
   displayFlagRun,
   flagEntries,
   flagHistoryStatus,
   formatMismatch,
   isLive,
   isUnconfirmedFlag,
-  last,
   primary,
+  withRunDetail,
 } from "./state"
 import type { ChallengeGui, RunFile, RunHistory } from "./types"
 
@@ -28,7 +29,8 @@ export function Detail() {
   const [tab, setTab] = useState<Tab>("activity")
   const [hint, setHint] = useState("")
   const [detailMenu, setDetailMenu] = useState(false)
-  const challenge = data?.challenges.find((item) => item.slug === selected)
+  const summaryChallenge = data?.challenges.find((item) => item.slug === selected)
+  const challenge = summaryChallenge ? withRunDetail(summaryChallenge, detail) : undefined
   const [remoteDraft, setRemoteDraft] = useState("")
   const [savingRemote, setSavingRemote] = useState(false)
   useEffect(() => setDetailMenu(false), [selected])
@@ -49,10 +51,12 @@ export function Detail() {
       </main>
     )
   }
-  const run = detail ?? last(challenge)
+  const run = detail
+    ? challenge.runs.find((item) => item.id === detail.id) ?? currentRun(challenge)
+    : currentRun(challenge)
   const live = isLive(run)
   const settings = data.settings
-  const flagRun = displayFlagRun(challenge)
+  const flagRun = displayFlagRun(challenge, run)
   const flag = primary(flagRun)
   const mismatch = flag && formatMismatch(flagRun, flag, settings.flagFormat)
   const archived = flagRun?.taskStatus === "archived" || !!flagRun?.confirmedFlag
@@ -67,7 +71,7 @@ export function Detail() {
         : "run"
 
   const rerun = async () => {
-    await actions.runChallenges([challenge.slug], { hint, runID: last(challenge)?.id, settings })
+    await actions.runChallenges([challenge.slug], { hint, runID: run?.id, settings })
     setHint("")
   }
 
@@ -99,7 +103,7 @@ export function Detail() {
     const tokens = settings.tokens * 2
     try {
       await postJSON("/api/settings", { ...settings, tokens })
-      await actions.runChallenges([challenge.slug], { hint, runID: last(challenge)?.id })
+      await actions.runChallenges([challenge.slug], { hint, runID: run?.id })
       toast("已提高上限并继续")
     } catch (error) {
       toast((error as Error).message, "error")
@@ -263,7 +267,7 @@ export function Detail() {
                   </button>
                 ) : null}
                 <div className="menu-sep" />
-                <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void actions.startConsultation(challenge.slug, settings, last(challenge)?.id) }}>
+                <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void actions.startConsultation(challenge.slug, settings, run?.id) }}>
                   ⚖ 发起会诊
                 </button>
                 {run && !live ? (
@@ -342,14 +346,14 @@ export function Detail() {
                 archived={archived}
                 onAction={(action) => void verdictAction(action)}
               />
-              <FlagsPane challenge={challenge} />
+              <FlagsPane challenge={challenge} run={run} />
             </section>
             <section className="workspace-section">
               <h3>Writeup</h3>
               <MarkdownPane text={flag ? flagRun?.writeup ?? "" : ""} fallback="暂无 Writeup" />
               <details className="result-meta">
                 <summary>运行元数据</summary>
-                <MetaPane run={run} flag={flag} flagRun={flagRun} now={now} />
+                <MetaPane run={flagRun ?? run} flag={flag} flagRun={flagRun} now={now} />
               </details>
             </section>
           </div>
@@ -480,8 +484,7 @@ function Verdict({
   else if (accepted) sourceParts.push("✓ Flag 已确认，主流程结束；需要时点击「生成 Writeup」")
   if (flagRun?.rejectedFlags?.includes(flag)) sourceParts.push("已标记为错误，仍会保留；如果判断有误可重新确认。")
   const others = alternatives(flagRun)
-  const candidateRun = displayFlagRun(challenge)
-  if (flag && candidateRun !== run) sourceParts.push("历史任务中的候选；当前运行没有新 flag。")
+  if (flag && flagRun !== run) sourceParts.push("历史任务中的候选；当前运行没有新 flag。")
 
   return (
     <div className={`verdict${flag ? " has-flag" : ""}${mismatch ? " mismatch" : ""}${flag && !mismatch && !accepted ? " candidate" : ""}${flag && !mismatch && accepted ? " accepted" : ""}`}>
@@ -537,10 +540,10 @@ function Verdict({
   )
 }
 
-function FlagsPane({ challenge }: { challenge: ChallengeGui }) {
+function FlagsPane({ challenge, run }: { challenge: ChallengeGui; run?: RunHistory }) {
   const { toast } = useApp()
   const actions = useActions()
-  const entries = flagEntries(challenge)
+  const entries = flagEntries(challenge, run)
   if (!entries.length) return <div className="empty">尚无 flag 历史</div>
   return (
     <div className="flag-history">

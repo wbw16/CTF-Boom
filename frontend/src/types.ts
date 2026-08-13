@@ -186,6 +186,8 @@ export type ChallengeGui = {
 }
 
 export type GuiState = {
+  instanceID?: string
+  sequence?: number
   root: string
   settings: GuiSettings
   models: ModelInfo[]
@@ -338,6 +340,7 @@ export type PlatformCatalog = {
 }
 
 export type RunnerNotification = {
+  instanceID?: string
   at: number
   sequence?: number
   type: string

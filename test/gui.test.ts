@@ -398,6 +398,9 @@ describe("GUI HTTP surface", () => {
       const before = await request(one, "/api/state")
       expect(before.status).toBe(200)
       const initial = (await before.json()) as {
+        instanceID: string
+        sequence: number
+        root: string
         runtime: { status: string }
         models: Array<{ id: string }>
         challenges: Array<{
@@ -411,6 +414,8 @@ describe("GUI HTTP surface", () => {
         }>
       }
       expect(initial.runtime.status).toBe("ready")
+      expect(initial.instanceID).toBeString()
+      expect(initial.sequence).toBeGreaterThanOrEqual(0)
       expect(initial.models.map((model) => model.id)).toEqual(["free/test"])
       expect(initial.challenges).toHaveLength(1)
       expect(initial.challenges[0]).toMatchObject({
@@ -426,12 +431,55 @@ describe("GUI HTTP surface", () => {
       )
       expect(detail.status).toBe(200)
       const detailed = (await detail.json()) as {
+        instanceID: string
+        sequence: number
+        root: string
         run: { notes: string; files: Array<{ path: string }> }
       }
+      expect(detailed.instanceID).toBe(initial.instanceID)
+      expect(detailed.sequence).toBeGreaterThanOrEqual(initial.sequence)
+      expect(detailed.root).toBe(initial.root)
       expect(detailed.run.notes).toBe("durable note")
       expect(detailed.run.files.map((file) => file.path)).toContain(
         "work/artifact.txt",
       )
+
+      await Promise.all([
+        writeFile(path.join(one.run, "NOTES.md"), "live evidence update"),
+        writeFile(path.join(one.run, "work", "new-proof.txt"), "new proof"),
+        writeFile(path.join(one.run, "work", "WRITEUP.md"), "# Live writeup\n\nflag{alpha}"),
+        writeFile(
+          path.join(one.run, "work", "events.jsonl"),
+          `${JSON.stringify({ at: 123, type: "tool", tool: "ctf-note", status: "completed", text: "saved" })}\n`,
+        ),
+      ])
+      const refreshedDetail = await request(
+        one,
+        `/api/challenges/alpha/runs/${encodeURIComponent(one.runID)}`,
+      )
+      expect(refreshedDetail.status).toBe(200)
+      const refreshedRun = (await refreshedDetail.json() as {
+        run: { files: Array<{ path: string; directory: boolean; size: number }> }
+      }).run
+      expect(refreshedRun).toMatchObject({
+        notes: "live evidence update",
+        writeup: "# Live writeup\n\nflag{alpha}",
+        primaryCandidate: "flag{alpha}",
+        events: [{ tool: "ctf-note", status: "completed" }],
+      })
+      expect(refreshedRun.files).toContainEqual({
+        path: "work/new-proof.txt",
+        directory: false,
+        size: 9,
+      })
+      const refreshedSummary = await request(one, "/api/state")
+      const refreshedSummaryBody = await refreshedSummary.json() as {
+        challenges: Array<{ runs: Array<{ notes: string; writeup?: string; files: unknown[] }> }>
+      }
+      expect(refreshedSummaryBody).toMatchObject({
+        challenges: [{ runs: [{ notes: "", files: [] }] }],
+      })
+      expect(refreshedSummaryBody.challenges[0]!.runs[0]!.writeup ?? "").toBe("")
 
       const providers = await request(one, "/api/providers")
       expect(providers.status).toBe(200)
@@ -976,6 +1024,42 @@ describe("GUI HTTP surface", () => {
       candidateSource: "submission",
       verification: { level: "offline-derivation", detail: "proof" },
     })
+  })
+
+  test("keeps the confirmed task writeup in the lightweight results summary", async () => {
+    const one = await harness()
+    try {
+      await writeFile(path.join(one.run, "work", "WRITEUP.md"), "# Confirmed\n\nflag{alpha}")
+      await writeFile(path.join(one.run, "task.json"), JSON.stringify({
+        version: 1,
+        id: one.runID,
+        slug: "alpha",
+        status: "solved",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        currentModel: "free/test",
+        turns: [],
+        rejectedFlags: [],
+        acceptedFlag: {
+          value: "flag{alpha}",
+          source: "user",
+          detail: "confirmed in test",
+          acceptedAt: new Date().toISOString(),
+        },
+      }))
+
+      const response = await request(one, "/api/state")
+      expect(await response.json()).toMatchObject({
+        challenges: [{ runs: [{
+          notes: "",
+          files: [],
+          acceptedFlag: "flag{alpha}",
+          writeup: "# Confirmed\n\nflag{alpha}",
+        }] }],
+      })
+    } finally {
+      await one.close()
+    }
   })
 
   test("manually rejects a candidate into the same task, or confirms it outside the workspace", async () => {

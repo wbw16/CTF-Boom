@@ -500,6 +500,7 @@ export async function startGuiServer(options: StartGuiOptions) {
   const runner: GuiRunnerBackend = options.runner ?? new GuiRunner(root)
   runner.setConcurrency(persisted.settings.concurrency)
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>()
+  const instanceID = crypto.randomUUID()
   let sequence = 0
   let mutation = Promise.resolve()
   let closing = false
@@ -514,7 +515,7 @@ export async function startGuiServer(options: StartGuiOptions) {
   }
 
   const broadcast = (value: RunnerNotification | Record<string, unknown>) => {
-    const event = { sequence: ++sequence, ...value }
+    const event = { instanceID, sequence: ++sequence, ...value }
     const packet = encoder.encode(`id: ${sequence}\nevent: state\ndata: ${JSON.stringify(event)}\n\n`)
     for (const client of [...clients]) {
       try {
@@ -534,12 +535,15 @@ export async function startGuiServer(options: StartGuiOptions) {
   }
 
   const state = async () => {
+    const snapshotSequence = sequence
     const stateRoot = root
     const statePersisted = persisted
     const found = await discoverChallenges(stateRoot)
     const models = await runner.getModels()
     const environments = await loadEnvironmentStore()
     return {
+      instanceID,
+      sequence: snapshotSequence,
       root: stateRoot,
       settings: statePersisted.settings,
       models,
@@ -550,7 +554,18 @@ export async function startGuiServer(options: StartGuiOptions) {
           const saved = statePersisted.challenges[item.slug]
           const history = await readChallengeRuns(stateRoot, item.slug)
           const runs = mergeTransient(history, runner.getTransientRuns(item.slug)).map((inputRun) => {
-            const run = summaryStateRun(inputRun)
+            const preserveWriteup =
+              saved?.confirmed?.runID === inputRun.id ||
+              inputRun.taskStatus === "solved" ||
+              inputRun.taskStatus === "archived" ||
+              !!inputRun.acceptedFlag ||
+              !!inputRun.confirmedFlag
+            const run = {
+              ...summaryStateRun(inputRun),
+              ...(preserveWriteup
+                ? { writeup: boundedStateText(inputRun.writeup, 64_000) ?? "" }
+                : {}),
+            }
             return saved?.confirmed?.runID === run.id
               ? {
                   ...run,
@@ -581,11 +596,17 @@ export async function startGuiServer(options: StartGuiOptions) {
     }
   }
 
-  const runDetail = async (slug: string, runID: string) => {
-    const found = await challenge(slug)
-    const saved = persisted.challenges[found.slug]
+  const runDetail = async (
+    detailRoot: string,
+    detailPersisted: RootGuiState,
+    slug: string,
+    runID: string,
+  ) => {
+    const found = (await discoverChallenges(detailRoot)).find((item) => item.slug === slug)
+    if (!found) throw new HttpError(404, `No such challenge: ${slug}`)
+    const saved = detailPersisted.challenges[found.slug]
     const runs = mergeTransient(
-      await readChallengeRuns(root, found.slug),
+      await readChallengeRuns(detailRoot, found.slug),
       runner.getTransientRuns(found.slug),
     )
     const selected = runs.find((run) => run.id === runID)
@@ -637,13 +658,22 @@ export async function startGuiServer(options: StartGuiOptions) {
 
         if (request.method === "GET" && url.pathname === "/api/state") return json(await state())
         const runDetailMatch = /^\/api\/challenges\/([^/]+)\/runs\/([^/]+)$/.exec(url.pathname)
-        if (request.method === "GET" && runDetailMatch)
+        if (request.method === "GET" && runDetailMatch) {
+          const snapshotSequence = sequence
+          const detailRoot = root
+          const detailPersisted = persisted
           return json({
+            instanceID,
+            sequence: snapshotSequence,
+            root: detailRoot,
             run: await runDetail(
+              detailRoot,
+              detailPersisted,
               decodeSegment(runDetailMatch[1]!),
               decodeSegment(runDetailMatch[2]!),
             ),
           })
+        }
         if (request.method === "GET" && url.pathname === "/api/events") {
           bunServer.timeout(request, 0)
           let controller: ReadableStreamDefaultController<Uint8Array>
@@ -655,6 +685,7 @@ export async function startGuiServer(options: StartGuiOptions) {
               controller.enqueue(
                 encoder.encode(
                   `: connected\nid: ${reconnectSequence}\nevent: state\ndata: ${JSON.stringify({
+                    instanceID,
                     sequence: reconnectSequence,
                     at: Date.now(),
                     type: "state.connected",

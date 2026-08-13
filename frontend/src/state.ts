@@ -1,4 +1,11 @@
-import type { ChallengeGui, GuiState, RunEvent, RunHistory } from "./types"
+import type { ChallengeGui, GuiState, RunEvent, RunHistory, RunnerNotification } from "./types"
+
+export type RunDetailSnapshot = {
+  instanceID?: string
+  slug: string
+  run: RunHistory
+  sequence?: number
+}
 
 export const CATEGORY_ORDER = [
   "WEB", "PWN", "REVERSE", "CRYPTO", "MISC", "MOBILE", "FORENSICS",
@@ -24,6 +31,11 @@ export const last = (challenge?: ChallengeGui | null) =>
 export const isLive = (run?: RunHistory | null) =>
   run?.stop === "running" || run?.stop === "queued"
 
+export const currentRun = (challenge?: ChallengeGui | null) =>
+  [...(challenge?.runs ?? [])].reverse().find((run) => run.stop === "running") ??
+  [...(challenge?.runs ?? [])].reverse().find((run) => run.stop === "queued") ??
+  last(challenge)
+
 export const isLegacyMissingRemoteBlock = (run?: RunHistory | null) =>
   run?.stop === "blocked" &&
   /(?:requires an external service|no reachable remote endpoint)/i.test(run.detail ?? "")
@@ -38,13 +50,14 @@ export const confirmedRun = (challenge: ChallengeGui) =>
   )
 
 export const candidateValues = (run?: RunHistory | null) =>
-  [
+  [...new Set([
+    run?.confirmedFlag,
+    run?.acceptedFlag,
     run?.primaryCandidate,
     ...(run?.candidates ?? []),
     ...(run?.alternatives ?? []),
     ...(run?.candidateHistory ?? []),
-    run?.acceptedFlag,
-  ].filter((value): value is string => typeof value === "string" && value.trim() !== "")
+  ].filter((value): value is string => typeof value === "string" && value.trim() !== ""))]
 
 export const primary = (run?: RunHistory | null) => candidateValues(run)[0] ?? ""
 export const alternatives = (run?: RunHistory | null) => candidateValues(run).slice(1)
@@ -54,13 +67,17 @@ export const activeCandidate = (run?: RunHistory | null) => run?.primaryCandidat
 export const latestFlagRun = (challenge: ChallengeGui) =>
   [...challenge.runs].reverse().find((run) => candidateValues(run).length > 0)
 
-export const displayFlagRun = (challenge: ChallengeGui) => {
-  const run = last(challenge)
+export const displayFlagRun = (challenge: ChallengeGui, preferred = currentRun(challenge)) => {
+  const confirmed = confirmedRun(challenge)
+  if (confirmed) return confirmed
+  const accepted = [...challenge.runs].reverse().find((run) => !!run.acceptedFlag)
+  if (accepted) return accepted
+  const run = preferred
   return candidateValues(run).length ? run : latestFlagRun(challenge)
 }
 
-export const flagEntries = (challenge: ChallengeGui) => {
-  const newest = last(challenge)
+export const flagEntries = (challenge: ChallengeGui, preferred = currentRun(challenge)) => {
+  const newest = preferred
   const seen = new Set<string>()
   return [...challenge.runs].reverse().flatMap((run) =>
     candidateValues(run)
@@ -76,9 +93,9 @@ export const flagEntries = (challenge: ChallengeGui) => {
 export const isRunnableChallenge = (challenge: ChallengeGui) =>
   !challenge.state &&
   !confirmedRun(challenge) &&
-  !activeCandidate(last(challenge)) &&
-  !isLive(last(challenge)) &&
-  !(isRemoteURLBlocked(last(challenge)) && !challenge.remote?.trim())
+  !activeCandidate(currentRun(challenge)) &&
+  !isLive(currentRun(challenge)) &&
+  !(isRemoteURLBlocked(currentRun(challenge)) && !challenge.remote?.trim())
 
 export const runnableChallenges = (challenges: ChallengeGui[], category?: string) =>
   challenges.filter(
@@ -109,7 +126,7 @@ export function formatMismatch(
 export function bucket(challenge: ChallengeGui, flagFormat = "") {
   if (challenge.state === "removed") return "removed"
   if (challenge.state === "given-up") return "gaveup"
-  const run = last(challenge)
+  const run = currentRun(challenge)
   if (!run) return "queued"
   if (run.stop === "running" || run.stop === "queued") return "running"
   if (confirmedRun(challenge)) return "solved"
@@ -138,7 +155,7 @@ export function orderedChallenges(
 export function label(challenge: ChallengeGui, flagFormat = "") {
   if (challenge.state === "given-up") return ["已放弃", "c-dim"] as const
   if (challenge.state === "removed") return ["已移出", "c-dim"] as const
-  const run = last(challenge)
+  const run = currentRun(challenge)
   if (!run) return ["未运行", "c-dim"] as const
   if (run.stop === "queued") return ["排队中", "c-run"] as const
   if (run.stop === "running") return ["运行中", "c-run"] as const
@@ -164,7 +181,7 @@ export function label(challenge: ChallengeGui, flagFormat = "") {
 }
 
 export function why(challenge: ChallengeGui, flagFormat = "") {
-  const run = last(challenge)
+  const run = currentRun(challenge)
   if (!run) return challenge.state ? "—" : "尚未运行"
   if (run.stop === "queued") return "等待运行槽位"
   if (run.stop === "running") return run.lastTool || "正在分析"
@@ -216,31 +233,202 @@ export function isUnconfirmedFlag(entry: { run: RunHistory; value: string }) {
   )
 }
 
-export function applyRunEvent(data: GuiState, update: { slug?: string; runID?: string; event?: RunEvent }) {
+function runEventKey(event: RunEvent) {
+  return JSON.stringify([
+    event.at,
+    event.type,
+    event.status ?? null,
+    event.tool ?? null,
+    event.text ?? null,
+    event.tokens ?? null,
+    event.billable ?? null,
+    event.cost ?? null,
+  ])
+}
+
+export function mergeRunEvents(...sources: Array<RunEvent[] | undefined>) {
+  const seen = new Set<string>()
+  return sources
+    .flatMap((events) => events ?? [])
+    .filter((event) => {
+      const key = runEventKey(event)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .sort((left, right) => left.at - right.at)
+}
+
+export function applyEventToRun(run: RunHistory, event: RunEvent): RunHistory {
+  const duplicate = run.events.some((item) => runEventKey(item) === runEventKey(event))
+  const tokens = event.tokens ?? run.tokens
+  const billableTokens = event.billable ?? run.billableTokens
+  const cost = event.cost ?? run.cost
+  const lastTool = event.tool ?? run.lastTool
+  if (
+    duplicate &&
+    tokens === run.tokens &&
+    billableTokens === run.billableTokens &&
+    cost === run.cost &&
+    lastTool === run.lastTool
+  ) return run
+  return {
+    ...run,
+    events: duplicate ? run.events : [...run.events, event],
+    tokens,
+    billableTokens,
+    cost,
+    ...(lastTool ? { lastTool } : {}),
+  }
+}
+
+export function mergeRunEventState(
+  authoritative: RunHistory,
+  ...liveSources: Array<RunHistory | null | undefined>
+): RunHistory {
+  const matching = liveSources.filter(
+    (run): run is RunHistory => !!run && run.id === authoritative.id,
+  )
+  const authoritativeKeys = new Set(authoritative.events.map(runEventKey))
+  const latestAuthoritativeAt = authoritative.events.reduce(
+    (latest, event) => Math.max(latest, event.at),
+    Number.NEGATIVE_INFINITY,
+  )
+  const liveEvents = matching.flatMap((run) => run.events).sort((left, right) => left.at - right.at)
+  let merged = authoritative
+  for (const event of liveEvents) {
+    if (!authoritativeKeys.has(runEventKey(event)) && event.at >= latestAuthoritativeAt)
+      merged = applyEventToRun(merged, event)
+  }
+  merged = {
+    ...merged,
+    events: mergeRunEvents(authoritative.events, ...matching.map((run) => run.events)),
+  }
+  return merged
+}
+
+export function mergeRunDetail(
+  authoritative: RunHistory,
+  ...newerSummaries: Array<RunHistory | null | undefined>
+): RunHistory {
+  const matching = newerSummaries.filter(
+    (run): run is RunHistory => !!run && run.id === authoritative.id,
+  )
+  const merged = mergeRunEventState(authoritative, ...matching)
+  const summary = matching[matching.length - 1]
+  return summary
+    ? {
+        ...merged,
+        model: summary.model,
+        runtimeBackend: summary.runtimeBackend,
+        runtimeVersion: summary.runtimeVersion,
+        promptVersion: summary.promptVersion,
+        stop: summary.stop,
+        tokens: summary.tokens,
+        billableTokens: summary.billableTokens,
+        cost: summary.cost,
+        candidates: summary.candidates,
+        primaryCandidate: summary.primaryCandidate,
+        alternatives: summary.alternatives,
+        candidateSource: summary.candidateSource,
+        verification: summary.verification,
+        platformSubmission: summary.platformSubmission,
+        flagFormat: summary.flagFormat,
+        startedAt: summary.startedAt,
+        finishedAt: summary.finishedAt,
+        durationMs: summary.durationMs,
+        lastTool: summary.lastTool ?? merged.lastTool,
+        detail: summary.detail ?? merged.detail,
+        taskStatus: summary.taskStatus,
+        candidateHistory: summary.candidateHistory,
+        rejectedFlags: summary.rejectedFlags,
+        confirmedFlag: summary.confirmedFlag,
+        acceptedFlag: summary.acceptedFlag,
+        environment: summary.environment,
+      }
+    : merged
+}
+
+export function withRunDetail(challenge: ChallengeGui, detail?: RunHistory | null): ChallengeGui {
+  if (!detail || !challenge.runs.some((run) => run.id === detail.id)) return challenge
+  return {
+    ...challenge,
+    runs: challenge.runs.map((run) => run.id === detail.id ? detail : run),
+  }
+}
+
+export function resolveRunDetail(
+  data: GuiState | null,
+  selected: string,
+  detail: RunDetailSnapshot | null,
+) {
+  if (!detail || detail.slug !== selected) return null
+  const summary = data?.challenges
+    .find((challenge) => challenge.slug === selected)?.runs
+    .find((run) => run.id === detail.run.id)
+  return summary && data?.instanceID === detail.instanceID && (data?.sequence ?? -1) > (detail.sequence ?? -1)
+    ? mergeRunDetail(detail.run, summary)
+    : detail.run
+}
+
+export function applyRunEventToDetail(
+  detail: RunDetailSnapshot | null,
+  update: { sequence?: number; slug?: string; runID?: string; event?: RunEvent },
+) {
+  if (
+    !detail ||
+    !update.slug ||
+    !update.runID ||
+    !update.event ||
+    detail.slug !== update.slug ||
+    detail.run.id !== update.runID
+  ) return detail
+  const run = applyEventToRun(detail.run, update.event)
+  return run === detail.run ? detail : { ...detail, run }
+}
+
+export function shouldRevalidateRunDetail(event?: RunEvent) {
+  if (!event) return false
+  if (event.type === "tool") return event.status !== "running" && event.status !== "pending"
+  return event.status === "consultation" ||
+    event.status?.startsWith("consultation.") === true ||
+    event.status?.startsWith("candidate.") === true
+}
+
+export function applyRunnerNotification(
+  data: GuiState | null,
+  detail: RunDetailSnapshot | null,
+  selected: string,
+  update: RunnerNotification,
+) {
+  const challenge = data?.challenges.find((item) => item.slug === update.slug)
+  const dataTargetKnown = !!challenge && !!update.event &&
+    challenge.runs.some((run) => run.id === update.runID)
+  const detailTargetKnown = !!detail && !!update.event && detail.slug === update.slug && detail.run.id === update.runID
+  const nextData = data && update.slug && update.event ? applyRunEvent(data, update) : data
+  const nextDetail = update.slug && update.event
+    ? applyRunEventToDetail(detail, update)
+    : detail
+  const handled = nextData !== data || nextDetail !== detail || dataTargetKnown || detailTargetKnown
+  const revalidate = update.type === "run.event" && handled
+    ? update.slug === selected && shouldRevalidateRunDetail(update.event)
+      ? "detail" as const
+      : "none" as const
+    : "state" as const
+  return { data: nextData, detail: nextDetail, revalidate }
+}
+
+export function applyRunEvent(
+  data: GuiState,
+  update: { sequence?: number; slug?: string; runID?: string; event?: RunEvent },
+) {
   if (!update.slug || !update.event) return data
   const challenge = data.challenges.find((item) => item.slug === update.slug)
   if (!challenge) return data
-  const run =
-    challenge.runs.find((item) => item.id === update.runID) ??
-    [...challenge.runs].reverse().find((item) => item.stop === "running" || item.stop === "queued")
+  const run = challenge.runs.find((item) => item.id === update.runID)
   if (!run) return data
-  const event = update.event
-  const duplicate = run.events.some(
-    (item) =>
-      item.at === event.at &&
-      item.type === event.type &&
-      item.status === event.status &&
-      item.tool === event.tool &&
-      item.text === event.text,
-  )
-  const nextRun: RunHistory = {
-    ...run,
-    events: duplicate ? run.events : [...run.events, event],
-    ...(event.tokens != null ? { tokens: event.tokens } : {}),
-    ...(event.billable != null ? { billableTokens: event.billable } : {}),
-    ...(event.cost != null ? { cost: event.cost } : {}),
-    ...(event.tool ? { lastTool: event.tool } : {}),
-  }
+  const nextRun = applyEventToRun(run, update.event)
+  if (nextRun === run) return data
   const nextChallenge: ChallengeGui = {
     ...challenge,
     runs: challenge.runs.map((item) => (item.id === nextRun.id ? nextRun : item)),
