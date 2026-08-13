@@ -6,6 +6,7 @@ import path from "node:path"
 import {
   compileOpenCodeMcpConfig,
   loadMcpStore,
+  wrapLocalIdaProxy,
   type McpStore,
 } from "./mcp-config.ts"
 import {
@@ -740,7 +741,14 @@ async function installProviders(directory: string, mcpStore: McpStore) {
     ...object(config.compaction),
     auto: true,
   }
-  config.mcp = compileOpenCodeMcpConfig(mcpStore)
+  const idaProxyScript = path.join(PACKAGE_ROOT, "src", "runtime", "ida-proxy.ts")
+  const idaProxyAvailable = await lstat(idaProxyScript)
+    .then((info) => info.isFile() && !info.isSymbolicLink())
+    .catch(() => false)
+  config.mcp = wrapLocalIdaProxy(compileOpenCodeMcpConfig(mcpStore), {
+    bunExecutable: process.execPath,
+    proxyScript: idaProxyAvailable ? idaProxyScript : "",
+  })
   await Bun.write(path.join(directory, "boom.json"), JSON.stringify(config, undefined, 2) + "\n")
   return Object.keys(config.provider)
 }

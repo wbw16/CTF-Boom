@@ -5,9 +5,11 @@ import path from "node:path"
 import {
   compileOpenCodeMcpConfig,
   loadMcpStore,
+  managedMcpAvailableToAgent,
   mcpStorePath,
   normalizeManagedMcpServer,
   saveMcpStore,
+  wrapLocalIdaProxy,
 } from "../src/mcp-config.ts"
 
 describe("Boom-managed MCP configuration", () => {
@@ -80,6 +82,80 @@ describe("Boom-managed MCP configuration", () => {
       headers: {},
       oauth: { clientId: "client", clientSecret: "must-not-persist" },
     })).toThrow("Invalid MCP")
+  })
+
+  test("reports a managed MCP capability only when connected and exposed to the requested agent", () => {
+    const idalib = normalizeManagedMcpServer({
+      id: "idalib",
+      name: "IDA Pro",
+      type: "local",
+      command: ["idalib-mcp", "--stdio"],
+      environment: {},
+      agents: ["boom"],
+    })
+    const store = { version: 1 as const, servers: { idalib } }
+
+    expect(managedMcpAvailableToAgent(store, { idalib: { status: "connected" } }, "idalib", "boom")).toBe(true)
+    expect(managedMcpAvailableToAgent(store, { idalib: { status: "failed", error: "offline" } }, "idalib", "boom")).toBe(false)
+    expect(managedMcpAvailableToAgent(store, { idalib: { status: "connected" } }, "idalib", "boom-worker")).toBe(false)
+    expect(managedMcpAvailableToAgent(
+      { version: 1, servers: { idalib: { ...idalib, enabled: false } } },
+      { idalib: { status: "connected" } },
+      "idalib",
+      "boom",
+    )).toBe(false)
+  })
+
+  test("wraps only the enabled local idalib server with the IDA result proxy", () => {
+    const config = compileOpenCodeMcpConfig({
+      version: 1,
+      servers: {
+        idalib: normalizeManagedMcpServer({
+          id: "idalib",
+          name: "IDA Pro",
+          type: "local",
+          command: ["idalib-mcp", "--stdio", "--profile", "readonly.profile"],
+          environment: {},
+          agents: ["boom"],
+        }),
+        filesystem: normalizeManagedMcpServer({
+          id: "filesystem",
+          name: "Filesystem",
+          type: "local",
+          command: ["filesystem-mcp"],
+          environment: {},
+          agents: ["boom"],
+        }),
+        remote: normalizeManagedMcpServer({
+          id: "remote",
+          name: "Remote",
+          type: "remote",
+          url: "https://example.test/mcp",
+          headers: {},
+          agents: ["boom"],
+        }),
+      },
+    })
+    const wrapped = wrapLocalIdaProxy(config, {
+      bunExecutable: "/usr/bin/bun",
+      proxyScript: "/opt/boom/ida-proxy.ts",
+    })
+    expect(wrapped.idalib).toMatchObject({
+      type: "local",
+      command: ["/usr/bin/bun", "/opt/boom/ida-proxy.ts", "idalib-mcp", "--stdio", "--profile", "readonly.profile"],
+      enabled: true,
+    })
+    expect(wrapped.filesystem).toEqual(config.filesystem)
+    expect(wrapped.remote).toEqual(config.remote)
+    // 缺失、禁用或缺少可执行信息时不包装。
+    expect(wrapLocalIdaProxy({}, { bunExecutable: "/usr/bin/bun", proxyScript: "/opt/boom/ida-proxy.ts" })).toEqual({})
+    expect(wrapLocalIdaProxy(config, { bunExecutable: "", proxyScript: "/opt/boom/ida-proxy.ts" })).toEqual(config)
+    expect(wrapLocalIdaProxy({
+      ...config,
+      idalib: { ...config.idalib!, enabled: false },
+    }, { bunExecutable: "/usr/bin/bun", proxyScript: "/opt/boom/ida-proxy.ts" })).toMatchObject({
+      idalib: { enabled: false, command: ["idalib-mcp", "--stdio", "--profile", "readonly.profile"] },
+    })
   })
 
   test("persists the MCP store atomically and refuses a symlink target", async () => {

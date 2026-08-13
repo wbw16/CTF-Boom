@@ -43,6 +43,114 @@ describe("host-level run recovery", () => {
     })).toBe(false)
   })
 
+  test("feeds the stalled turn's context snapshot into the recovery prompt", async () => {
+    const interpreter = Bun.which("python3")
+    if (!interpreter) return
+    const root = await mkdtemp(path.join(os.tmpdir(), "boom-recovery-snapshot-"))
+    temporary.push(root)
+    const source = path.join(root, "challenges", "snapshot-task")
+    await mkdir(source, { recursive: true })
+    await writeFile(path.join(source, "README.md"), "reverse the binary")
+
+    let conversations = 0
+    let resolveFirstPrompt: ((value: never) => void) | undefined
+    const prompts: string[] = []
+    const handle: RuntimeHandle = {
+      backend: "fake",
+      version: "test",
+      capabilities: {
+        eventStreaming: true,
+        toolCalls: true,
+        reasoning: false,
+        attachments: false,
+        web: false,
+        cancellation: true,
+        providerManagement: false,
+        providerOAuth: false,
+        compaction: false,
+      },
+      agent: {
+        async createConversation() {
+          const index = conversations += 1
+          const id = `recovery-snapshot-${index}`
+          return {
+            id,
+            async events() {
+              if (index !== 1)
+                return { async *[Symbol.asyncIterator]() {} }
+              return {
+                async *[Symbol.asyncIterator]() {
+                  yield {
+                    type: "step-finish",
+                    sessionID: id,
+                    usage: { input: 5, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+                    cost: 0,
+                    reason: "tool-calls",
+                  }
+                  await new Promise(() => {})
+                },
+              }
+            },
+            async prompt(request) {
+              prompts.push(request.text)
+              if (index !== 1)
+                return {
+                  usage: { input: 10, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+                  cost: 0,
+                  finish: "stop" as const,
+                  parts: [{ type: "text" as const, text: "analysis continued from the snapshot" }],
+                }
+              return new Promise<never>((resolve) => { resolveFirstPrompt = resolve })
+            },
+            async abort() {
+              resolveFirstPrompt?.({
+                usage: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                cost: 0,
+                finish: "stop" as const,
+                parts: [],
+              } as never)
+            },
+            async activeContext() {
+              if (index !== 1) return []
+              return [{
+                id: "msg-1",
+                role: "assistant",
+                parts: [{ type: "text", text: "关键结论：校验逻辑在 sub_A780" }],
+              }]
+            },
+          }
+        },
+      },
+      close() {},
+    }
+    const runner = new GuiRunner(root, async () => handle)
+    runner.setConcurrency(8)
+    try {
+      await runner.enqueue({
+        challenges: [{
+          slug: "snapshot-task",
+          directory: source,
+          description: "reverse the binary",
+          files: [],
+          flagFormat: "flag\\{[^}]+\\}",
+        }],
+        model: "test/solver",
+        limits: { tokens: 10_000, repeats: 3, timeout: 30_000, silenceMs: 60 },
+        flagFormat: "flag\\{[^}]+\\}",
+        pythonInterpreter: interpreter,
+      })
+      for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1)
+        await Bun.sleep(10)
+
+      expect(conversations).toBeGreaterThanOrEqual(2)
+      expect(prompts.length).toBeGreaterThanOrEqual(2)
+      expect(prompts[1]).toContain("活动上下文快照")
+      expect(prompts[1]).toContain("关键结论：校验逻辑在 sub_A780")
+    } finally {
+      await runner.close()
+    }
+  })
+
   test("runs local analysis when a service-dependent challenge has no endpoint", async () => {
     const interpreter = Bun.which("python3")
     if (!interpreter) return

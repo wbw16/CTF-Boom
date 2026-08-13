@@ -647,6 +647,31 @@ describe("runChallenge integration seam", () => {
       expect(seen).toContainEqual(expect.objectContaining({ type: "status", status: "silent" }))
     })
 
+    test("exports a bounded context snapshot for the recovery turn", async () => {
+      const directory = await brakeWorkspace("silence-snapshot")
+      pendingPrompt = true
+      activeContextMessages = [{
+        id: "msg-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "关键结论：校验逻辑在 sub_A780" }],
+      }]
+      eventStream = {
+        async *[Symbol.asyncIterator]() {
+          yield spend(10)
+          await new Promise(() => {})
+        },
+      }
+
+      const outcome = await runChallenge(input({
+        workspace: { directory, runID: "mock-run", extracted: [] },
+        limits: { tokens: 10_000, repeats: 5, timeout: 30_000, silenceMs: 60 },
+      }))
+
+      expect(outcome.stop).toBe("silent")
+      expect(outcome.recoveryContext?.summary).toContain("关键结论：校验逻辑在 sub_A780")
+      expect(activeContextCalls).toBe(1)
+    })
+
     test("never cuts a turn while a tool is still running", async () => {
       const directory = await brakeWorkspace("silence-longrunning")
       pendingPrompt = true

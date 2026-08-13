@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import * as armorPromptModule from "../resources/plugin/armor-prompt.ts"
 import ArmorPromptPlugin from "../resources/plugin/armor-prompt.ts"
 
 const previousHome = process.env.BOOM_HOME
@@ -25,6 +26,20 @@ async function writeStore(value: unknown) {
 }
 
 describe("armor prompt runtime plugin", () => {
+  test("exports only the plugin factory so OpenCode's legacy loader accepts the module", async () => {
+    // OpenCode's legacy plugin loader calls every exported function as a plugin factory. A named
+    // helper export is therefore not just dead code: it crashes the loader and unloads the plugin.
+    const factories = Object.values(armorPromptModule).filter(
+      (entry) => typeof entry === "function",
+    )
+    expect(factories).toHaveLength(1)
+    expect(factories[0]).toBe(ArmorPromptPlugin)
+    const hooks = await (factories[0] as (input: unknown) => Promise<Record<string, unknown>>)(
+      {} as never,
+    )
+    expect(typeof hooks["experimental.chat.system.transform"]).toBe("function")
+  })
+
   test("removes per-run directories and the date from Boom system prompts", async () => {
     await writeStore({ version: 1, armorPrompts: [], providers: {} })
     const hooks = await ArmorPromptPlugin({} as never)

@@ -1,7 +1,7 @@
 import { lstat, readFile } from "node:fs/promises"
 import path from "node:path"
 import { submitCandidate } from "./candidate-submission.ts"
-import type { Challenge } from "./challenge.ts"
+import { normalizeChallengeCategory, type Challenge } from "./challenge.ts"
 import {
   addConsultationUsage,
   allocateConsultationBudgets,
@@ -70,6 +70,7 @@ import {
 } from "./provider-config.ts"
 import {
   loadMcpStore,
+  managedMcpAvailableToAgent,
   normalizeManagedMcpServer,
   saveMcpStore,
   type ManagedMcpServer,
@@ -353,22 +354,49 @@ export function recoverableRunOutcome(
     .test(detail)
 }
 
-function recoveryHint(outcome: Pick<Outcome, "stop" | "detail">, attempt: number) {
+function recoveryHint(
+  outcome: Pick<Outcome, "stop" | "detail" | "recoveryContext">,
+  attempt: number,
+) {
   const action = outcome.stop === "stalled"
     ? "上一轮触发了防循环保护。跳过导致循环的调用或输出方式，不要重复相同动作。"
     : outcome.stop === "silent"
       ? "上一轮 Provider 长时间无响应，现已使用新会话恢复。"
       : "上一轮遇到可恢复的 Provider/运行时异常，现已使用新会话恢复。"
+  const summary = outcome.recoveryContext?.summary.trim()
+  const snapshot = summary
+    ? "以下是停滞前自动导出的活动上下文快照（含工具调用与关键结果，已截断）：\n\n" + summary
+    : outcome.recoveryContext?.contextWarning
+      ? `停滞前尝试导出活动上下文失败：${outcome.recoveryContext.contextWarning}`
+      : ""
   return [
     action,
     `这是第 ${attempt}/${RUN_RECOVERY_ATTEMPTS} 次自动恢复；work/ 与 NOTES.md 中的已有成果保持不变。`,
     outcome.detail ? `原停止原因：${outcome.detail}` : "",
     "先检查持久状态，从最后一个未完成步骤继续；不要从头重做。",
+    snapshot,
   ].filter(Boolean).join("\n")
 }
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+async function solverPromptCapabilities(runtime: RuntimeHandle, category?: string) {
+  const normalized = category?.trim() ? normalizeChallengeCategory(category) : undefined
+  if ((normalized !== "REVERSE" && normalized !== "PWN") || !runtime.mcp) return {}
+  try {
+    const [store, statuses] = await Promise.all([
+      loadMcpStore(),
+      runtime.mcp.status(),
+    ])
+    return {
+      headlessIda: managedMcpAvailableToAgent(store, statuses, "idalib", "boom"),
+    }
+  } catch {
+    // Capability hints fail closed: solving must continue if MCP status inspection is unavailable.
+    return {}
+  }
 }
 
 function clampConcurrency(value: number) {
@@ -2068,6 +2096,7 @@ export class GuiRunner {
             limits: solveLimits,
             hint,
             continuation: job.continuation || job.task.turns.length > 0,
+            promptCapabilities: await solverPromptCapabilities(runtime, challenge.category),
             resumeSessionID: job.resumeSessionID ?? job.consultationInput?.resumeSessionID,
             handoffHistory: job.handoffHistory,
             handoffWarning: job.handoffWarning,

@@ -1,6 +1,7 @@
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import type { RuntimeMcpStatus } from "./runtime-contract.ts"
 
 export const BOOM_MCP_AGENT_IDS = [
   "boom",
@@ -198,6 +199,19 @@ export function initialMcpStore(): McpStore {
   return { version: 1, servers: {} }
 }
 
+/** True only when a configured server is enabled, connected, and exposed to this Boom role. */
+export function managedMcpAvailableToAgent(
+  store: McpStore,
+  statuses: Record<string, RuntimeMcpStatus>,
+  serverID: string,
+  agentID: BoomMcpAgentID,
+) {
+  const server = store.servers[serverID]
+  return !!server?.enabled &&
+    server.agents.includes(agentID) &&
+    statuses[serverID]?.status === "connected"
+}
+
 export function parseMcpStore(value: unknown): McpStore | undefined {
   const input = object(value)
   if (!input || input.version !== 1) return undefined
@@ -281,6 +295,28 @@ export function compileOpenCodeMcpConfig(store: McpStore): OpenCodeMcpConfig {
       timeout: entry.timeout,
     }]
   }))
+}
+
+/**
+ * 把 Boom 托管的 `idalib` 本地服务器包进 IDA 结果薄代理。
+ *
+ * OpenCode 以 stdio 拉起该命令；代理在前面透传并归档超大的 IDA 工具结果。包装只作用于
+ * 名字固定为 `idalib` 的本地服务器，其余服务器原样保留，因此用户自定义 MCP 不受影响。
+ */
+export function wrapLocalIdaProxy(
+  config: OpenCodeMcpConfig,
+  options: { bunExecutable: string; proxyScript: string },
+): OpenCodeMcpConfig {
+  const server = config["idalib"]
+  if (!options.bunExecutable || !options.proxyScript || !server || server.type !== "local" || !server.enabled)
+    return config
+  return {
+    ...config,
+    idalib: {
+      ...server,
+      command: [options.bunExecutable, options.proxyScript, ...server.command],
+    },
+  }
 }
 
 export function openCodeMcpToolPattern(serverID: string) {

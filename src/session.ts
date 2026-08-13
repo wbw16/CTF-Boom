@@ -93,6 +93,15 @@ export type Outcome = {
     history?: RuntimeMessage[]
     contextWarning?: string
   }
+  /**
+   * Bounded provider-neutral summary of the active context, exported when a turn dies mid-flight
+   * (`silent` or `stalled`). The host injects it into the recovery turn so a fresh session can
+   * continue from prior findings instead of redoing the analysis that preceded the failure.
+   */
+  recoveryContext?: {
+    summary: string
+    contextWarning?: string
+  }
   /** Number of runtime context compactions completed during this turn. */
   compactions?: number
   /** Recorded experiment policy for this turn. */
@@ -381,26 +390,51 @@ const CATEGORY_GUIDANCE = {
   OTHER: "先完成题型分诊，再依据题目文件、服务和实验结果选择方向。",
 } as const
 
+export type SolverPromptCapabilities = {
+  /** A connected, Boom-managed headless IDA MCP is callable by the primary solver. */
+  headlessIda?: boolean
+}
+
+const HEADLESS_IDA_GUIDANCE = [
+  "本题可使用 headless IDA Pro MCP（idalib）。处理原生可执行文件时，优先将目标从 challenge/ 复制到 work/ida/，再使用 idb_open 的 force_headless 模式完成自动分析，并结合 survey_binary、list_funcs、decompile、xrefs_to、callees 和 callgraph 恢复程序逻辑；不要直接在 challenge/ 下生成 IDB。",
+  "若 IDA 打开、自动分析或反编译失败，记录具体错误，再回退到 objdump、LLDB、Python、angr 等工具；不要仅因 shell 工具可用就跳过 IDA。成功打开 IDB 后应围绕入口、校验路径、关键字符串及其交叉引用查询相关函数，避免无目的地反编译全部函数。",
+  "IDA 的大型查询结果会自动归档到 work/ida/results/，上下文里只保留摘要与文件指针：用 idalib_boom_ida_get 按行分段读取细节，用 idalib_boom_ida_list 查看已归档查询。归档属于持久产物，恢复回合应优先读取，不要重复查询同样的函数。",
+].join("")
+
 /** Give the solver a bounded prior without overriding contrary evidence from the challenge. */
-export function challengeCategoryPrompt(category?: string) {
+export function challengeCategoryPrompt(
+  category?: string,
+  capabilities: SolverPromptCapabilities = {},
+) {
   if (!category?.trim()) return ""
   const normalized = normalizeChallengeCategory(category)
   return [
     `你现在正在解一道 CTF ${normalized} 类型题目。`,
     CATEGORY_GUIDANCE[normalized],
+    capabilities.headlessIda && (normalized === "REVERSE" || normalized === "PWN")
+      ? HEADLESS_IDA_GUIDANCE
+      : "",
     "分类只用于安排排查优先级；如果与题目文件、服务或实验结果冲突，以实际证据为准。",
-  ].join("")
+  ].filter(Boolean).join("")
 }
 
-function withCategoryPrompt(prompt: string, category?: string) {
-  const context = challengeCategoryPrompt(category)
+function withCategoryPrompt(
+  prompt: string,
+  category?: string,
+  capabilities: SolverPromptCapabilities = {},
+) {
+  const context = challengeCategoryPrompt(category, capabilities)
   return context ? `${context}\n\n${prompt}` : prompt
 }
 
-export function buildPrompt(hint?: string, category?: string) {
+export function buildPrompt(
+  hint?: string,
+  category?: string,
+  capabilities: SolverPromptCapabilities = {},
+) {
   const trimmed = hint?.trim()
   const prompt = trimmed ? `${PROMPT}\n\n用户追加提示：${trimmed}` : PROMPT
-  return compileTurnPrompt("turn:solve", withCategoryPrompt(prompt, category))
+  return compileTurnPrompt("turn:solve", withCategoryPrompt(prompt, category, capabilities))
 }
 
 const CONTINUE_PROMPT = [
@@ -410,11 +444,19 @@ const CONTINUE_PROMPT = [
   "本轮开始时已自动注入紧凑交接摘要，先按摘要恢复；若与工作区实际文件冲突，以实际文件为准。",
 ].join("")
 
-export function buildContinuationPrompt(hint?: string, category?: string) {
+export function buildContinuationPrompt(
+  hint?: string,
+  category?: string,
+  capabilities: SolverPromptCapabilities = {},
+) {
   const trimmed = hint?.trim()
   return compileTurnPrompt(
     "turn:continue",
-    withCategoryPrompt(trimmed ? `${CONTINUE_PROMPT}\n\n用户追加提示：${trimmed}` : CONTINUE_PROMPT, category),
+    withCategoryPrompt(
+      trimmed ? `${CONTINUE_PROMPT}\n\n用户追加提示：${trimmed}` : CONTINUE_PROMPT,
+      category,
+      capabilities,
+    ),
   )
 }
 
@@ -498,6 +540,8 @@ export async function runChallenge(input: {
   limits: Limits
   hint?: string
   continuation?: boolean
+  /** Runtime capabilities that are both connected and callable by the primary solver. */
+  promptCapabilities?: SolverPromptCapabilities
   /** Resume this durable runtime session instead of creating a disconnected solver session. */
   resumeSessionID?: string
   /** Provider-neutral context used only when the new runtime cannot resume the durable session. */
@@ -607,6 +651,7 @@ export async function runChallenge(input: {
   const runningCalls = new Set<string>()
   let handoffRequested = input.handoffSignal?.aborted === true
   let handoff: Outcome["handoff"]
+  let recoveryContext: Outcome["recoveryContext"]
   const captureConsultationHistory = async (reportFailure = true) => {
     if (contextCaptureAttempted) return consultationHistory
     contextCaptureAttempted = true
@@ -720,6 +765,16 @@ export async function runChallenge(input: {
     stop = reason
     detail = why
     clearSilence()
+    // A `silent` or `stalled` stop abandons the in-session analysis. Export a bounded summary before
+    // aborting the provider so the recovery turn can resume from it instead of redoing the work.
+    // The runtime may already be unresponsive, so this is best-effort and strictly time-boxed.
+    if ((reason === "silent" || reason === "stalled") && recoveryContext === undefined) {
+      await captureConsultationHistory(false)
+      const summary = consultationHistory ? renderRuntimeContext(consultationHistory) : ""
+      recoveryContext = summary.trim() || contextWarning
+        ? { summary, ...(contextWarning ? { contextWarning } : {}) }
+        : undefined
+    }
     await conversation.abort().catch(() => {})
     await emit({ type: "status", status: reason, text: why })
   }
@@ -1046,8 +1101,8 @@ export async function runChallenge(input: {
     const prompt = input.purpose === "writeup"
       ? buildWriteupPrompt(input.acceptedFlag ?? "[missing accepted flag]", handoffHint, input.challenge.category)
       : input.continuation
-        ? buildContinuationPrompt(handoffHint, input.challenge.category)
-        : buildPrompt(handoffHint, input.challenge.category)
+        ? buildContinuationPrompt(handoffHint, input.challenge.category, input.promptCapabilities)
+        : buildPrompt(handoffHint, input.challenge.category, input.promptCapabilities)
     result = await promptWithProviderRecovery(prompt, "prompt")
   }
 
@@ -1257,6 +1312,7 @@ export async function runChallenge(input: {
     retries: retried,
     consultationRequest,
     handoff,
+    ...(recoveryContext ? { recoveryContext } : {}),
     ...(compactions > 0 ? { compactions } : {}),
     consultOnCompaction,
   }

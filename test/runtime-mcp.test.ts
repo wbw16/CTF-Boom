@@ -28,22 +28,42 @@ test("Boom compiles and connects its managed local MCP through the isolated Open
       timeout: 5_000,
       agents: ["boom"],
     })
-    await saveMcpStore({ version: 1, servers: { fixture: server } })
+    const idaUpstream = path.join(import.meta.dir, "fixtures", "ida-proxy-upstream.ts")
+    const idalib = normalizeManagedMcpServer({
+      id: "idalib",
+      name: "IDA Pro",
+      type: "local",
+      command: [process.execPath, idaUpstream],
+      environment: {},
+      enabled: true,
+      timeout: 10_000,
+      agents: ["boom"],
+    })
+    await saveMcpStore({ version: 1, servers: { fixture: server, idalib } })
     runtime = await startOpenCodeRuntime()
     expect(runtime.capabilities.mcp).toBe(true)
-    expect(await runtime.mcp?.status()).toEqual({ fixture: { status: "connected" } })
+    expect(await runtime.mcp?.status()).toEqual({
+      fixture: { status: "connected" },
+      idalib: { status: "connected" },
+    })
     const config = JSON.parse(await readFile(path.join(home, "runtime", "boom.json"), "utf8"))
     expect(config.mcp.fixture).toMatchObject({
       type: "local",
       command: [process.execPath, fixture],
       enabled: true,
     })
+    expect(config.mcp.idalib).toMatchObject({ type: "local", enabled: true })
+    expect(config.mcp.idalib.command[0]).toBe(process.execPath)
+    expect(config.mcp.idalib.command[1]).toContain("ida-proxy.ts")
+    expect(config.mcp.idalib.command.slice(2)).toEqual([process.execPath, idaUpstream])
     expect(await Bun.file(path.join(home, "runtime", "opencode.json")).exists()).toBe(false)
     expect(await Bun.file(path.join(home, "runtime", "xdg-config")).exists()).toBe(false)
     expect(await Bun.file(path.join(home, "runtime", "home")).exists()).toBe(false)
     expect(await Bun.file(path.join(home, "runtime", "bin", "opencode")).exists()).toBe(false)
     expect(await readFile(path.join(home, "runtime", "agent", "boom-consultant.md"), "utf8"))
       .toContain('"fixture_*": "deny"')
+    expect(await readFile(path.join(home, "runtime", "agent", "boom-consultant.md"), "utf8"))
+      .toContain('"idalib_*": "deny"')
 
     const workspace = path.join(home, "workspace")
     await mkdir(path.join(workspace, "work"), { recursive: true })
@@ -62,4 +82,4 @@ test("Boom compiles and connects its managed local MCP through the isolated Open
     if (previous === undefined) delete process.env.BOOM_HOME
     else process.env.BOOM_HOME = previous
   }
-}, 20_000)
+}, 30_000)

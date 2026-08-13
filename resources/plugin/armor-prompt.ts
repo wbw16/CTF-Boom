@@ -69,8 +69,12 @@ function isBoomSystem(system: unknown) {
  * OpenCode places the run's absolute directory and current date inside the same system block as the
  * agent prompt. Boom addresses its workspace through stable relative paths, so those fields add no
  * useful context and make an otherwise reusable prompt prefix different for every run.
+ *
+ * This helper must stay module-private. OpenCode's legacy plugin loader treats every exported
+ * function as a plugin factory, so a stray named export makes it invoke this function with the
+ * PluginInput object and unload the whole plugin with `system.replace is not a function`.
  */
-export function stripDynamicBoomEnvironment(system: string) {
+function stripDynamicBoomEnvironment(system: string) {
   return system.replace(/<env>([\s\S]*?)<\/env>/g, (_block, body: string) => {
     const stable = body
       .split(/\r?\n/)

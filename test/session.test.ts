@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   budgetTokens,
+  buildContinuationPrompt,
   buildPrompt,
   buildWriteupPrompt,
   classifyVerification,
@@ -227,6 +228,26 @@ describe("run controls", () => {
     const pwn = buildPrompt(undefined, "PWN")
     expect(pwn).toContain("正在解一道 CTF PWN 类型题目")
     expect(pwn).toContain("内存破坏面")
+  })
+
+  test("adds the headless IDA workflow only for eligible categories when the capability is available", () => {
+    const reverseWithoutIda = buildPrompt(undefined, "REVERSE")
+    expect(reverseWithoutIda).not.toContain("headless IDA Pro MCP")
+
+    const reverseWithIda = buildPrompt(undefined, "REVERSE", { headlessIda: true })
+    expect(reverseWithIda).toContain("headless IDA Pro MCP（idalib）")
+    expect(reverseWithIda).toContain("复制到 work/ida/")
+    expect(reverseWithIda).toContain("idb_open 的 force_headless 模式")
+    expect(reverseWithIda).toContain("不要仅因 shell 工具可用就跳过 IDA")
+    expect(reverseWithIda).toContain("归档到 work/ida/results/")
+    expect(reverseWithIda).toContain("idalib_boom_ida_get")
+    expect(reverseWithIda).toContain("不要重复查询同样的函数")
+
+    const pwnContinuation = buildContinuationPrompt(undefined, "PWN", { headlessIda: true })
+    expect(pwnContinuation).toContain("survey_binary、list_funcs、decompile")
+
+    const webWithIda = buildPrompt(undefined, "WEB", { headlessIda: true })
+    expect(webWithIda).not.toContain("headless IDA Pro MCP")
   })
 
   test("returns an aborted outcome before creating a runtime conversation when the signal is already aborted", async () => {
