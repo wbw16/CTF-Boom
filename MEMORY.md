@@ -81,6 +81,28 @@ before continuation; runtime headroom means compaction may begin near the bounda
 invalid over-limit provider request. Consultant turns are role-isolated and do not enter this recursive
 transition. A real paid-provider run that actually reaches the 300k boundary has not yet been performed.
 
+**Worker subagents are model-tiered.** `boom-worker` runs on the economy model and
+`boom-worker-pro` on the strong model. The tier is declared in each agent's neutral `agent.json`
+(`model: "economy" | "strong"`) and resolved at runtime-config compile time into the generated
+OpenCode frontmatter, so a `task` dispatch runs the declared tier's model instead of inheriting the
+solver's. `boom`/`boom-consultant` declare no tier and keep the host-selected per-turn model. The
+runtime writes `subagent_depth: 2`, letting the strong worker delegate mechanical subtasks to the
+economy worker. The policy is adopted at the first `enqueue` (CLI) or first settings save (GUI), and
+a change to the economy/strong tiers relaunches the runtime at a safe boundary with a
+"Worker 模型档位已更新" handoff — mirroring the Provider-reload pattern. The resolved models join
+the prompt-provenance hash.
+
+The design was cross-checked against the vendored `claude-code-source-code`: Claude Code resolves a
+subagent's model as env `CLAUDE_CODE_SUBAGENT_MODEL` > per-call Task-tool `model` enum
+(sonnet/opus/haiku) > agent frontmatter > `inherit` (parent's exact model; `getAgentModel` in
+`utils/model/agent.ts`), uses family aliases resolved at call time, and keeps teammates flat (no
+nesting). Boom cannot copy the per-call enum because OpenCode's task tool has no per-call model
+parameter (`tool/task.ts`: agent model or parent inheritance only) and its agent frontmatter accepts
+only literal `provider/model`. Agent-ID-per-tier is therefore the OpenCode-native compromise; the
+Native kernel's per-call model parameter is the future escape hatch. The deliberate difference from
+Claude Code — Boom defaults workers to the cheap tier instead of `inherit` — is a measured-risk
+decision, see Known problems.
+
 ## Identity
 
 - Product and default solver agent: **Boom**. CLI and agent ID: `boom`.
@@ -238,6 +260,17 @@ turn — no per-role state or report files:
 - C. Active consultation: user-, model-, or post-compaction-triggered; 2–4 expert models plus one
   strong synthesizer merge into one plan.
 
+**Worker tiering is declared per agent resource, resolved at compile time, and cheap by default.**
+An agent's `model` tier in `agent.json` is a Boom-neutral declaration; the literal provider/model is
+resolved from the current ModelPolicy when the runtime config is compiled, so resources never hardcode
+models. Tier changes are host events (runtime relaunch + safe-boundary handoff), not prompt edits. The
+solver selects a tier by choosing `boom-worker` (economy) or `boom-worker-pro` (strong) in the `task`
+tool; worker prompts may explain tier economics but must not prescribe solving steps. Workers default
+to the cheap tier and are upgraded per task — the inverse of Claude Code's `inherit` default — because
+Boom's measured batch was solved mostly by the economy model and CTF work is mechanical-heavy. If
+measurement shows frequent cheap-worker failure followed by pro retries, revisit this default instead
+of adding more tiers.
+
 **Stall detection is deterministic, not a model self-report.** Progress is measured by artifact
 hashes, `ctf-note` changes, non-repeated tool results, and candidates (already in
 `orchestration/progress.ts`; 5-minute tail threshold). Do not ask the model every 5 minutes —
@@ -319,6 +352,7 @@ grid tracks, and wrapping long paths.
 | IDA MCP result broker | 8 proxy tests over a fake upstream cover passthrough, tool merge, archiving, per-function split, dedup, error passthrough, chunked retrieval, and no-root degradation. A real-IDA end-to-end using the actual `idalib-mcp` and `task-ef2417cb55`'s binary archived `idb_open`/`survey_binary`/`decompile` to `work/ida/results/`, left small `get_bytes` inline, and read back bounded chunks via `boom_ida_get`/`boom_ida_list`. `runtime-mcp` boots the wrapped command through real OpenCode. |
 | armor-prompt plugin load | The `system.replace is not a function` plugin-load crash is gone from the 2026-08-13 runtime log after removing the stray named export; regression test simulates OpenCode's legacy module loader. |
 | Recovery context handoff | Silent/stalled turns export a ≤200K-char context snapshot into the next recovery prompt; session and runner tests assert the snapshot is rendered and injected. |
+| Worker model tiers | `boom-worker` resolves `model: economy` and `boom-worker-pro` resolves `model: strong` in the generated OpenCode frontmatter; tierless `boom`/`boom-consultant` stay host-selected; resolved models join the prompt hash. Runner tests prove the CLI enqueue adopts the policy before the first launch, an economy/strong tier change relaunches the runtime (generation 2) with the new policy and forces a safe boundary on unchanged-model jobs with the "Worker 模型档位已更新" handoff, and an unchanged policy does not relaunch. |
 | REVERSE task-ef2417cb55 | Re-run on 2026-08-13 completed with candidate `CTF{upDN_B_a_im_ur_pRoOf_0f_p1y}` (manual verdict pending); no recurrence of the previous provider stalls, and `ctf-note` populated `NOTES.md` this time. |
 
 ## Measured results — the honest number
@@ -392,6 +426,16 @@ profile permits the tool. The provider stalls cut each turn before any handoff m
 stored progress as `work/*.py` scripts instead of conclusions. The 2026-08-13 run did write notes, so
 this is behavioral rather than a tooling failure; consider a hard prompt rule or a soft host check
 (e.g. remind after `idb_open` completes with no note yet) if it recurs.
+
+**Worker tier routing is unmeasured and cheap-by-default carries a misclassification cost.** Claude
+Code defaults subagents to `inherit` precisely to avoid a solver misjudging task hardness and paying
+for a failed cheap run plus a strong retry. Boom inverts that default; the failure mode is a
+`boom-worker` thrash on reasoning-heavy objectives. No real paid run has yet exercised the tiered
+dispatch, so the wrong-tier rate and its cost are unknown. The cheap mitigations, gated on
+measurement: record per-dispatch outcome (cheap-failed → pro-retried → succeeded?) in the benchmark,
+route automatic cheap-failure retries to `boom-worker-pro` at the host, or add a
+`BOOM_SUBAGENT_MODEL`-style global override mirroring `CLAUDE_CODE_SUBAGENT_MODEL`. Do not add a
+third tier or per-task model hints before those numbers exist.
 
 ## Gotchas
 
@@ -477,9 +521,10 @@ assertion failure.
 3. **Add a `boom writeup` CLI command** so the separate writeup flow is usable outside the GUI;
    today only the GUI button exists.
 4. **Build a small real-challenge benchmark** (20–30 representative CRYPTO/MISC/REVERSE/WEB/PWN
-   challenges) measuring solve rate, wrong-candidate rate, tokens, time and failure category. Let
-   those measurements choose the next solver improvement; do not add another runtime subsystem by
-   default.
+   challenges) measuring solve rate, wrong-candidate rate, tokens, time and failure category. Include
+   per-dispatch worker-tier outcomes (boom-worker vs boom-worker-pro: success / cheap-failed-then-pro-retried)
+   so the cheap-by-default decision is measured, not assumed. Let those measurements choose the next
+   solver improvement; do not add another runtime subsystem by default.
 5. **Confirm the 2026-08-13 candidate.** Verify or reject `CTF{upDN_B_a_im_ur_pRoOf_0f_p1y}` for
    `task-ef2417cb55`, then fold the verdict into the measured numbers.
 6. **Upstream ida-pro-mcp PR.** Expose `get_cached_output` in stdio mode or make the 50K-char
@@ -487,3 +532,16 @@ assertion failure.
 7. **Guarantee note-taking.** If another run burns many tokens without `ctf-note`, add a hard prompt
    rule (note after key findings) or a soft host check that reminds after `idb_open`/N steps with no
    note yet.
+
+## 2026-08-14 接口层文档与修复(本轮)
+
+- 新增 `docs/CONVERSATION_INTERFACES.md`:runtime-contract / opencode adapter / native runtime 的
+  conversation 接口速查,含事件词汇表、usage 口径、watchdog 心跳语义、陷阱清单。以后改 watchdog、
+  会诊、事件流先读它,不必重读三个源文件。
+- 顺手修复(全部带测试):opencode part.updated 先于 message.updated 时丢 delta;无 step 事件的
+  provider 绕过 token 预算执法(completeRuntimePrompt result.usage 兜底);150s 静默 watchdog
+  误杀批量推理 provider(isBusy 心跳:busy 不杀、空闲才杀);自然完成回合 stop=undefined 导致遗留
+  watchdog 污染下一回合(finished 门闩);会诊 prompt 超限缩档重试阶梯 + 溢出花费 carve-out;
+  token 估算保守化(CJK/hex 密度)。
+- 全套件剩余 6 个失败为既有环境问题:environment/runtime-shell 的 EPERM 进程组(DSH 文件沙箱),
+  runtime-conformance 的 boom-exec(工作区未完成的 resources 改动),与上述修复无关。

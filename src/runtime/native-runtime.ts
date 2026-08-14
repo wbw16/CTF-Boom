@@ -936,6 +936,16 @@ class NativeConversation implements RuntimeConversation {
     await this.#activeTurn?.catch(() => {})
   }
 
+  /**
+   * A turn is in flight while `prompt()` awaits its agent loop, including a provider step whose
+   * driver batches deltas and therefore emits no events. The watchdog may treat that silence as
+   * alive; only an idle conversation with no events is a hang.
+   */
+  async isBusy(signal?: AbortSignal) {
+    signal?.throwIfAborted()
+    return this.#activeTurn !== undefined
+  }
+
   #resultUsage() {
     return this.#depth === 0 ? this.#coordinator.usage() : cloneRuntimeUsage(this.#localUsage)
   }
@@ -1027,6 +1037,7 @@ class NativeAgentRuntime implements AgentRuntime {
       abort: () => conversation.abort(),
       activeContext: () => conversation.activeContext(),
       messages: () => conversation.messages(),
+      isBusy: (signal) => conversation.isBusy(signal),
       fork: async (input) => {
         const forked = await conversation.fork(input)
         if (input?.signal)

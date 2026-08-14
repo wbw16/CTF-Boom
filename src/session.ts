@@ -156,6 +156,9 @@ const ARTIFACT_REPRIEVES = 3
  */
 export const DEFAULT_SILENCE_MS = 150_000
 
+/** How long a silence probe may take before the watchdog treats the backend as unresponsive. */
+const SILENCE_PROBE_TIMEOUT_MS = 15_000
+
 /**
  * How long to wait for the event watcher to finish after the subscription is aborted, before
  * abandoning it. Only reached when a runtime ignores its own abort signal.
@@ -731,30 +734,76 @@ export async function runChallenge(input: {
   // it entirely. Reset by every event of any kind, including reasoning deltas, so a model that thinks
   // for a long time before answering is never cut off.
   //
+  // Providers that batch reasoning deltas emit nothing at all during a long think, so the event
+  // stream alone cannot distinguish "thinking" from "wedged". Before killing, the watchdog probes
+  // the conversation's liveness: while the backend reports an in-flight step, silence is alive and
+  // the timer re-arms. Only an idle backend with no events is a hang.
+  //
   // Declared before `abort` because `abort` clears it and can run before the prompt is ever sent.
   const silenceLimit = Math.floor(input.limits.silenceMs ?? 0)
   let silence: ReturnType<typeof setTimeout> | undefined
+  /** Invalidates an async probe whenever newer activity re-arms or clears the watchdog. */
+  let watchdogEpoch = 0
+  /** Set once the turn outcome is final; a settled turn must never arm or fire the watchdog again. */
+  let finished = false
   const clearSilence = () => {
+    watchdogEpoch += 1
     if (silence) clearTimeout(silence)
     silence = undefined
   }
   const armSilence = () => {
-    if (silenceLimit <= 0 || stop !== undefined) return
+    if (silenceLimit <= 0 || stop !== undefined || finished) return
     clearSilence()
+    const epoch = watchdogEpoch
     silence = setTimeout(() => {
-      if (stop !== undefined) return
-      if (runningCalls.size > 0) {
-        armSilence()
-        return
-      }
-      void abort(
-        "silent",
-        `no runtime activity for ${Math.round(silenceLimit / 1000)}s with no tool running: ` +
-          `provider or agent loop stopped responding`,
-      )
+      void probeSilence(epoch)
     }, silenceLimit)
     // Never hold the process open on the watchdog alone.
     silence.unref?.()
+  }
+  const probeSilence = async (epoch: number) => {
+    if (epoch !== watchdogEpoch || stop !== undefined || finished) return
+    if (runningCalls.size > 0) {
+      armSilence()
+      return
+    }
+    const busy = await probeConversationBusy()
+    // Activity or completion may race the async backend probe. A stale idle result must never kill
+    // the newer turn state that already re-armed or cleared the watchdog.
+    if (epoch !== watchdogEpoch || stop !== undefined || finished || runningCalls.size > 0) return
+    if (busy) {
+      await emit({
+        type: "status",
+        status: "watchdog.busy",
+        text: `backend reports an in-flight step after ${Math.round(silenceLimit / 1000)}s of silence; watchdog re-armed`,
+      })
+      armSilence()
+      return
+    }
+    void abort(
+      "silent",
+      `no runtime activity for ${Math.round(silenceLimit / 1000)}s with no tool running and no step in flight: ` +
+        `provider or agent loop stopped responding`,
+    )
+  }
+  const probeConversationBusy = async (): Promise<boolean> => {
+    if (typeof conversation.isBusy !== "function") return false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const result = await Promise.race([
+        conversation.isBusy(),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), SILENCE_PROBE_TIMEOUT_MS)
+          timer.unref?.()
+        }),
+      ])
+      return result === true
+    } catch {
+      // A failed probe is not proof of life; the watchdog proceeds as if the backend were idle.
+      return false
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   const abort = async (reason: Outcome["stop"], why: string) => {
@@ -1175,6 +1224,7 @@ export async function runChallenge(input: {
   }
 
   clearTimeout(deadline)
+  finished = true
   clearSilence()
   input.signal?.removeEventListener("abort", externalAbort)
   input.handoffSignal?.removeEventListener("abort", externalHandoff)

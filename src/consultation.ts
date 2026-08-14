@@ -2,6 +2,7 @@ import { lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/pro
 import path from "node:path"
 import type { Challenge } from "./challenge.ts"
 import {
+  estimateTextTokens,
   loadConsultationHistory,
   type ConsultationContext,
 } from "./consultation-context.ts"
@@ -13,7 +14,13 @@ import {
   runtimeFailureUsage,
   runtimeReplyText,
 } from "./runtime-turn.ts"
-import { budgetTokens, isTransient, messageTokens, type Limits } from "./session.ts"
+import {
+  budgetTokens,
+  classifyProviderFailure,
+  isTransient,
+  messageTokens,
+  type Limits,
+} from "./session.ts"
 import type { Workspace } from "./workspace.ts"
 
 export type ConsultationTrigger =
@@ -93,6 +100,7 @@ export type AskConsultant = (input: {
 }) => Promise<ConsultationReply>
 
 const MAX_DESCRIPTION = 16_000
+/** Token ceiling for the rendered work section, measured with the conservative estimator. */
 const MAX_WORK = 24_000
 const MAX_CLUES = 32_000
 const MAX_DETAIL = 4_000
@@ -105,7 +113,11 @@ function bounded(text: string | undefined, maximum: number) {
   return `${value.slice(0, maximum)}\n\n[内容已截断，共 ${value.length} 字符]`
 }
 
-function challengeSummary(challenge: Challenge) {
+function scaledBound(maximum: number, scale: number) {
+  return Math.max(1, Math.floor(maximum * Math.min(1, Math.max(0, scale))))
+}
+
+function challengeSummary(challenge: Challenge, scale = 1) {
   return [
     `题目：${challenge.slug}`,
     `分类：${challenge.category ?? "OTHER"}`,
@@ -114,7 +126,7 @@ function challengeSummary(challenge: Challenge) {
     challenge.remote ? `远程目标：${JSON.stringify(challenge.remote)}` : "",
     "",
     "题目说明：",
-    bounded(challenge.description, MAX_DESCRIPTION) || "（无）",
+    bounded(challenge.description, scaledBound(MAX_DESCRIPTION, scale)) || "（无）",
   ]
     .filter((line) => line !== "")
     .join("\n")
@@ -148,7 +160,9 @@ function renderHistoryMessage(message: RuntimeMessage) {
 /**
  * Produce a consultation-only view of recent work without mutating the solver conversation. Manual
  * and post-compaction consultations both reduce their available snapshot here. The result is plain
- * text, so a very large API round can be shortened safely instead of erasing all consultation history.
+ * text, so a very large API round can be shortened safely instead of erasing all consultation
+ * history. `maximum` is a token budget measured with {@link estimateTextTokens}, so dense logs and
+ * CJK text no longer slip through a character-counting loophole.
  */
 export function compressConsultationHistory(messages: RuntimeMessage[], maximum = MAX_WORK) {
   const limit = Math.max(0, Math.floor(maximum))
@@ -159,19 +173,22 @@ export function compressConsultationHistory(messages: RuntimeMessage[], maximum 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const rendered = renderHistoryMessage(messages[index]!)
     if (!rendered) continue
-    const separator = selected.length === 0 ? 0 : 2
+    const cost = estimateTextTokens(rendered)
+    const separator = selected.length === 0 ? 0 : 1
     const remaining = limit - used - separator
     if (remaining <= 0) {
       omitted = index + 1
       break
     }
-    if (rendered.length > remaining) {
-      selected.unshift(boundedHeadAndTail(rendered, remaining))
+    if (cost > remaining) {
+      // One character per remaining token is conservative for the estimator's densest (CJK) case;
+      // the runtime's real prompt-token enforcement remains the final backstop.
+      selected.unshift(boundedHeadAndTail(rendered, Math.max(1, remaining)))
       omitted = index
       break
     }
     selected.unshift(rendered)
-    used += separator + rendered.length
+    used += separator + cost
   }
   const body = selected.join("\n\n") || "（暂无已完成的工作记录）"
   return omitted > 0 ? `[较早的 ${omitted} 条记录已省略]\n${body}` : body
@@ -187,19 +204,25 @@ export function buildConsultationContext(input: {
   artifacts?: string[]
   rejectedFlags?: string[]
   contextWarning?: string
+  /**
+   * Shrinks every rendered bound (description, work, clues, detail) by this factor in (0, 1].
+   * Retry ladders walk down the scale until the runtime accepts the prompt.
+   */
+  scale?: number
 }): ConsultationContext {
+  const scale = input.scale === undefined ? 1 : Math.min(1, Math.max(0, Number(input.scale) || 1))
   const historyMaximum = Math.min(
     MAX_WORK,
-    Math.max(1, Math.floor(input.historyTokenBudget ?? DEFAULT_CONSULTATION_HISTORY_TOKENS)) * 4,
+    Math.max(1, Math.floor(input.historyTokenBudget ?? DEFAULT_CONSULTATION_HISTORY_TOKENS)),
   )
   const recentWork = compressConsultationHistory(input.history ?? [], historyMaximum)
-  const status = bounded(input.stopDetail, MAX_DETAIL)
+  const status = bounded(input.stopDetail, scaledBound(MAX_DETAIL, scale))
   const work = [
     ...(status ? [`当前状态：${status}`, ""] : []),
     recentWork,
   ].join("\n")
   const clues = [
-    bounded(input.notes, MAX_CLUES) || "（暂无线索记录）",
+    bounded(input.notes, scaledBound(MAX_CLUES, scale)) || "（暂无线索记录）",
     ...(input.artifacts?.length
       ? ["", "相关产物：", ...input.artifacts.map((artifact) => `- ${artifact}`)]
       : []),
@@ -207,11 +230,11 @@ export function buildConsultationContext(input: {
       ? ["", "已拒绝 flag（不得重复提交）：", ...input.rejectedFlags.map((flag) => `- ${flag}`)]
       : []),
     ...(input.contextWarning
-      ? ["", `上下文读取提示：${bounded(input.contextWarning, MAX_DETAIL)}`]
+      ? ["", `上下文读取提示：${bounded(input.contextWarning, scaledBound(MAX_DETAIL, scale))}`]
       : []),
   ].join("\n")
   return {
-    challenge: challengeSummary(input.challenge),
+    challenge: challengeSummary(input.challenge, scale),
     work,
     clues,
   }
@@ -242,7 +265,18 @@ function expertLabel(index: number) {
   return `专家 ${index + 1}`
 }
 
-function synthesisPrompt(context: ConsultationContext, plans: ConsultationReply[]) {
+const MAX_PLAN_CHARS = 12_000
+
+/**
+ * Synthesis prompt with each expert plan bounded. Unbounded plan text is the dominant term in the
+ * synthesis context: one verbose expert can single-handedly overflow the synthesizer window, and a
+ * degraded consultation then inherits whatever that expert hallucinated in full.
+ */
+function synthesisPrompt(
+  context: ConsultationContext,
+  plans: ConsultationReply[],
+  planChars = MAX_PLAN_CHARS,
+) {
   return [
     "下面是几位 CTF 专家给出的思路。请结合题目摘要和当前进展，整理出最可行的解题方案。",
     "",
@@ -250,12 +284,24 @@ function synthesisPrompt(context: ConsultationContext, plans: ConsultationReply[
     ...plans.flatMap((plan, index) => [
       "",
       `${expertLabel(index)}（${plan.model}）：`,
-      plan.text,
+      boundedHeadAndTail(plan.text, Math.max(1, Math.floor(planChars))),
     ]),
   ].join("\n")
 }
 
-export function allocateConsultationBudgets(totalTokens: number, expertCount: number): ConsultationBudgets {
+/** Declared model context windows used to cap consultation budgets when the backend reports them. */
+export type ConsultationWindows = {
+  /** Context window of the smallest expert model; caps the shared per-expert budget. */
+  expert?: number
+  /** Context window of the synthesizer model; caps the synthesis budget. */
+  synthesizer?: number
+}
+
+export function allocateConsultationBudgets(
+  totalTokens: number,
+  expertCount: number,
+  windows: ConsultationWindows = {},
+): ConsultationBudgets {
   if (expertCount < CONSULT_EXPERTS.minimum || expertCount > CONSULT_EXPERTS.maximum)
     throw new Error(`Consultation budget requires ${CONSULT_EXPERTS.minimum}-${CONSULT_EXPERTS.maximum} experts`)
   if (!Number.isFinite(totalTokens) || totalTokens < expertCount + 2)
@@ -268,13 +314,34 @@ export function allocateConsultationBudgets(totalTokens: number, expertCount: nu
   const synthesizerTokens = Math.max(1, Math.min(
     Math.floor(total * 0.2),
     total - expertCount - solverTokens,
+    windows.synthesizer === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(1, Math.floor(windows.synthesizer)),
   ))
   const expertPool = total - solverTokens - synthesizerTokens
+  const expertTokens = Math.max(1, Math.min(
+    Math.floor(expertPool / expertCount),
+    windows.expert === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(1, Math.floor(windows.expert)),
+  ))
   return {
-    expertTokens: Math.max(1, Math.floor(expertPool / expertCount)),
+    expertTokens,
     synthesizerTokens,
     solverTokens,
   }
+}
+
+/**
+ * One rung of a consultation prompt ladder, from largest to smallest. The runtime's own
+ * prompt-token enforcement is the fit oracle: a context overflow advances to the next rung
+ * instead of failing the expert outright.
+ */
+export type ConsultationPromptRung = {
+  index: number
+  prompt: string
+  historyTokens: number
+  scale: number
 }
 
 export type ConsultationExpertSettlement =
@@ -335,6 +402,16 @@ function retryableConsultationFailure(error: unknown) {
     .test(errorText(error))
 }
 
+/**
+ * True when the prompt itself did not fit the runtime: the provider reported an input context
+ * overflow, or Boom's own post-step budget check fired while the prompt was still oversized.
+ * Retrying the same rung cannot help; the ladder must shrink instead.
+ */
+function contextOverflowError(error: unknown) {
+  return classifyProviderFailure(error) === "input-context-overflow" ||
+    /prompt token budget exceeded/i.test(errorText(error))
+}
+
 function degradedPlan(
   plans: ConsultationReply[],
   degradation: ConsultationDegradation,
@@ -374,6 +451,16 @@ export async function conductConsultation(input: {
   onExpertSettled?: (settlement: ConsultationExpertSettlement) => unknown
   signal?: AbortSignal
   timeout?: number
+  /** Ordered expert prompt ladder, largest first; absent, one rung renders from `context`. */
+  promptRungs?: ConsultationPromptRung[]
+  /** Ordered synthesis ladder, largest first; absent, one rung renders from `context` and `plans`. */
+  synthesisRungs?: ConsultationPromptRung[]
+  /**
+   * Contexts for the synthesis ladder, largest first. Only `plans` exist after the expert phase,
+   * so the synthesis prompts are rendered from these inside the consultation run. Ignored when
+   * `synthesisRungs` is provided.
+   */
+  synthesisContexts?: ConsultationContext[]
 }): Promise<Consultation> {
   if (input.signal?.aborted) throw new Error("Consultation aborted by user")
   if (
@@ -392,7 +479,7 @@ export async function conductConsultation(input: {
     input.signal && deadline
       ? AbortSignal.any([input.signal, deadline])
       : input.signal ?? deadline
-  const prompt = expertPrompt(input.context)
+  const promptRungs = input.promptRungs ?? [{ index: 0, prompt: expertPrompt(input.context), historyTokens: 0, scale: 1 }]
   let plans: ConsultationReply[] = []
   let failures: ConsultationFailure[] = []
   let merged: ConsultationReply
@@ -405,46 +492,60 @@ export async function conductConsultation(input: {
       let tokens = 0
       let billable = 0
       let cost = 0
+      /** Billable spend of attempts rejected for context overflow. It must not consume the ask
+       *  budget, or one oversized prompt would starve every smaller retry that could fit. */
+      let overflowBillable = 0
       let lastError = "unknown expert failure"
       let attempts = 0
-      for (let attempt = 0; attempt <= retries; attempt += 1) {
-        const remaining = input.budgets
-          ? Math.max(0, input.budgets.expertTokens - billable)
-          : undefined
-        if (remaining !== undefined && remaining <= 0) break
-        let completed: ConsultationReply
-        try {
-          attempts += 1
-          completed = await input.ask({
-            model,
-            title: attempt === 0
-              ? `Boom consult ${index + 1}/${input.expertModels.length}`
-              : `Boom consult ${index + 1}/${input.expertModels.length} retry ${attempt}`,
-            prompt,
-            ...(remaining === undefined ? {} : { tokenBudget: remaining }),
-            signal,
-          })
-        } catch (error) {
-          lastError = errorText(error)
-          const usage = failedUsage(error)
-          tokens += usage.tokens
-          billable += usage.billable
-          cost += usage.cost
-          if (input.signal?.aborted) throw error
-          if (deadline?.aborted || !retryableConsultationFailure(error)) break
-          if (attempt < retries && retryDelayMs > 0)
-            await new Promise((resume) => setTimeout(resume, retryDelayMs * 2 ** attempt))
-          continue
+      outer: for (const rung of promptRungs) {
+        for (let attempt = 0; attempt <= retries; attempt += 1) {
+          const remaining = input.budgets
+            ? Math.max(0, input.budgets.expertTokens - (billable - overflowBillable))
+            : undefined
+          if (remaining !== undefined && remaining <= 0) break outer
+          let completed: ConsultationReply
+          try {
+            attempts += 1
+            completed = await input.ask({
+              model,
+              title: attempts === 1
+                ? `Boom consult ${index + 1}/${input.expertModels.length}`
+                : `Boom consult ${index + 1}/${input.expertModels.length} retry ${attempts - 1}`,
+              prompt: rung.prompt,
+              ...(remaining === undefined ? {} : { tokenBudget: remaining }),
+              signal,
+            })
+          } catch (error) {
+            lastError = errorText(error)
+            const usage = failedUsage(error)
+            tokens += usage.tokens
+            billable += usage.billable
+            cost += usage.cost
+            if (input.signal?.aborted) throw error
+            if (deadline?.aborted) break outer
+            // A prompt that does not fit the runtime is a property of the rung, not of the model.
+            // Charge it outside the budget and walk down the ladder instead of failing the expert.
+            if (contextOverflowError(error) && rung.index < promptRungs.length - 1) {
+              overflowBillable += usage.billable
+              break
+            }
+            if (retryableConsultationFailure(error) && attempt < retries) {
+              if (retryDelayMs > 0)
+                await new Promise((resume) => setTimeout(resume, retryDelayMs * 2 ** attempt))
+              continue
+            }
+            break outer
+          }
+          const reply = {
+            ...completed,
+            tokens: completed.tokens + tokens,
+            billable: completed.billable + billable,
+            cost: completed.cost + cost,
+          }
+          const settlement = { index, status: "success" as const, reply }
+          await Promise.resolve(input.onExpertSettled?.(settlement))
+          return settlement
         }
-        const reply = {
-          ...completed,
-          tokens: completed.tokens + tokens,
-          billable: completed.billable + billable,
-          cost: completed.cost + cost,
-        }
-        const settlement = { index, status: "success" as const, reply }
-        await Promise.resolve(input.onExpertSettled?.(settlement))
-        return settlement
       }
       const failure: ConsultationFailure = {
         index,
@@ -486,22 +587,68 @@ export async function conductConsultation(input: {
       }
       merged = degradedPlan(plans, degraded)
     } else {
-      try {
-        merged = await input.ask({
-          model: input.synthesizerModel,
-          title: "Boom consult synthesis",
-          prompt: synthesisPrompt(input.context, plans),
-          ...(input.budgets ? { tokenBudget: input.budgets.synthesizerTokens } : {}),
-          signal,
-        })
-      } catch (error) {
-        if (input.signal?.aborted) throw error
-        degradationUsage = failedUsage(error)
+      // The synthesis prompt carries every surviving plan, so it is the most likely ask to
+      // overflow. Walk its ladder the same way the experts do: overflow advances a rung, only a
+      // terminal failure on the smallest rung degrades the merge. Plan text quarters per rung.
+      const synthesisRungs = input.synthesisRungs ?? (input.synthesisContexts
+        ? input.synthesisContexts.map((rungContext, index) => ({
+            index,
+            prompt: synthesisPrompt(
+              rungContext,
+              plans,
+              Math.max(1, Math.floor(MAX_PLAN_CHARS / 4 ** index)),
+            ),
+            historyTokens: 0,
+            scale: 1 / 4 ** index,
+          }))
+        : [{
+            index: 0,
+            prompt: synthesisPrompt(input.context, plans),
+            historyTokens: 0,
+            scale: 1,
+          }])
+      let synthesisOverflowBillable = 0
+      let synthesisBillable = 0
+      let lastSynthesisError = "unknown synthesis failure"
+      let mergedAsk: ConsultationReply | undefined
+      for (const rung of synthesisRungs) {
+        const remaining = input.budgets
+          ? Math.max(0, input.budgets.synthesizerTokens - (synthesisBillable - synthesisOverflowBillable))
+          : undefined
+        if (remaining !== undefined && remaining <= 0) break
+        try {
+          mergedAsk = await input.ask({
+            model: input.synthesizerModel,
+            title: "Boom consult synthesis",
+            prompt: rung.prompt,
+            ...(remaining === undefined ? {} : { tokenBudget: remaining }),
+            signal,
+          })
+          break
+        } catch (error) {
+          if (input.signal?.aborted) throw error
+          const usage = failedUsage(error)
+          degradationUsage.tokens += usage.tokens
+          degradationUsage.billable += usage.billable
+          degradationUsage.cost += usage.cost
+          synthesisBillable += usage.billable
+          lastSynthesisError = errorText(error)
+          if (deadline?.aborted) break
+          if (contextOverflowError(error) && rung.index < synthesisRungs.length - 1) {
+            synthesisOverflowBillable += usage.billable
+            continue
+          }
+          break
+        }
+      }
+      if (mergedAsk !== undefined) {
+        merged = mergedAsk
+      } else {
         degraded = {
           reason: "synthesis-failed",
           detail: deadline?.aborted
             ? `Consultation timed out after ${Math.round(input.timeout! / 1000)}s during synthesis; preserving completed expert plans`
-            : errorText(error),
+            : lastSynthesisError,
         }
         merged = degradedPlan(plans, degraded)
       }
@@ -614,18 +761,35 @@ export async function runConsultation(input: {
   }
   const history = input.history ?? stored?.messages ?? []
   const artifacts = await recentArtifacts(input.workspace.directory, MAX_ARTIFACTS)
-  const context = buildConsultationContext({
+  const contextInput = {
     ...input,
     notes,
     history,
     contextWarning: [input.contextWarning, storedWarning].filter(Boolean).join("; ") || undefined,
-    historyTokenBudget:
-      input.historyTokenBudget ??
-      (input.budgets
-        ? Math.max(1, Math.floor(input.budgets.expertTokens * 0.5))
-        : DEFAULT_CONSULTATION_HISTORY_TOKENS),
     artifacts,
-  })
+  }
+  // Prompt ladder, largest first. The runtime's own prompt-token enforcement picks the first rung
+  // that fits; each rung quarters the history budget and every rendered bound. Four rungs cover a
+  // ~64x spread, which absorbs the observed 2x-and-up estimator miss on dense logs and CJK notes.
+  const initialHistoryTokens = input.historyTokenBudget ??
+    (input.budgets
+      ? Math.max(1, Math.floor(input.budgets.expertTokens * 0.5))
+      : DEFAULT_CONSULTATION_HISTORY_TOKENS)
+  const ladder: Array<{ context: ConsultationContext; rung: ConsultationPromptRung }> = []
+  for (let index = 0; index < 4; index += 1) {
+    const scale = 1 / 4 ** index
+    const historyTokens = Math.max(1, Math.floor(initialHistoryTokens * scale))
+    const context = buildConsultationContext({
+      ...contextInput,
+      historyTokenBudget: historyTokens,
+      scale,
+    })
+    ladder.push({
+      context,
+      rung: { index, prompt: expertPrompt(context), historyTokens, scale },
+    })
+  }
+  const context = ladder[0]!.context
   const id = `consult-${new Date().toISOString().replace(/[:.]/g, "")}-${crypto.randomUUID().slice(0, 8)}`
   const consultation = await conductConsultation({
     id,
@@ -636,6 +800,8 @@ export async function runConsultation(input: {
     context,
     ask: createRuntimeConsultant(input),
     budgets: input.budgets,
+    promptRungs: ladder.map((item) => item.rung),
+    synthesisContexts: ladder.map((item) => item.context),
     onExpertSettled: (settlement) =>
       persistExpertSettlement(input.workspace.directory, id, settlement),
     signal: input.signal,

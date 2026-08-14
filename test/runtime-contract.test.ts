@@ -5,7 +5,7 @@ import type {
   RuntimeHandle,
   RuntimePrompt,
 } from "../src/runtime-contract.ts"
-import { completeRuntimePrompt, runtimeFailureUsage, runtimeReplyText } from "../src/runtime-turn.ts"
+import { completeRuntimePrompt, RuntimePromptFailure, runtimeFailureUsage, runtimeReplyText } from "../src/runtime-turn.ts"
 import { resolveRuntimeForkBoundary, runtimeForkBoundaries } from "../src/runtime-messages.ts"
 
 function fakeAgent(seen: RuntimePrompt[]): AgentRuntime {
@@ -172,6 +172,48 @@ describe("Boom runtime contract", () => {
       cost: 0.2,
     })
     expect(aborted).toBeGreaterThan(0)
+  })
+
+  test("enforces the ask ceiling from result usage when no step events arrive", async () => {
+    const runtime: AgentRuntime = {
+      async createConversation() {
+        return {
+          id: "silent-budget",
+          async events() {
+            return { async *[Symbol.asyncIterator]() {} }
+          },
+          async prompt() {
+            return {
+              parts: [{ type: "text", text: "expensive answer" }],
+              usage: { input: 600, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+              cost: 0.5,
+              finish: "stop" as const,
+            }
+          },
+          async abort() {},
+        }
+      },
+    }
+    let failure: unknown
+    try {
+      await completeRuntimePrompt({
+        runtime,
+        directory: "/tmp/silent-budget-runtime-test",
+        title: "silent",
+        agent: "boom-worker",
+        model: "test/model",
+        prompt: "objective",
+        tokenBudget: 500,
+      })
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(RuntimePromptFailure)
+    expect((failure as Error).message).toContain("runtime prompt token budget exceeded: 700 > 500")
+    expect(runtimeFailureUsage(failure)).toMatchObject({
+      usage: { input: 600, output: 100 },
+      cost: 0.5,
+    })
   })
 
   test("lets the GUI inject an agent-only backend without provider management", async () => {

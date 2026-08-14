@@ -67,9 +67,31 @@ function runtimeMessage(value: unknown): RuntimeMessage | undefined {
   }
 }
 
+/**
+ * Conservative provider-neutral token estimate. CJK and fullwidth characters approximate one token
+ * each, Latin text one token per 2.5 characters. The margin matters: hex dumps, pixel-art logs, and
+ * CJK notes inflate far beyond the old flat chars/4 rule, and the estimate must over- rather than
+ * under-count — trimming too much only loses history, trimming too little breaks the ask.
+ */
+export function estimateTextTokens(text: string) {
+  if (text.length === 0) return 0
+  let cjk = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)!
+    if (
+      (code >= 0x2e80 && code <= 0x9fff) ||
+      (code >= 0xf900 && code <= 0xfaff) ||
+      (code >= 0xff00 && code <= 0xffef) ||
+      (code >= 0x3000 && code <= 0x303f)
+    ) cjk += 1
+  }
+  const other = text.length - cjk
+  return Math.max(1, Math.ceil(cjk + other / 2.5))
+}
+
 /** Conservative provider-neutral estimate used only to bound consultation input. */
 export function estimateRuntimeMessageTokens(message: RuntimeMessage) {
-  return Math.max(1, Math.ceil(JSON.stringify(message).length / 4))
+  return estimateTextTokens(JSON.stringify(message))
 }
 
 function completeRounds(messages: RuntimeMessage[]) {

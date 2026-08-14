@@ -94,7 +94,7 @@
       }
     },
     "task": {
-      "description": "Run a bounded Boom worker in an isolated child workspace and return its final report to this tool call.",
+      "description": "Run a bounded Boom worker in an isolated child workspace and return its final report to this tool call. Choose boom-worker (economy model) for mechanical, enumerable work; choose boom-worker-pro (strong model) for reasoning-heavy analysis.",
       "implementation": "runtime",
       "sideEffect": "process",
       "schema": {
@@ -104,7 +104,7 @@
         "properties": {
           "description": { "type": "string", "minLength": 1, "maxLength": 200 },
           "prompt": { "type": "string", "minLength": 1, "maxLength": 65536 },
-          "subagent_type": { "enum": ["boom-worker"] }
+          "subagent_type": { "enum": ["boom-worker", "boom-worker-pro"] }
         }
       }
     },

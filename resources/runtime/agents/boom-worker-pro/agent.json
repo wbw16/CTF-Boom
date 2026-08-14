@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "boom-worker-pro",
+  "mode": "subagent",
+  "role": "worker",
+  "model": "strong",
+  "description": "Boom's strong-tier worker: hard, reasoning-heavy analysis (exploit synthesis, decompilation reading, crypto math). It runs on the strong model and may delegate mechanical subtasks to boom-worker.",
+  "color": "#4F46E5",
+  "temperature": 0.3,
+  "toolProfile": "worker",
+  "output": "freeform"
+}

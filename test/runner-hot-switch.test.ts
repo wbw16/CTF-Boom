@@ -37,6 +37,7 @@ async function hotSwitchFixture() {
   const consultationPrompts: Array<{ model: string; title: string; text: string }> = []
   const resumed: string[] = []
   const closed: number[] = []
+  const launchModels: Array<{ economy: string; strong: string } | undefined> = []
   let generation = 0
 
   const catalog = (): RuntimeProviderCatalog => ({
@@ -144,7 +145,8 @@ async function hotSwitchFixture() {
     async abort() {},
   })
 
-  const launcher = async (): Promise<RuntimeHandle> => {
+  const launcher = async (options?: { models?: { economy: string; strong: string } }): Promise<RuntimeHandle> => {
+    launchModels.push(options?.models)
     const current = ++generation
     const agent: AgentRuntime = {
       async createConversation(input) {
@@ -212,6 +214,7 @@ async function hotSwitchFixture() {
     consultationPrompts,
     resumed,
     closed,
+    launchModels,
     get oldAborts() { return oldAborts },
     get generation() { return generation },
   }
@@ -250,6 +253,57 @@ test("hot-switches an active model only after its running tool completes", async
       { model: "openai/old", stop: "switched" },
       { model: "openai/next", candidates: ["flag{switched}"] },
     ])
+  } finally {
+    await fixture.runner.close()
+  }
+})
+
+test("relaunches the runtime with the tier policy when worker model tiers change", async () => {
+  const fixture = await hotSwitchFixture()
+  try {
+    // The CLI enqueue path adopts the explicit policy before the first runtime launch.
+    expect(fixture.launchModels[0]).toEqual({ economy: "openai/old", strong: "openai/old" })
+
+    // Only the economy tier changes; the active job keeps running on "openai/old", but the runtime
+    // must relaunch so boom-worker / boom-worker-pro resolve their new tier models.
+    const result = await fixture.runner.applyLiveModelSettings({
+      economyModel: "openai/next",
+      strongModel: "openai/old",
+      consultModels: [],
+      blindReview: false,
+      consultOnCompaction: false,
+    })
+    expect(result.active).toBe(1)
+    expect(fixture.oldAborts).toBe(0)
+
+    fixture.releaseTool()
+    await waitForIdle(fixture.runner)
+
+    expect(fixture.oldAborts).toBe(1)
+    expect(fixture.generation).toBe(2)
+    expect(fixture.launchModels[1]).toEqual({ economy: "openai/next", strong: "openai/old" })
+    // The solver model itself did not change; only the worker tier policy did.
+    expect(fixture.prompts.map((item) => item.model)).toEqual(["openai/old", "openai/old"])
+    expect(fixture.prompts[1]?.text).toContain("Worker 模型档位已更新")
+    expect(fixture.resumed).toEqual(["session-hot"])
+  } finally {
+    await fixture.runner.close()
+  }
+})
+
+test("adopts an unchanged tier policy without relaunching the runtime", async () => {
+  const fixture = await hotSwitchFixture()
+  try {
+    const result = await fixture.runner.applyLiveModelSettings({
+      economyModel: "openai/old",
+      strongModel: "openai/old",
+      consultModels: [],
+      blindReview: false,
+      consultOnCompaction: false,
+    })
+    expect(result.active).toBe(0)
+    expect(fixture.generation).toBe(1)
+    expect(fixture.oldAborts).toBe(0)
   } finally {
     await fixture.runner.close()
   }

@@ -163,7 +163,20 @@ export async function completeRuntimePrompt(input: {
       await Promise.race([terminalEvent, watching, trailingEventWindow()]).catch(() => {})
     }
     if (budgetError) throw new RuntimePromptFailure(budgetError, usage, observedCost)
-    if (usageSteps === 0) return result
+    if (usageSteps === 0) {
+      // Providers that emit no step events must still respect the ask ceiling: fall back to the
+      // result's own usage so a silent single-shot provider cannot dodge the budget check.
+      if (input.tokenBudget !== undefined && result.usage) {
+        const billable = billableUsage(result.usage)
+        if (billable > input.tokenBudget)
+          throw new RuntimePromptFailure(
+            `runtime prompt token budget exceeded: ${Math.round(billable)} > ${input.tokenBudget}`,
+            result.usage,
+            result.cost,
+          )
+      }
+      return result
+    }
     // Native results include descendant task usage while root events contain only root steps. Use a
     // component-wise reconciliation so neither that aggregate nor compatibility event usage is lost
     // or double-counted.

@@ -29,6 +29,12 @@ system, or targets outside the challenge. Do not send challenge material to thir
 How you solve the challenge, which tools you use, whether you write programs or delegate work, and
 the order in which you proceed are entirely your decision.
 
+When delegating with the task tool, choose the tier by the objective: `boom-worker` runs on the
+economy model and suits bounded, mechanical work (decode, extract, brute force, scan); `boom-worker-pro`
+runs on the strong model and suits hard analysis (exploit synthesis, decompilation reading, crypto
+math). Give either worker one complete objective, the evidence it should return, and where it must
+write files; `boom-worker-pro` may itself delegate mechanical subtasks to `boom-worker`.
+
 You may proactively request an independent multi-model consultation with `ctf-consult` whenever the
 current approach appears trapped, the evidence supports several materially different next paths, or
 an outside plan would reduce repeated low-information experiments. Before calling it, record any new

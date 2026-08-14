@@ -11,6 +11,7 @@ import {
   ConsultationExecutionError,
   type Consultation,
   type ConsultationTrigger,
+  type ConsultationWindows,
 } from "./consultation.ts"
 import {
   handleConsultationRequest,
@@ -399,6 +400,40 @@ async function solverPromptCapabilities(runtime: RuntimeHandle, category?: strin
   }
 }
 
+/**
+ * Best-effort context windows for consultation budgets, resolved from the runtime's provider
+ * catalog. An unresolved or unexposed window never caps a budget; the consultation prompt ladder
+ * remains the fit guarantee. Catalog entries may report Boom's own floor instead of the true
+ * window, in which case the cap is a no-op.
+ */
+async function consultationModelWindows(
+  runtime: RuntimeHandle,
+  input: { experts: string[]; synthesizer: string },
+): Promise<ConsultationWindows> {
+  const windows: ConsultationWindows = {}
+  try {
+    if (!runtime.provider) return windows
+    const catalog = await runtime.provider.listProviders()
+    const resolve = (model: string): number | undefined => {
+      const [providerID, ...rest] = model.split("/")
+      const modelID = rest.join("/")
+      for (const candidate of [providerID, providerID === "free" ? "opencode" : providerID]) {
+        const provider = catalog.all.find((item) => item.id === candidate)
+        const context = provider?.models[modelID]?.limit?.context
+        if (context !== undefined && Number.isFinite(context) && context > 0) return context
+      }
+      return undefined
+    }
+    const expertWindows = input.experts.map(resolve).filter((window): window is number => window !== undefined)
+    if (expertWindows.length > 0) windows.expert = Math.min(...expertWindows)
+    const synthesizerWindow = resolve(input.synthesizer)
+    if (synthesizerWindow !== undefined) windows.synthesizer = synthesizerWindow
+  } catch {
+    // Provider catalogs are advisory; an unreachable runtime must not block a consultation.
+  }
+  return windows
+}
+
 function clampConcurrency(value: number) {
   if (!Number.isFinite(value)) return 1
   return Math.max(1, Math.min(32, Math.floor(value)))
@@ -564,6 +599,8 @@ export class GuiRunner {
   private runtimePromise?: Promise<RuntimeHandle>
   private retiredRuntimes = new Set<RuntimeHandle>()
   private launchRuntime: RuntimeLauncher
+  /** Last applied economy/strong policy; resolved into tier-declared agent resources on launch. */
+  private runtimeModelPolicy?: ModelPolicy
   private platformAdapters: PlatformAdapterRegistry
   private runtimeStatus: RuntimeState["status"] = "starting"
   private runtimeError?: string
@@ -683,7 +720,7 @@ export class GuiRunner {
     this.runtimeStatus = "starting"
     this.runtimeError = undefined
     this.notify({ at: Date.now(), type: "runtime.starting" })
-    this.runtimePromise = this.launchRuntime()
+    this.runtimePromise = this.launchRuntime({ models: this.runtimeModelPolicy })
       .then(async (started) => {
         if (this.closed) {
           await started.close()
@@ -1158,6 +1195,16 @@ export class GuiRunner {
 
   async applyLiveModelSettings(settings: LiveModelSettings): Promise<LiveSwitchResult> {
     const policy = { economy: settings.economyModel, strong: settings.strongModel }
+    // Worker agent resources resolve their tier at runtime launch. A changed tier policy therefore
+    // needs a fresh runtime generation; active jobs re-bind it at their next safe boundary.
+    const tierPolicyChanged =
+      this.runtimeModelPolicy === undefined ||
+      this.runtimeModelPolicy.economy !== policy.economy ||
+      this.runtimeModelPolicy.strong !== policy.strong
+    if (tierPolicyChanged) {
+      this.runtimeModelPolicy = policy
+      await this.restartRuntime()
+    }
     const targets = new Set<string>()
     for (const job of this.active.values())
       targets.add(job.purpose === "writeup" ? policy.economy : policy.strong)
@@ -1182,7 +1229,7 @@ export class GuiRunner {
       const model = job.purpose === "writeup" ? policy.economy : policy.strong
       const modelWarnings = warningMap.get(model) ?? []
       modelWarnings.forEach((warning) => warnings.add(warning))
-      if (model === job.model) {
+      if (model === job.model && !tierPolicyChanged) {
         job.modelPolicy = policy
         job.consultModels = [...settings.consultModels]
         job.blindReview = settings.blindReview
@@ -1196,7 +1243,9 @@ export class GuiRunner {
         blindReview: settings.blindReview,
         consultOnCompaction: settings.consultOnCompaction,
         requestedAt: Date.now(),
-        reason: "用户修改了运行模型策略",
+        reason: tierPolicyChanged && model === job.model
+          ? "用户修改了 Worker 模型档位"
+          : "用户修改了运行模型策略",
         warnings: modelWarnings,
       })
       if (needsBoundary) active += 1
@@ -1228,6 +1277,16 @@ export class GuiRunner {
 
   async enqueue(input: EnqueueRunsInput) {
     if (input.challenges.length === 0) throw new Error("No challenges selected")
+    // Validate models and adopt the explicit policy before the runtime launches, so tier-declared
+    // worker agents resolve to this policy's models. Duplicate checks stay in the queueing loop.
+    for (const challenge of input.challenges) {
+      const model = input.models?.[challenge.slug] ?? input.model
+      if (!model.includes("/")) throw new Error(`Model must be "provider/model", got: ${model}`)
+      const policy = input.modelPolicy ?? { economy: model, strong: model }
+      if (!policy.economy.includes("/") || !policy.strong.includes("/"))
+        throw new Error("Model policy requires provider/model values")
+    }
+    if (!this.runtimeModelPolicy && input.modelPolicy) this.runtimeModelPolicy = input.modelPolicy
     await this.ensureRuntime()
     if (this.closed) throw new Error("GUI runner is closed")
     const seen = new Set<string>()
@@ -1236,11 +1295,6 @@ export class GuiRunner {
       seen.add(challenge.slug)
       if (this.active.has(challenge.slug) || this.queue.some((job) => job.challenge.slug === challenge.slug))
         throw new Error(`Challenge is already running or queued: ${challenge.slug}`)
-      const model = input.models?.[challenge.slug] ?? input.model
-      if (!model.includes("/")) throw new Error(`Model must be "provider/model", got: ${model}`)
-      const policy = input.modelPolicy ?? { economy: model, strong: model }
-      if (!policy.economy.includes("/") || !policy.strong.includes("/"))
-        throw new Error("Model policy requires provider/model values")
     }
 
     const queued = input.challenges.map((challenge) => {
@@ -1950,9 +2004,14 @@ export class GuiRunner {
         let preprocessingCost = 0
         if (canSolve && runtime && job.consultationInput) {
           job.consultationPhase = "running"
+          const consultationWindows = await consultationModelWindows(runtime, {
+            experts: job.consultationInput.expertModels,
+            synthesizer: job.consultationInput.synthesizerModel,
+          })
           const consultationBudgets = allocateConsultationBudgets(
             limits.tokens,
             job.consultationInput.expertModels.length,
+            consultationWindows,
           )
           const solverTimeout = Math.max(1, Math.floor(limits.timeout * 0.5))
           this.recordEvent(job, {
@@ -2313,11 +2372,17 @@ export class GuiRunner {
               "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
             ].join("\n")
           : request
-            ? [
-                `模型热切换：${job.model} -> ${request.model}。`,
-                warning,
-                "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
-              ].join("\n")
+            ? request.model === job.model
+              ? [
+                  "Worker 模型档位已更新：下一次 boom-worker / boom-worker-pro 委派将使用新的 economy/strong 模型。",
+                  warning,
+                  "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
+                ].join("\n")
+              : [
+                  `模型热切换：${job.model} -> ${request.model}。`,
+                  warning,
+                  "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
+                ].join("\n")
             : environment
               ? [
                   "任务环境已切换，下一次会话使用新环境声明。",

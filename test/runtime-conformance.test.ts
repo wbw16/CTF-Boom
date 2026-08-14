@@ -331,6 +331,31 @@ describe("OpenCode adapter normalization", () => {
     })
   })
 
+  test("derives reasoning deltas from whole-part updates before the message role is known", () => {
+    const context = { accumulatedParts: new Map<string, string>(), messageRoles: new Map<string, string>() }
+    expect(normalizeOpenCodeRuntimeEvent({
+      type: "message.part.updated",
+      properties: {
+        part: { id: "p1", type: "reasoning", sessionID: "ses", messageID: "msg-1", text: "step one" },
+      },
+    }, context)).toEqual({ type: "reasoning-delta", sessionID: "ses", delta: "step one" })
+    expect(normalizeOpenCodeRuntimeEvent({
+      type: "message.part.updated",
+      properties: {
+        part: { id: "p1", type: "reasoning", sessionID: "ses", messageID: "msg-1", text: "step one, step two" },
+      },
+    }, context)).toEqual({ type: "reasoning-delta", sessionID: "ses", delta: ", step two" })
+
+    // A role that is known to be non-assistant stays filtered even once parts accumulated.
+    const filtered = { accumulatedParts: new Map<string, string>(), messageRoles: new Map([["msg-2", "user"]]) }
+    expect(normalizeOpenCodeRuntimeEvent({
+      type: "message.part.updated",
+      properties: {
+        part: { id: "p2", type: "text", sessionID: "ses", messageID: "msg-2", text: "user text" },
+      },
+    }, filtered)).toBeUndefined()
+  })
+
   test("filters events from other sessions in a real scripted-provider turn", async () => {
     const provider = new ScriptedProvider([{
       type: "completion",

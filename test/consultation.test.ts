@@ -14,10 +14,13 @@ import {
   type ConsultationReply,
 } from "../src/consultation.ts"
 import {
+  estimateTextTokens,
   loadConsultationHistory,
   persistConsultationHistory,
+  estimateRuntimeMessageTokens,
   trimHistoryToCompleteRounds,
 } from "../src/consultation-context.ts"
+import { RuntimePromptFailure } from "../src/runtime-turn.ts"
 
 const challenge = {
   slug: "clockwork",
@@ -231,6 +234,17 @@ describe("multi-model consultation", () => {
     expect(work).toContain("内容已截断")
   })
 
+  test("keeps dense CJK history within the requested token budget", () => {
+    const budget = 100
+    const work = compressConsultationHistory([{
+      id: "dense-cjk",
+      role: "assistant",
+      parts: [{ type: "text", text: "汉".repeat(1_000) }],
+    }], budget)
+
+    expect(estimateTextTokens(work)).toBeLessThanOrEqual(budget)
+  })
+
   test("allows one capable model to serve independent roles", async () => {
     const calls: string[] = []
     const result = await conductConsultation({
@@ -327,7 +341,7 @@ describe("multi-model consultation", () => {
       },
     ]
     const newestRoundTokens = history.slice(2).reduce(
-      (sum, message) => sum + Math.ceil(JSON.stringify(message).length / 4),
+      (sum, message) => sum + estimateRuntimeMessageTokens(message),
       0,
     )
     const trimmed = trimHistoryToCompleteRounds(history, newestRoundTokens)
@@ -529,6 +543,103 @@ describe("multi-model consultation", () => {
     expect(seen.filter((call) => call.title !== "Boom consult synthesis").map((call) => call.budget))
       .toEqual([1_500, 1_500])
     expect(seen.at(-1)).toEqual({ title: "Boom consult synthesis", budget: 2_000 })
+  })
+
+  test("caps consultation budgets at declared model windows", () => {
+    const capped = allocateConsultationBudgets(10_000, 2, { expert: 1_000, synthesizer: 500 })
+
+    expect(capped).toEqual({ expertTokens: 1_000, synthesizerTokens: 500, solverTokens: 5_000 })
+  })
+
+  test("walks down the prompt ladder when an expert prompt does not fit the runtime", async () => {
+    const prompts: string[] = []
+    const budgets: Array<number | undefined> = []
+    const result = await conductConsultation({
+      trigger: "manual",
+      expertModels: ["openai/a", "anthropic/b"],
+      synthesizerModel: "openai/main",
+      context: snapshot,
+      budgets: { expertTokens: 2_000, synthesizerTokens: 1_000, solverTokens: 7_000 },
+      promptRungs: [
+        { index: 0, prompt: `FULL ${"x".repeat(2_000)}`, historyTokens: 100, scale: 1 },
+        { index: 1, prompt: "small context", historyTokens: 25, scale: 0.25 },
+        { index: 2, prompt: "tiny context", historyTokens: 6, scale: 0.0625 },
+      ],
+      expertRetries: 0,
+      ask: async ({ model, title, prompt, tokenBudget }) => {
+        if (title !== "Boom consult synthesis") {
+          prompts.push(prompt)
+          budgets.push(tokenBudget)
+        }
+        if (prompt.startsWith("FULL")) throw new RuntimePromptFailure(
+          "runtime prompt token budget exceeded: 9_000 > 2_000",
+          { input: 9_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          0.1,
+        )
+        return reply(model, `plan ${model}`)
+      },
+    })
+
+    expect(result.plans.map((plan) => plan.text)).toEqual(["plan openai/a", "plan anthropic/b"])
+    expect(prompts.filter((prompt) => prompt.startsWith("FULL"))).toHaveLength(2)
+    expect(prompts.filter((prompt) => prompt.startsWith("small"))).toHaveLength(2)
+    // The overflowed attempt must not consume the follow-up ask budget.
+    expect(budgets).toEqual([2_000, 2_000, 2_000, 2_000])
+  })
+
+  test("walks the synthesis ladder when the merged prompt overflows", async () => {
+    const synthesisPrompts: string[] = []
+    const result = await conductConsultation({
+      trigger: "manual",
+      expertModels: ["openai/a", "anthropic/b"],
+      synthesizerModel: "openai/main",
+      context: snapshot,
+      budgets: { expertTokens: 1_000, synthesizerTokens: 2_000, solverTokens: 7_000 },
+      synthesisRungs: [
+        { index: 0, prompt: "BIG MERGE", historyTokens: 0, scale: 1 },
+        { index: 1, prompt: "small merge", historyTokens: 0, scale: 0.25 },
+      ],
+      expertRetries: 0,
+      ask: async ({ model, title, prompt }) => {
+        if (title === "Boom consult synthesis") {
+          synthesisPrompts.push(prompt)
+          if (prompt === "BIG MERGE") throw new RuntimePromptFailure(
+            "runtime prompt token budget exceeded: 408342 > 400000",
+            { input: 400_000, output: 0, reasoning: 8_342, cache: { read: 0, write: 0 } },
+            0.01,
+          )
+          return reply(model, "merged")
+        }
+        return reply(model, `plan ${model}`)
+      },
+    })
+
+    expect(synthesisPrompts).toEqual(["BIG MERGE", "small merge"])
+    expect(result.merged.text).toBe("merged")
+    expect(result.degraded).toBeUndefined()
+  })
+
+  test("renders synthesis ladder contexts with bounded plan text", async () => {
+    let synthesisPrompt = ""
+    await conductConsultation({
+      trigger: "manual",
+      expertModels: ["openai/a", "anthropic/b"],
+      synthesizerModel: "openai/main",
+      context: snapshot,
+      synthesisContexts: [
+        { challenge: "摘要", work: "工作", clues: "线索" },
+        { challenge: "摘要小", work: "工作小", clues: "线索小" },
+      ],
+      expertRetries: 0,
+      ask: async ({ model, title, prompt }) => {
+        if (title === "Boom consult synthesis") synthesisPrompt = prompt
+        return reply(model, `draft ${model}`)
+      },
+    })
+
+    expect(synthesisPrompt).toContain("摘要")
+    expect(synthesisPrompt).toContain("draft openai/a")
+    expect(synthesisPrompt).not.toContain("plan openai/a")
   })
 
   test("persists provider-neutral history for a later manual consultation", async () => {

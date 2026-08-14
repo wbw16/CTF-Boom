@@ -57,24 +57,52 @@ describe("M2 neutral agent registry", () => {
       "boom",
       "boom-consultant",
       "boom-worker",
+      "boom-worker-pro",
     ])
     expect(registry.promptVersion).toMatch(/^[a-f0-9]{64}$/)
 
     const solver = registry.agents.find((agent) => agent.resource.id === "boom")!
     const worker = registry.agents.find((agent) => agent.resource.id === "boom-worker")!
+    const strongWorker = registry.agents.find((agent) => agent.resource.id === "boom-worker-pro")!
     const consultant = registry.agents.find((agent) => agent.resource.id === "boom-consultant")!
-    for (const agent of [solver, worker]) {
+    for (const agent of [solver, worker, strongWorker]) {
       for (const tool of ["bash", "read", "edit", "write", "list", "glob", "grep", "task", "skill", "websearch", "webfetch", "boom-exec", "ctf-note", "ctf-submit"])
         expect(agent.profile.tools).toContain(tool)
     }
     expect(consultant.profile.tools).toEqual(["read", "list", "glob", "grep"])
     expect(solver.profile.tools).toContain("ctf-consult")
     expect(worker.profile.tools).not.toContain("ctf-consult")
+    expect(strongWorker.profile.tools).not.toContain("ctf-consult")
     expect(consultant.profile.tools).not.toContain("ctf-consult")
     expect(solver.openCodeMarkdown).toContain("Generated from resources/runtime")
     expect(solver.openCodeMarkdown).toContain('"challenge/**": "deny"')
     expect(solver.openCodeMarkdown).toContain("You are Boom. The current workspace contains one CTF challenge.")
     expect(consultant.openCodeMarkdown).toContain("Boom tool profile: reasoning.")
+    expect(worker.resource.model).toBe("economy")
+    expect(strongWorker.resource.model).toBe("strong")
+    expect(solver.resource.model).toBeUndefined()
+    expect(consultant.resource.model).toBeUndefined()
+  })
+
+  test("stamps declared agent tiers into the OpenCode frontmatter from the current model policy", async () => {
+    const models = { economy: "free/deepseek-v4-flash-free", strong: "mimo/mimo-v2.5-pro" }
+    const registry = await compileBoomAgentRegistry(RESOURCE_ROOT, [], models)
+    const solver = registry.agents.find((agent) => agent.resource.id === "boom")!
+    const worker = registry.agents.find((agent) => agent.resource.id === "boom-worker")!
+    const strongWorker = registry.agents.find((agent) => agent.resource.id === "boom-worker-pro")!
+    const consultant = registry.agents.find((agent) => agent.resource.id === "boom-consultant")!
+    expect(worker.openCodeMarkdown).toContain(`model: "${models.economy}"`)
+    expect(strongWorker.openCodeMarkdown).toContain(`model: "${models.strong}"`)
+    // Host-selected roles must inherit the per-turn model, not a baked tier.
+    for (const markdown of [solver.openCodeMarkdown, consultant.openCodeMarkdown]) {
+      expect(markdown).not.toContain('model: "')
+    }
+
+    const unstamped = await compileBoomAgentRegistry(RESOURCE_ROOT)
+    expect(unstamped.agents.find((agent) => agent.resource.id === "boom-worker")!.openCodeMarkdown)
+      .not.toContain('model: "')
+    // The resolved tier models participate in the prompt provenance hash.
+    expect(registry.promptVersion).not.toBe(unstamped.promptVersion)
   })
 
   test("keeps the C19 tool catalog and Boom-owned schemas snapshot-stable", async () => {

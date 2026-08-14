@@ -5,21 +5,6 @@ export type ModelPolicy = {
   strong: string
 }
 
-export type ModelRole =
-  | "worker"
-  | "open-worker"
-  | "analyzer"
-  | "solver"
-  | "reviewer"
-
-const ROLE_TIERS: Record<ModelRole, ModelTier> = {
-  worker: "economy",
-  "open-worker": "strong",
-  analyzer: "economy",
-  solver: "strong",
-  reviewer: "strong",
-}
-
 export function isModelID(value: unknown): value is string {
   return typeof value === "string" && /^[^/\s]+\/[^/\s].*$/.test(value)
 }
@@ -44,9 +29,4 @@ export function assertModelPolicy(policy: ModelPolicy) {
   if (!isModelID(policy.strong))
     throw new Error(`Strong model must be "provider/model", got: ${policy.strong}`)
   return policy
-}
-
-export function modelForRole(policy: ModelPolicy, role: ModelRole) {
-  assertModelPolicy(policy)
-  return policy[ROLE_TIERS[role]]
 }

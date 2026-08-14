@@ -16,6 +16,7 @@ import {
   type BoomToolProfile,
   type ToolEffectPolicy,
 } from "./tool-registry.ts"
+import type { ModelPolicy } from "../model-policy.ts"
 
 export type {
   BoomToolCatalog,
@@ -46,6 +47,8 @@ export type BoomAgentResource = {
   temperature: number
   toolProfile: string
   output: "freeform" | "prompt-contract"
+  /** Declared model tier; resolved to the current policy's model in the generated runtime config. */
+  model?: keyof ModelPolicy
 }
 
 export type CompiledBoomAgent = {
@@ -90,7 +93,8 @@ function parseAgent(value: unknown, directory: string): BoomAgentResource {
     typeof item.color !== "string" || !HEX_COLOR.test(item.color) ||
     typeof item.temperature !== "number" || !Number.isFinite(item.temperature) || item.temperature < 0 || item.temperature > 2 ||
     typeof item.toolProfile !== "string" || !item.toolProfile ||
-    (item.output !== "freeform" && item.output !== "prompt-contract")
+    (item.output !== "freeform" && item.output !== "prompt-contract") ||
+    (item.model !== undefined && item.model !== "economy" && item.model !== "strong")
   ) throw new Error(`Invalid Boom agent resource: ${directory}/agent.json`)
   return item as BoomAgentResource
 }
@@ -164,6 +168,7 @@ export function compileOpenCodeAgent(
   catalog: BoomToolCatalog,
   prompt: PromptBundle,
   mcpServers: ManagedMcpServer[] = [],
+  models?: ModelPolicy,
 ) {
   // OpenCode turns an explicit `tool: true` entry into a trailing allow permission, which would
   // override a more specific path/effect deny. Enabled tools therefore use the runtime default;
@@ -171,11 +176,13 @@ export function compileOpenCodeAgent(
   const disabledTools = Object.fromEntries(
     Object.keys(catalog.tools).sort().filter((id) => !profile.tools.includes(id)).map((id) => [id, false]),
   )
+  const declaredModel = resource.model ? models?.[resource.model] : undefined
   const frontmatter = {
     mode: resource.mode,
     description: resource.description,
     color: resource.color,
     temperature: resource.temperature,
+    ...(declaredModel ? { model: declaredModel } : {}),
     ...(Object.keys(disabledTools).length > 0 ? { tools: disabledTools } : {}),
     permission: compatibilityPermissions(profile.effects, resource.id, mcpServers),
   }
@@ -194,6 +201,7 @@ export function compileOpenCodeAgent(
 export async function compileBoomAgentRegistry(
   resourceRoot: string,
   mcpServers: ManagedMcpServer[] = [],
+  models?: ModelPolicy,
 ): Promise<CompiledBoomAgentRegistry> {
   const runtimeRoot = path.join(resourceRoot, "runtime")
   const [policy, identity, catalog, entries] = await Promise.all([
@@ -222,13 +230,14 @@ export async function compileBoomAgentRegistry(
       resource,
       profile,
       prompt,
-      openCodeMarkdown: compileOpenCodeAgent(resource, profile, catalog, prompt, mcpServers),
+      openCodeMarkdown: compileOpenCodeAgent(resource, profile, catalog, prompt, mcpServers, models),
     }
   }))
   if (agents.length === 0 || new Set(agents.map((agent) => agent.resource.id)).size !== agents.length)
     throw new Error("Boom agent registry is empty or contains duplicate IDs")
   const promptVersion = sha256(JSON.stringify({
     catalog,
+    models: models ?? null,
     agents: agents.map((agent) => ({ id: agent.resource.id, resource: agent.resource, prompt: agent.prompt.promptVersion })),
   }))
   return { version: 1, promptVersion, catalog, agents }
@@ -239,8 +248,9 @@ export async function installOpenCodeAgentResources(
   resourceRoot: string,
   targetRoot: string,
   mcpServers: ManagedMcpServer[] = [],
+  models?: ModelPolicy,
 ) {
-  const registry = await compileBoomAgentRegistry(resourceRoot, mcpServers)
+  const registry = await compileBoomAgentRegistry(resourceRoot, mcpServers, models)
   const agentDirectory = path.join(targetRoot, "agent")
   await mkdir(agentDirectory, { recursive: true })
   await Promise.all(registry.agents.map((agent) =>

@@ -35,6 +35,10 @@ let activeContextMessages: RuntimeMessage[] = []
 let activeContextCalls = 0
 let resumeCalls: string[] = []
 let subscribeFailures = 0
+/** Liveness probe answer for the no-activity watchdog; undefined = probe absent. */
+let busyProbe: boolean | undefined = undefined
+let busyProbeCalls = 0
+let busyProbeDelayMs = 0
 const temporary: string[] = []
 
 afterEach(async () => Promise.all(
@@ -69,6 +73,15 @@ function fakeConversation(id = "session-1") {
       activeContextCalls += 1
       return activeContextMessages
     },
+    ...(busyProbe === undefined ? {} : {
+      async isBusy() {
+        busyProbeCalls += 1
+        const answer = busyProbe === true
+        if (busyProbeDelayMs > 0)
+          await new Promise((resolve) => setTimeout(resolve, busyProbeDelayMs))
+        return answer
+      },
+    }),
   }
 }
 
@@ -126,6 +139,9 @@ beforeEach(() => {
   activeContextCalls = 0
   resumeCalls = []
   subscribeFailures = 0
+  busyProbe = undefined
+  busyProbeCalls = 0
+  busyProbeDelayMs = 0
 })
 
 describe("runChallenge integration seam", () => {
@@ -711,6 +727,79 @@ describe("runChallenge integration seam", () => {
       }))
 
       expect(outcome.stop).toBe("completed")
+    })
+
+    test("keeps a silent turn alive while the backend reports a step in flight", async () => {
+      const directory = await brakeWorkspace("silence-busy")
+      pendingPrompt = true
+      busyProbe = true
+      // No events after the first usage tick: the shape of a provider that batches reasoning
+      // deltas. The backend still reports an in-flight step, so the watchdog must leave it alone
+      // and the wall-clock timeout becomes the backstop.
+      eventStream = {
+        async *[Symbol.asyncIterator]() {
+          yield spend(10)
+          await new Promise(() => {})
+        },
+      }
+      const seen: RunEvent[] = []
+
+      const outcome = await runChallenge(input({
+        workspace: { directory, runID: "mock-run", extracted: [] },
+        limits: { tokens: 10_000, repeats: 5, timeout: 400, silenceMs: 60 },
+        onEvent: (event: RunEvent) => seen.push(event),
+      }))
+
+      expect(outcome.stop).toBe("timeout")
+      expect(busyProbeCalls).toBeGreaterThan(0)
+      expect(seen).not.toContainEqual(expect.objectContaining({ status: "silent" }))
+    })
+
+    test("kills once the backend stops reporting a step in flight", async () => {
+      const directory = await brakeWorkspace("silence-busy-then-idle")
+      pendingPrompt = true
+      busyProbe = true
+      setTimeout(() => { busyProbe = false }, 150)
+      eventStream = {
+        async *[Symbol.asyncIterator]() {
+          yield spend(10)
+          await new Promise(() => {})
+        },
+      }
+
+      const outcome = await runChallenge(input({
+        workspace: { directory, runID: "mock-run", extracted: [] },
+        limits: { tokens: 10_000, repeats: 5, timeout: 30_000, silenceMs: 60 },
+      }))
+
+      expect(outcome.stop).toBe("silent")
+      expect(outcome.detail).toContain("no runtime activity")
+    })
+
+    test("ignores an idle probe made stale by newer runtime activity", async () => {
+      const directory = await brakeWorkspace("silence-stale-probe")
+      pendingPrompt = true
+      busyProbe = false
+      busyProbeDelayMs = 80
+      eventStream = {
+        async *[Symbol.asyncIterator]() {
+          yield spend(10)
+          // The first probe captures idle. This newer event re-arms the watchdog before it resolves,
+          // and later probes see the still-running backend.
+          await new Promise((resolve) => setTimeout(resolve, 45))
+          busyProbe = true
+          yield { type: "reasoning-delta", sessionID: "session-1", delta: "still thinking" } as RuntimeEvent
+          await new Promise(() => {})
+        },
+      }
+
+      const outcome = await runChallenge(input({
+        workspace: { directory, runID: "mock-run", extracted: [] },
+        limits: { tokens: 10_000, repeats: 5, timeout: 250, silenceMs: 30 },
+      }))
+
+      expect(outcome.stop).toBe("timeout")
+      expect(busyProbeCalls).toBeGreaterThan(1)
     })
 
     test("stays disabled when no silence budget is configured", async () => {

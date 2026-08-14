@@ -6,6 +6,8 @@
  * plane into this vocabulary.
  */
 
+import type { ModelPolicy } from "./model-policy.ts"
+
 export type RuntimeUsage = {
   input: number
   output: number
@@ -194,6 +196,13 @@ export interface RuntimeConversation {
   activeContext?(): Promise<RuntimeMessage[]>
   /** Complete ordered durable transcript; unlike activeContext(), this is not reduced by compaction. */
   messages?(): Promise<RuntimeMessage[]>
+  /**
+   * Bounded liveness probe for the no-activity watchdog. Resolves true while the backend reports
+   * an in-flight step that can legitimately stay silent for minutes — a reasoning model whose
+   * provider does not stream deltas is the canonical case. Absent or false means no step is known
+   * to be running, and the watchdog may classify extended silence as a hang.
+   */
+  isBusy?(signal?: AbortSignal): Promise<boolean>
   /** Fork only at a complete API-round boundary, optionally selected by stable message ID. */
   fork?(input?: RuntimeForkInput): Promise<RuntimeConversation>
   /** Releases adapter resources without deleting the durable session. Idempotent when implemented. */
@@ -324,4 +333,9 @@ export interface RuntimeHandle {
   close(): void | Promise<void>
 }
 
-export type RuntimeLauncher = () => Promise<RuntimeHandle>
+export type RuntimeLauncherOptions = {
+  /** Current economy/strong model policy, resolved into tier-declared agent resources. */
+  models?: ModelPolicy
+}
+
+export type RuntimeLauncher = (options?: RuntimeLauncherOptions) => Promise<RuntimeHandle>

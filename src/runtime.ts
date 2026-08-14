@@ -15,6 +15,7 @@ import {
   mergeRuntimeProviderConfig,
   type RuntimeProviderConfig,
 } from "./provider-config.ts"
+import type { ModelPolicy } from "./model-policy.ts"
 import { installOpenCodeAgentResources } from "./runtime/agent.ts"
 import { startBoomToolBridge } from "./runtime/tool-bridge.ts"
 import { createNativeRuntime, type NativeRuntimeOptions } from "./runtime/native-runtime.ts"
@@ -430,7 +431,11 @@ export function normalizeOpenCodeRuntimeEvent(
     let delta = typeof properties?.delta === "string" ? properties.delta : undefined
     const role = typeof part.messageID === "string" ? context?.messageRoles.get(part.messageID) : undefined
     if (role !== undefined && role !== "assistant") return undefined
-    if (context && typeof part.text === "string" && role === "assistant") {
+    if (context && typeof part.text === "string") {
+      // Accumulate regardless of whether the message role was observed yet: `part.updated` can
+      // precede `message.updated`, and the accumulated delta is the only one we can compute when the
+      // provider sends whole-part updates. Text and reasoning parts only exist on assistant messages,
+      // so an unknown role is treated as assistant; known non-assistant roles are filtered above.
       const key = typeof part.id === "string"
         ? part.id
         : `${part.sessionID}:${String(part.messageID ?? "unknown")}:${part.type}`
@@ -535,6 +540,19 @@ export function createOpenCodeAgentRuntime(baseUrl: string): AgentRuntime {
         return active.length > 0 ? active : readMessages()
       },
       messages: readMessages,
+      async isBusy(signal) {
+        // The status endpoint reports the whole server, keyed by session ID. `busy` means a step is
+        // actively being processed; `retry` is a backoff wait between provider attempts. Both are
+        // alive states that may legitimately emit no events while a reasoning model thinks.
+        try {
+          const result = await client.session.status({ query: { directory }, signal })
+          if (result.error || !result.data || typeof result.data !== "object") return false
+          const status = (result.data as Record<string, { type?: string } | undefined>)[id]?.type
+          return status === "busy" || status === "retry"
+        } catch {
+          return false
+        }
+      },
       async fork(input = {}) {
         input.signal?.throwIfAborted()
         const messages = await readMessages()
@@ -741,6 +759,9 @@ async function installProviders(directory: string, mcpStore: McpStore) {
     ...object(config.compaction),
     auto: true,
   }
+  // The strong worker may delegate mechanical subtasks to the economy worker, so the runtime must
+  // allow one level of nested subagent dispatch below the main solver.
+  config.subagent_depth = 2
   const idaProxyScript = path.join(PACKAGE_ROOT, "src", "runtime", "ida-proxy.ts")
   const idaProxyAvailable = await lstat(idaProxyScript)
     .then((info) => info.isFile() && !info.isSymbolicLink())
@@ -753,7 +774,7 @@ async function installProviders(directory: string, mcpStore: McpStore) {
   return Object.keys(config.provider)
 }
 
-async function installRuntime() {
+async function installRuntime(models?: ModelPolicy) {
   const directory = path.resolve(
     process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"),
     "runtime",
@@ -778,6 +799,7 @@ async function installRuntime() {
     RESOURCE_ROOT,
     directory,
     Object.values(mcpStore.servers),
+    models,
   )
   const providerIDs = await installProviders(directory, mcpStore)
 
@@ -795,12 +817,12 @@ async function installRuntime() {
   }
 }
 
-export async function configureRuntime() {
-  return installRuntime()
+export async function configureRuntime(models?: ModelPolicy) {
+  return installRuntime(models)
 }
 
-export async function startOpenCodeRuntime() {
-  const configured = await configureRuntime()
+export async function startOpenCodeRuntime(options?: { models?: ModelPolicy }) {
+  const configured = await configureRuntime(options?.models)
   const started = await startOpenCodeCompatibility(configured)
   const runtimePackage = await Bun.file(
     path.join(path.dirname(Bun.resolveSync("opencode-ai/package.json", PACKAGE_ROOT)), "package.json"),
@@ -1049,6 +1071,7 @@ export async function inspectRuntime() {
       agents.error ||
       !agents.data?.some((agent) => agent.name === "boom") ||
       !agents.data?.some((agent) => agent.name === "boom-worker") ||
+      !agents.data?.some((agent) => agent.name === "boom-worker-pro") ||
       !agents.data?.some((agent) => agent.name === "boom-consultant")
     )
       throw new Error("Boom's solver, worker, and consultant agents were not registered by Boom's runtime.")
