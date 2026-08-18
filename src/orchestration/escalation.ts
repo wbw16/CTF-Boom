@@ -20,12 +20,21 @@ import {
   type AutonomyEscalationSummary,
 } from "./progress.ts"
 
+/**
+ * Competition build thresholds, rescaled for a 3-hour match.
+ *
+ * The original values (20 minutes to become eligible, 5-minute cooldowns) were calibrated against
+ * hour-scale per-challenge budgets. In a 3-hour match a challenge gets roughly 12-35 minutes in total,
+ * so those gates would never open before the challenge's own budget expired: stagnation would go
+ * undetected and the match clock would drain into a dead end. Every duration here is cut so the brakes
+ * can engage within a single short attempt.
+ */
 export const AUTONOMY_THRESHOLDS = {
-  eligibleActiveMs: 20 * 60_000,
-  eligibleBudgetRatio: 0.30,
-  stalledMs: 5 * 60_000,
+  eligibleActiveMs: 5 * 60_000,
+  eligibleBudgetRatio: 0.20,
+  stalledMs: 2 * 60_000,
   stalledBudgetRatio: 0.10,
-  cooldownMs: 5 * 60_000,
+  cooldownMs: 90_000,
   /**
    * Calibrated by replaying 45 archived runs. This is a share of the whole challenge budget, not the
    * current turn's remaining budget, so late continuations do not acquire a hair-trigger brake.

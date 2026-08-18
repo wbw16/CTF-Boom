@@ -225,7 +225,9 @@ describe("host-level run recovery", () => {
         await Bun.sleep(10)
 
       expect(conversations).toBe(1)
-      expect(prompts[0]).toContain("先完成附件、源码、静态分析")
+      // Competition build: a challenge waiting for one of the three environments still does real
+      // offline work (reversing, exploit development) rather than idling for a human-supplied URL.
+      expect(prompts[0]).toContain("完成一切不依赖靶机的工作")
       expect(prompts[0]).toContain("不要因为缺少地址而等待")
       expect(runner.getRuntimeState().concurrency).toBe(8)
       const [runID] = await readdir(path.join(root, "runs", "service-only"))
@@ -242,7 +244,7 @@ describe("host-level run recovery", () => {
     }
   })
 
-  test("blocks a service continuation until its endpoint is supplied", async () => {
+  test("keeps a service continuation working offline instead of blocking on a missing endpoint", async () => {
     const interpreter = Bun.which("python3")
     if (!interpreter) return
     const root = await mkdtemp(path.join(os.tmpdir(), "boom-remote-continuation-"))
@@ -313,12 +315,15 @@ describe("host-level run recovery", () => {
       await waitForIdle()
       const [runID] = await readdir(path.join(root, "runs", challenge.slug))
       const runDirectory = path.join(root, "runs", challenge.slug, runID!)
+      // Competition build: a missing endpoint is a scheduling wait, not a dead end. The turn runs and
+      // completes offline rather than blocking for a human to paste a URL.
       expect(JSON.parse(await readFile(path.join(runDirectory, "result.json"), "utf8"))).toMatchObject({
-        stop: "blocked",
-        detail: expect.stringContaining("missing remote URL"),
+        stop: "completed",
       })
-      expect(conversations).toBe(1)
+      expect(conversations).toBeGreaterThanOrEqual(1)
+      const afterFirst = conversations
 
+      // A continuation without an endpoint still solves offline instead of refusing to start a model.
       await runner.enqueue({
         challenges: [challenge],
         model: "test/solver",
@@ -328,11 +333,7 @@ describe("host-level run recovery", () => {
         pythonInterpreter: interpreter,
       })
       await waitForIdle()
-      expect(conversations).toBe(1)
-      expect(JSON.parse(await readFile(path.join(runDirectory, "result.json"), "utf8"))).toMatchObject({
-        stop: "blocked",
-        detail: expect.stringContaining("本轮不会启动解题模型"),
-      })
+      expect(conversations).toBeGreaterThan(afterFirst)
 
       await runner.enqueue({
         challenges: [{ ...challenge, remote: "https://target.example/task-1" }],
@@ -344,6 +345,7 @@ describe("host-level run recovery", () => {
       })
       await waitForIdle()
       expect(conversations).toBeGreaterThanOrEqual(2)
+      // With an endpoint available the same task continues normally against the target.
       expect(JSON.parse(await readFile(path.join(runDirectory, "result.json"), "utf8"))).toMatchObject({
         stop: "completed",
       })

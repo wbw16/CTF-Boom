@@ -136,6 +136,34 @@ GUI 对应接口：
 - `POST /api/platforms/profile`（`{profile:"xihulunjian", id, baseURL}`）创建适配器
 - `PUT /api/platforms/<id>/credential`（`{value}`）写入 AccessKey，只写不读
 
+## 调度实现说明
+
+调度决策集中在 `src/competition/policy.ts`（纯函数，可独立测试），
+副作用留在 `src/runner.ts`：
+
+- `pump()` 不再是先进先出：改为按 `priorityOf` 排序 + 槽位准入。
+  某个作业当前不可启动（槽位满、已进入收尾）时会被跳过而不是堵住队列，
+  这样线上环境占满时本地题不会被饿死。
+- `EnvironmentPool`（`src/competition/environments.ts`）管理三个环境租约。
+  释放是幂等的，且**即使 `recover-exercise-env` 失败也会释放本地槽位**——
+  失去远端状态后继续占着槽位会让本场比赛剩余的环境题全部卡死，
+  而平台侧会在过期后自行回收。
+- 租约释放挂在 `pump()` 现有的 `.finally()` 里，覆盖包括抛异常在内的所有终止路径。
+- 同一题目已有后续轮次排队时保留环境，避免"本地分析 -> 联调"过渡时
+  白白回收再重开。
+- 提交台账 `competition/submissions/<slug>.json` 持久化，
+  **刻意不放在 `runs/<slug>/` 下**：那里的条目会被当作 run ID 枚举。
+
+### 已重标定的阈值
+
+`AUTONOMY_THRESHOLDS`（`src/orchestration/escalation.ts`）原按小时级预算标定
+（20 分钟才够 eligible、5 分钟冷却）。3 小时赛里每题只有 12-35 分钟，
+这些闸门在题目自身预算耗尽前根本不会打开，停滞将无法被发现。
+现已整体缩小（eligible 5 分钟、停滞 2 分钟、冷却 90 秒）。
+
+本地优先轮次预算也从 25k tokens / 5 分钟提高到 120k / 12 分钟：
+在比赛版里这一轮是真正的逆向与 exp 开发，而不再是等人填 URL 前的粗筛。
+
 ## 已验证行为（对照真实平台）
 
 - 题目列表两层结构展开、`isOpen=false` 的未放题被跳过
