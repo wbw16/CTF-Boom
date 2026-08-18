@@ -82,6 +82,17 @@ describe("M3 native file tools", () => {
     const grep = await execute("grep", { pattern: "alpha", include: "**/*.txt" })
     expect(grep.output).toContain("challenge/evidence.txt:1:alpha")
     expect(grep.output).toContain("work/analysis.txt:1:hypothesis alpha")
+
+    // Host-owned task state is hidden from the agent-facing file tools.
+    expect(list.output).not.toContain(".boom/")
+    expect(list.output).not.toContain("RESULT.json")
+    expect(glob.output).not.toContain(".boom")
+    await expect(host.execute({
+      name: "read",
+      arguments: { filePath: "work/.boom/state.json" },
+      directory,
+      profileID: "solver",
+    })).rejects.toThrow("host-owned task state")
   })
 
   test("edits only existing agent-owned files under work", async () => {
@@ -179,7 +190,7 @@ describe("M3 native state tools", () => {
       name: "todowrite",
       arguments: { todos },
       directory,
-      profileID: "solver",
+      profileID: "worker",
       sessionID: "session-todo-1",
     })
     expect(result.title).toBe("1 todos")
@@ -188,8 +199,15 @@ describe("M3 native state tools", () => {
       name: "todowrite",
       arguments: { todos },
       directory,
-      profileID: "solver",
+      profileID: "worker",
     })).rejects.toThrow("runtime session ID")
+    await expect(host.execute({
+      name: "todowrite",
+      arguments: { todos },
+      directory,
+      profileID: "solver",
+      sessionID: "session-todo-solver",
+    })).rejects.toThrow("Boom policy denied todowrite")
     await expect(host.execute({
       name: "todowrite",
       arguments: { todos },
@@ -201,7 +219,7 @@ describe("M3 native state tools", () => {
       name: "todowrite",
       arguments: { todos: Array.from({ length: 101 }, () => todos[0]) },
       directory,
-      profileID: "solver",
+      profileID: "worker",
       sessionID: "session-todo-large",
     })).rejects.toThrow("maximum item count is 100")
   })

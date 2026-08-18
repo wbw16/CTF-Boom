@@ -3,7 +3,10 @@ export type ExecutionMode = "managed" | "isolated" | "static-only"
 export type GuiSettings = {
   economyModel: string
   strongModel: string
+  visionModel?: string
   tokens: number
+  /** When false, a run is governed by time/repeat safeguards but has no token ceiling. */
+  tokenBudgetEnabled: boolean
   repeats: number
   minutes: number
   concurrency: number
@@ -12,12 +15,78 @@ export type GuiSettings = {
   consultModels: string[]
   blindReview: boolean
   consultOnCompaction: boolean
+  /** Host-wide network switch; "deny" refuses web tools and isolates bash/boom-exec sandboxes. */
+  network: "allow" | "deny"
+  competition: CompetitionSettings
+}
+
+export type CompetitionSettings = {
+  /** Platform rule: how many challenge environments may exist at once. */
+  remoteSlots: number
+  /** How often unattended mode checks for new released challenges. */
+  refreshIntervalMinutes?: number
+  /** Local solve concurrency, bounded by this machine's CPU/memory. */
+  localSlots: number
+  matchMinutes: number
+  endgameMinutes: number
+  /** Epoch ms when the match ends; absent until the clock is started. */
+  deadline?: number
+  autopilotEnabled?: boolean
+}
+
+export type CompetitionState = {
+  settings: CompetitionSettings
+  clock: {
+    started: boolean
+    remainingMs: number
+    elapsedMs: number
+    endgame: boolean
+    over: boolean
+  }
+  environments: {
+    used: number
+    limit: number
+    leases: Array<{
+      slug: string
+      exerciseId: string
+      remote?: string
+      expireTime?: number
+    }>
+  }
+  usage: { local: number; remote: number }
+  autopilot?: {
+    enabled: boolean
+    syncing: boolean
+    retries: number
+    nextSyncAt?: number
+    lastSyncAt?: number
+    lastSuccessAt?: number
+    lastError?: string
+    lastResult?: { downloaded: number; queued: number; skipped: number }
+  }
+  unavailable?: boolean
+}
+
+export type XihulunjianNotice = {
+  id: number
+  title: string
+  content?: string
+  createdAt?: string
+  createdTime?: number
+  userName?: string
+}
+
+export type XihulunjianNoticeDetail = XihulunjianNotice & {
+  isFile: boolean
+  files: Array<{ name: string; url: string; ext?: string }>
+  url?: string
 }
 
 export type ModelInfo = {
   id: string
   name: string
   connected: boolean
+  attachment?: boolean
 }
 
 export type RuntimeState = {
@@ -216,6 +285,8 @@ export type ProviderSummary = {
 
 export type ProviderModel = {
   id: string
+  /** Runtime catalog ID this row originated from; retained when the visible Model ID is replaced. */
+  catalogID?: string
   name: string
   context: number
   output: number
@@ -284,59 +355,6 @@ export type McpServer = McpLocalServer | McpRemoteServer
 
 export type McpServerDetails = McpServer & {
   runtime: McpRuntimeStatus
-}
-
-export type PlatformSummary = {
-  id: string
-  name: string
-  status: "draft" | "ready" | "invalid"
-  profile?: string
-  listChallenges: boolean
-  acquireChallenges: boolean
-  submitFlag: boolean
-  credential?: { env: string; configured: boolean }
-  error?: string
-}
-
-export type PlatformManifest = {
-  version: 1
-  id: string
-  name?: string
-  profile?: string
-  status: "draft" | "ready"
-  baseURL: string
-  auth?: { env: string; location: string; name: string; prefix?: string }
-  variables?: Record<string, unknown>
-  operations: {
-    listChallenges: unknown
-    getChallenge?: unknown
-    submitFlag?: unknown
-  }
-}
-
-export type PlatformCredential = {
-  env: string
-  configured: boolean
-}
-
-export type PlatformCatalogItem = {
-  id: string
-  title: string
-  challengeID?: string
-  category?: string
-  difficulty?: string
-  points?: number
-  solved?: boolean
-  group?: { name: string }
-}
-
-export type PlatformCatalog = {
-  items: PlatformCatalogItem[]
-  page: number
-  pageSize: number
-  total: number
-  categories: string[]
-  difficulties: string[]
 }
 
 export type RunnerNotification = {

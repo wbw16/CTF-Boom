@@ -3,7 +3,8 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import os from "node:os"
 import path from "node:path"
 import { submitCandidate } from "../src/candidate-submission.ts"
-import { PlatformAdapterRegistry } from "../src/platform-adapter.ts"
+import { readChallengeRuns } from "../src/history.ts"
+import { MockSubmissionGateway } from "./fixtures/mock-submission.ts"
 import { GuiRunner } from "../src/runner.ts"
 import type { RuntimeHandle } from "../src/runtime-contract.ts"
 
@@ -75,7 +76,7 @@ async function fixture(input: {
   }
   const verdicts = [...(input.verdicts ?? [])]
   const adapters = verdicts.length
-    ? new PlatformAdapterRegistry([{
+    ? new MockSubmissionGateway([{
         id: "test",
         async submitFlag() {
           const verdict = verdicts.shift() ?? "pending"
@@ -87,7 +88,7 @@ async function fixture(input: {
           }
         },
       }])
-    : new PlatformAdapterRegistry()
+    : new MockSubmissionGateway()
   const runner = new GuiRunner(root, async () => handle, adapters, {
     platformSubmissionRetryDelayMs: 20,
   })
@@ -110,7 +111,7 @@ async function fixture(input: {
   for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1) await Bun.sleep(10)
   const [runID] = await readdir(path.join(root, "runs", "sample"))
   const run = path.join(root, "runs", "sample", runID!)
-  return { runner, run, prompts }
+  return { runner, root, run, prompts }
 }
 
 describe("candidate lifecycle", () => {
@@ -151,6 +152,33 @@ describe("candidate lifecycle", () => {
     }
   })
 
+  test("removes a platform-rejected flag from the active candidate state", async () => {
+    const one = await fixture({
+      candidates: ["flag{wrong}"],
+      verdicts: ["rejected"],
+    })
+    try {
+      // The follow-up solve turn is expected, but it has no candidate of its own. Recovery may
+      // make further empty attempts, which must not resurrect the rejected flag.
+      expect(one.prompts.length).toBeGreaterThanOrEqual(2)
+      expect(JSON.parse(await readFile(path.join(one.run, "task.json"), "utf8"))).toMatchObject({
+        status: "paused",
+        rejectedFlags: ["flag{wrong}"],
+      })
+
+      const [history] = await readChallengeRuns(one.root, "sample")
+      expect(history).toMatchObject({
+        candidates: [],
+        primaryCandidate: undefined,
+        rejectedFlags: ["flag{wrong}"],
+      })
+      // It stays in the immutable history so the solver and user can see it was ruled out.
+      expect(history?.candidateHistory).toContain("flag{wrong}")
+    } finally {
+      await one.runner.close()
+    }
+  })
+
   test("retries a pending platform submission once, then ends the main flow on acceptance", async () => {
     const interpreter = Bun.which("python3")
     if (!interpreter) throw new Error("python3 is required for this test")
@@ -186,8 +214,20 @@ describe("candidate lifecycle", () => {
             async events() {
               return { async *[Symbol.asyncIterator]() {} }
             },
-            async prompt() {
-              prompts.push("solve")
+            async prompt(request) {
+              prompts.push(request.text)
+              if (request.text.includes("Confirmed flag")) {
+                await writeFile(
+                  path.join(conversation.directory, "work", "WRITEUP.md"),
+                  "# Writeup\n\n已确认 flag，并根据已有证据整理核心思路与复现步骤。\n\nFlag: flag{retry}\n",
+                )
+                return {
+                  usage: { input: 10, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+                  cost: 0,
+                  finish: "stop" as const,
+                  parts: [{ type: "text" as const, text: "writeup completed" }],
+                }
+              }
               await submitCandidate({
                 directory: conversation.directory,
                 sessionID: id,
@@ -206,7 +246,7 @@ describe("candidate lifecycle", () => {
       },
       close() {},
     }
-    const adapters = new PlatformAdapterRegistry([{
+    const adapters = new MockSubmissionGateway([{
       id: "test",
       async submitFlag() {
         submissionAttempts += 1
@@ -243,15 +283,14 @@ describe("candidate lifecycle", () => {
       const [runID] = await readdir(path.join(root, "runs", "sample"))
       const run = path.join(root, "runs", "sample", runID!)
       expect(submissionAttempts).toBe(2)
-      expect(prompts).toHaveLength(1)
+      expect(prompts).toHaveLength(2)
       expect(JSON.parse(await readFile(path.join(run, "task.json"), "utf8"))).toMatchObject({
-        status: "solved",
+        status: "archived",
         acceptedFlag: { value: "flag{retry}", source: "test" },
       })
       expect(JSON.parse(await readFile(path.join(run, "result.json"), "utf8"))).toMatchObject({
         platform_submission: { adapter: "test", verdict: "accepted" },
       })
-      // The main flow ends at acceptance; no writeup turn is queued automatically.
       expect(runner.hasWork()).toBe(false)
     } finally {
       await runner.close()

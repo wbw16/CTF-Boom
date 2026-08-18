@@ -108,6 +108,7 @@ export function ProvidersDialog() {
     }
     const models = draft.models.map((model) => ({
       id: model.id.trim(),
+      ...(model.catalogID ? { catalogID: model.catalogID } : {}),
       name: model.name.trim(),
       context: Number(model.context) || 300000,
       output: Number(model.output) || 16384,
@@ -134,32 +135,61 @@ export function ProvidersDialog() {
     }
   }
 
-  const save = async (reloadRuntime = false) => {
+  const save = async (apply = false) => {
+    if (!draft) return
     const provider = readProvider()
     if (!provider) return
     if (!provider.id) {
       toast("Provider ID 不能为空", "error")
       return
     }
+    const savedDraft = structuredClone(draft)
     setSaving(true)
     try {
-      const result = await putJSON<{ provider: ProviderDetails }>(
+      const result = await putJSON<{ provider?: ProviderDetails; applied: boolean }>(
         `/api/providers/${encodeURIComponent(provider.id)}`,
-        { provider, apiKey: apiKey.trim() || undefined },
+        { provider, apiKey: apiKey.trim() || undefined, apply },
       )
       setApiKey("")
-      setSelected(result.provider.id)
+      const nextDraft = result.provider ?? {
+        ...savedDraft,
+        id: provider.id,
+        name: provider.name ?? savedDraft.name,
+        custom: provider.custom,
+        disabled: false,
+        configured: true,
+      }
+      const summary: ProviderSummary = {
+        id: nextDraft.id,
+        name: nextDraft.name || nextDraft.id,
+        connected: nextDraft.connected,
+        configured: nextDraft.configured,
+        custom: nextDraft.custom,
+        disabled: nextDraft.disabled,
+        modelCount: nextDraft.models.length,
+        visibleModelCount: nextDraft.models.filter((model) => model.enabled).length,
+        authMethods: nextDraft.authMethods,
+      }
+      setSelected(nextDraft.id)
       setIsNew(false)
-      setDraft(structuredClone(result.provider))
+      setDraft(structuredClone(nextDraft))
+      setProviders((current) => {
+        const index = current.findIndex((item) => item.id === summary.id)
+        if (index < 0) return [...current, summary].sort((a, b) => a.name.localeCompare(b.name))
+        return current.map((item) => item.id === summary.id ? summary : item)
+      })
       const live = (data?.runtime.active ?? 0) > 0
       toast(
-        reloadRuntime
+        result.applied
           ? `Boom Runtime 已应用 Provider 配置并刷新模型目录${live ? "；使用该 Provider 的运行将在下一边界接管" : ""}`
-          : `Provider 已保存，运行时已重载${live ? "；使用该 Provider 的运行将在下一边界接管" : ""}`,
+          : "Provider 已保存；点击“应用到 Boom Runtime”后才会重载并生效。",
       )
-      await Promise.all([load(), refresh()])
+      // A local save deliberately leaves the current runtime and model picker untouched. Applying
+      // has already returned the fresh Provider detail, so only refresh the main picker in the
+      // background instead of reloading the full Provider list and detail a second time.
+      if (result.applied) void refresh()
     } catch (error) {
-      toast(reloadRuntime ? `Boom Runtime 应用 Provider 失败：${(error as Error).message}` : (error as Error).message, "error")
+      toast(apply ? `Boom Runtime 应用 Provider 失败：${(error as Error).message}` : (error as Error).message, "error")
     } finally {
       setSaving(false)
     }
@@ -284,10 +314,10 @@ export function ProvidersDialog() {
             放弃修改
           </button>
           <button type="button" className="btn" disabled={!draft || saving} onClick={() => void save(true)}>
-            应用并刷新 Boom Runtime
+            {saving ? "处理中…" : "应用到 Boom Runtime"}
           </button>
           <button type="button" className="btn btn-primary" disabled={!draft || saving} onClick={() => void save(false)}>
-            {saving ? "保存中…" : "保存并重载 Boom Runtime"}
+            {saving ? "处理中…" : "仅保存"}
           </button>
         </>
       }
@@ -341,9 +371,6 @@ export function ProvidersDialog() {
             <div className="field">
               <div className="field-label"><span>Base URL</span></div>
               <input className="input mono" value={draft.baseURL ?? ""} onChange={(event) => setDraft({ ...draft, baseURL: event.target.value })} />
-              <span className="field-hint">
-                默认在 URL 后拼接 /chat/completions；若网关本身已是完整端点（如赛方大模型网关，直接 POST 根地址），在末尾加 `!` 表示原样使用。
-              </span>
             </div>
             <div className="field" style={{ gridColumn: "1 / -1" }}>
               <div className="field-label"><span>API Key（留空不修改）</span></div>
@@ -377,7 +404,7 @@ export function ProvidersDialog() {
                   {draft.models.filter((model) => model.enabled).length}/{draft.models.length} 显示
                 </span>
               </span>
-              <p>模型目录由 Boom Runtime 返回；内置目录复用兼容运行时，保存后会重载并刷新选择器。</p>
+              <p>目录模型和自定义模型都可编辑；修改目录模型的 Model ID 会保留原目录映射，并在应用后刷新选择器。</p>
             </div>
             <button type="button" className="btn btn-tiny" onClick={() => setDraft({ ...draft, models: [...draft.models, { id: "", name: "", context: 300000, output: 16384, reasoning: false, attachment: false, armorPrompt: undefined, pricing: undefined, enabled: true, source: "custom" }] })}>
               <Plus size={12} /> 模型
@@ -393,7 +420,7 @@ export function ProvidersDialog() {
                   </label>
                   <label className="model-field">
                     <span>Model ID</span>
-                    <input className="mono" value={model.id} title={model.id} disabled={model.source !== "custom"} placeholder="model-id" onChange={(event) => setModel(index, { id: event.target.value })} />
+                    <input className="mono" value={model.id} title={model.id} placeholder="model-id" onChange={(event) => setModel(index, { id: event.target.value })} />
                   </label>
                   <label className="model-field">
                     <span>名称</span>
@@ -409,7 +436,7 @@ export function ProvidersDialog() {
                     >
                       <Trash2 size={15} />
                     </button>
-                  ) : <span className="model-source-tag">目录模型</span>}
+                  ) : <span className="model-source-tag">目录模型 · 可编辑</span>}
                 </div>
                 <div className="model-card-settings">
                   <label className="model-field">

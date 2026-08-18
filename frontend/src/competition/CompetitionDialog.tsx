@@ -1,53 +1,51 @@
 import { useCallback, useEffect, useState } from "react"
-import { Timer } from "lucide-react"
+import {
+  CircleAlert,
+  CloudDownload,
+  Cpu,
+  KeyRound,
+  Power,
+  RefreshCw,
+  Server,
+  ShieldCheck,
+  Timer,
+} from "lucide-react"
 import { useApp } from "../context"
 import { api, patchJSON, postJSON, putJSON } from "../api"
 import { Modal } from "../ui"
-import type { CompetitionState, GuiSettings, GuiState, PlatformSummary } from "../types"
+import type { CompetitionState, GuiSettings } from "../types"
 
-const DEFAULT_HOST = "https://pro.dasctf.com"
-const GATEWAY_PROVIDER_ID = "competition-gateway"
+type XihulunjianStatus = {
+  credential: { configured: boolean; serverHost: string }
+}
 
 /**
- * Competition control panel.
- *
- * Owns the three things an operator must set before a match: the platform endpoint, the AccessKey,
- * and the match clock. The AccessKey is write-only here — the server stores it outside the challenge
- * root and only ever reports whether it is configured, so this dialog can show status but never the
- * value.
+ * The only competition screen in this build. Its API intentionally has no adapter IDs, manifests,
+ * or OpenAPI parameters: all actions target the dedicated 西湖论剑 Agent API.
  */
 export function CompetitionDialog() {
-  const { data, toast, refresh, closeDialog } = useApp()
-  const [platforms, setPlatforms] = useState<PlatformSummary[]>([])
-  const [state, setState] = useState<CompetitionState | null>(null)
-  const [adapterID, setAdapterID] = useState("xihu")
-  const [host, setHost] = useState(DEFAULT_HOST)
+  const { data, toast, refresh, closeDialog, openDialog } = useApp()
+  const [competition, setCompetition] = useState<CompetitionState | null>(null)
+  const [connection, setConnection] = useState<XihulunjianStatus | null>(null)
   const [accessKey, setAccessKey] = useState("")
-  const [minutes, setMinutes] = useState(180)
+  const [serverHost, setServerHost] = useState("")
+  const [refreshIntervalMinutes, setRefreshIntervalMinutes] = useState(10)
   const [remoteSlots, setRemoteSlots] = useState(3)
-  const [localSlots, setLocalSlots] = useState(5)
   const [busy, setBusy] = useState(false)
-  const [gwURL, setGwURL] = useState("")
-  const [gwKey, setGwKey] = useState("")
-  const [gwModel, setGwModel] = useState("deepseek-chat")
-  const gwConfigured = data?.settings.economyModel?.startsWith(`${GATEWAY_PROVIDER_ID}/`) &&
-    data?.settings.strongModel?.startsWith(`${GATEWAY_PROVIDER_ID}/`)
 
   const load = useCallback(async () => {
     try {
-      const [listed, competition] = await Promise.all([
-        api<{ platforms: PlatformSummary[] }>("/api/platforms"),
+      const [nextConnection, nextCompetition] = await Promise.all([
+        api<XihulunjianStatus>("/api/xihulunjian"),
         api<CompetitionState>("/api/competition"),
       ])
-      setPlatforms(listed.platforms)
-      if (!competition.unavailable) {
-        setState(competition)
-        setRemoteSlots(competition.settings.remoteSlots)
-        setLocalSlots(competition.settings.localSlots)
-        setMinutes(competition.settings.matchMinutes)
+      setConnection(nextConnection)
+      setServerHost(nextConnection.credential.serverHost)
+      if (!nextCompetition.unavailable) {
+        setCompetition(nextCompetition)
+        setRefreshIntervalMinutes(nextCompetition.settings.refreshIntervalMinutes ?? 10)
+        setRemoteSlots(nextCompetition.settings.remoteSlots)
       }
-      const existing = listed.platforms.find((item) => item.profile === "xihulunjian-agent-v1")
-      if (existing) setAdapterID(existing.id)
     } catch (error) {
       toast((error as Error).message, "error")
     }
@@ -57,55 +55,21 @@ export function CompetitionDialog() {
     void load()
   }, [load])
 
-  // Keep the countdown live while the dialog is open.
   useEffect(() => {
-    if (!state?.clock.started) return
-    const timer = setInterval(() => {
+    const timer = window.setInterval(() => {
       void api<CompetitionState>("/api/competition")
-        .then((next) => { if (!next.unavailable) setState(next) })
+        .then((next) => { if (!next.unavailable) setCompetition(next) })
         .catch(() => {})
     }, 5_000)
-    return () => clearInterval(timer)
-  }, [state?.clock.started])
+    return () => window.clearInterval(timer)
+  }, [])
 
-  const adapter = platforms.find((item) => item.id === adapterID)
-
-  const createAdapter = async () => {
-    if (!host.trim()) {
-      toast("请填写 Server Host", "error")
-      return
-    }
+  const saveAccessKey = async () => {
     setBusy(true)
     try {
-      await postJSON("/api/platforms/profile", {
-        profile: "xihulunjian",
-        id: adapterID.trim() || "xihu",
-        baseURL: host.trim(),
-        force: true,
-      })
-      toast("比赛平台适配器已就绪")
-      await load()
-      await refresh()
-    } catch (error) {
-      toast((error as Error).message, "error")
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const saveKey = async () => {
-    if (!adapter) {
-      toast("请先创建适配器", "error")
-      return
-    }
-    setBusy(true)
-    try {
-      await putJSON(`/api/platforms/${encodeURIComponent(adapter.id)}/credential`, {
-        value: accessKey,
-      })
-      // Never keep the secret in component state once it is stored.
+      await putJSON("/api/xihulunjian/credential", { value: accessKey })
       setAccessKey("")
-      toast(accessKey.trim() ? "AccessKey 已保存" : "AccessKey 已清除")
+      toast(accessKey.trim() ? "AccessKey 已安全保存" : "AccessKey 已清除")
       await load()
     } catch (error) {
       toast((error as Error).message, "error")
@@ -114,36 +78,13 @@ export function CompetitionDialog() {
     }
   }
 
-  const saveSlots = async () => {
-    if (!data) return
+  const saveServerHost = async () => {
     setBusy(true)
     try {
-      const updated = await patchJSON<{ settings: GuiState["settings"] }>("/api/settings", {
-        ...data.settings,
-        competition: {
-          ...data.settings.competition,
-          remoteSlots,
-          localSlots,
-          matchMinutes: minutes,
-        },
-      })
-      toast(`并发已保存：线上 ${updated.settings.competition.remoteSlots} / 本地 ${updated.settings.competition.localSlots}`)
+      const saved = await putJSON<{ serverHost: string }>("/api/xihulunjian/server-host", { value: serverHost })
+      setServerHost(saved.serverHost)
+      toast("西湖论剑 Server Host 已保存")
       await load()
-      await refresh()
-    } catch (error) {
-      toast((error as Error).message, "error")
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const clock = async (action: "start" | "clear") => {
-    setBusy(true)
-    try {
-      await postJSON("/api/competition/clock", { action, minutes })
-      toast(action === "start" ? `比赛计时已开始：${minutes} 分钟` : "比赛计时已清除")
-      await load()
-      await refresh()
     } catch (error) {
       toast((error as Error).message, "error")
     } finally {
@@ -152,14 +93,10 @@ export function CompetitionDialog() {
   }
 
   const sync = async () => {
-    if (!adapter) return
     setBusy(true)
     try {
-      const result = await postJSON<{ challenges: string[] }>(
-        `/api/platforms/${encodeURIComponent(adapter.id)}/sync`,
-        { selection: { all: true } },
-      )
-      toast(`已同步 ${result.challenges.length} 道题目`)
+      const result = await postJSON<{ challenges: string[] }>("/api/xihulunjian/sync", {})
+      toast(`已同步 ${result.challenges.length} 道已开放赛题`)
       await refresh()
     } catch (error) {
       toast((error as Error).message, "error")
@@ -168,52 +105,20 @@ export function CompetitionDialog() {
     }
   }
 
-  const configureGateway = async () => {
-    if (!gwURL.trim()) {
-      toast("请填写大模型网关地址", "error")
-      return
-    }
-    if (!gwKey.trim()) {
-      toast("请填写 API Key", "error")
-      return
-    }
-    if (!gwModel.trim()) {
-      toast("请填写 Model ID", "error")
-      return
-    }
+  const saveCapacity = async () => {
+    if (!data) return
     setBusy(true)
     try {
-      // Create or replace the competition gateway provider.
-      await putJSON(`/api/providers/${encodeURIComponent(GATEWAY_PROVIDER_ID)}`, {
-        provider: {
-          id: GATEWAY_PROVIDER_ID,
-          custom: true,
-          disabled: false,
-          name: "比赛大模型网关",
-          driver: "openai-compatible",
-          // The gateway only answers at its root, so the marker prevents /chat/completions being appended.
-          // Appended here so the operator does not need to know about it.
-          baseURL: `${gwURL.trim().replace(/\/+$/, "")}!`,
-          models: [{
-            id: gwModel.trim(),
-            name: gwModel.trim(),
-          }],
-          hiddenModels: [],
+      const updated = await patchJSON<{ settings: GuiSettings }>("/api/settings", {
+        ...data.settings,
+        competition: {
+          ...data.settings.competition,
+          remoteSlots,
+          refreshIntervalMinutes,
         },
-        apiKey: gwKey.trim(),
       })
-      // Make both model tiers use the gateway, and also set the vision model to empty so it doesn't
-      // accidentally fall back to a non-gateway provider.
-      const modelID = `${GATEWAY_PROVIDER_ID}/${gwModel.trim()}`
-      const settings = data!.settings
-      await patchJSON<{ settings: GuiSettings }>("/api/settings", {
-        ...settings,
-        economyModel: modelID,
-        strongModel: modelID,
-        visionModel: "",
-      })
-      setGwKey("")
-      toast("大模型网关已配置，economy/strong 均指向比赛网关")
+      toast(`自动化设置已保存：每 ${updated.settings.competition.refreshIntervalMinutes ?? 10} 分钟刷新一次`)
+      await load()
       await refresh()
     } catch (error) {
       toast((error as Error).message, "error")
@@ -221,189 +126,145 @@ export function CompetitionDialog() {
       setBusy(false)
     }
   }
+
+  const closeAllEnvironments = async () => {
+    if (!window.confirm("这会停止所有依赖靶机的任务、关闭当前全部靶机，并停止自动巡航。离线分析和 Writeup 不会受影响。是否继续？"))
+      return
+    setBusy(true)
+    try {
+      const result = await postJSON<{ closed: { released: number; stopped: number; errors: string[] } }>(
+        "/api/competition/environments/close",
+        {},
+      )
+      const { released, stopped, errors } = result.closed
+      toast(
+        errors.length === 0
+          ? `已关闭 ${released} 个靶机，停止 ${stopped} 个远程任务`
+          : `已请求关闭 ${released} 个靶机；${errors.length} 个回收请求失败`,
+        errors.length === 0 ? "success" : "error",
+      )
+      await load()
+      await refresh()
+    } catch (error) {
+      toast((error as Error).message, "error")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const activeEnvironments = competition?.environments.used ?? 0
+  const remotelyConfigured = connection?.credential.configured ?? false
+  const autopilot = competition?.autopilot
 
   return (
     <Modal
-      title="比赛控制台"
-      subtitle="西湖论剑：平台接入、赛时计时与资源并发"
-      icon={<Timer size={15} />}
+      title="西湖论剑控制台"
+      subtitle="专用接入 · 自动拉题 · 赛方大模型网关"
+      icon={<Timer size={17} />}
       onClose={closeDialog}
       wide
+      className="competition-modal"
     >
-      <section className="field-group">
-        <h3>平台接入</h3>
-        <label className="field">
-          <span>Server Host</span>
-          <input
-            value={host}
-            onChange={(event) => setHost(event.target.value)}
-            placeholder={DEFAULT_HOST}
-            spellCheck={false}
-          />
-        </label>
-        <label className="field">
-          <span>适配器 ID</span>
-          <input
-            value={adapterID}
-            onChange={(event) => setAdapterID(event.target.value)}
-            spellCheck={false}
-          />
-        </label>
-        <div className="row">
-          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void createAdapter()}>
-            保存并创建适配器
-          </button>
-          {adapter ? <span className="hint">当前状态：{adapter.status}</span> : <span className="hint">尚未创建</span>}
-        </div>
-
-        <label className="field">
-          <span>AccessKey</span>
-          <input
-            type="password"
-            value={accessKey}
-            onChange={(event) => setAccessKey(event.target.value)}
-            placeholder={adapter?.credential?.configured ? "已配置（留空提交则清除）" : "ak_live_..."}
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </label>
-        <div className="row">
-          <button type="button" className="btn" disabled={busy || !adapter} onClick={() => void saveKey()}>
-            保存 AccessKey
-          </button>
-          <span className="hint">
-            {adapter?.credential?.configured ? "凭证已配置" : "凭证未配置"}
-            ：仅保存在本机（0600），不写入题库目录，也不会回显。
-          </span>
-        </div>
-        <div className="row">
-          <button type="button" className="btn" disabled={busy || !adapter?.credential?.configured} onClick={() => void sync()}>
-            拉取题目列表
-          </button>
-          <span className="hint">比赛分批放题，开赛后需要多次拉取。</span>
-        </div>
-      </section>
-
-      <section className="field-group">
-        <h3>赛时计时</h3>
-        <label className="field">
-          <span>比赛总时长（分钟）</span>
-          <input
-            type="number"
-            min={1}
-            value={minutes}
-            onChange={(event) => setMinutes(Number(event.target.value) || 0)}
-          />
-        </label>
-        <div className="row">
-          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void clock("start")}>
-            开始计时
-          </button>
-          <button type="button" className="btn" disabled={busy || !state?.clock.started} onClick={() => void clock("clear")}>
-            清除计时
-          </button>
-          <span className="hint">
-            {state?.clock.started
-              ? `剩余 ${formatRemaining(state.clock.remainingMs)}${state.clock.endgame ? "（收尾阶段：不再开新题）" : ""}`
-              : "未开始：不会触发收尾与超时放弃"}
-          </span>
-        </div>
-      </section>
-
-      <section className="field-group">
-        <h3>资源并发</h3>
-        <label className="field">
-          <span>线上环境上限</span>
-          <input
-            type="number"
-            min={1}
-            value={remoteSlots}
-            onChange={(event) => setRemoteSlots(Number(event.target.value) || 1)}
-          />
-        </label>
-        <label className="field">
-          <span>本地并发上限</span>
-          <input
-            type="number"
-            min={1}
-            value={localSlots}
-            onChange={(event) => setLocalSlots(Number(event.target.value) || 1)}
-          />
-        </label>
-        <div className="row">
-          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void saveSlots()}>
-            保存并发设置
-          </button>
-          <span className="hint">
-            线上环境上限由赛方规则决定（本场为 3），超过会被平台拒绝。
-          </span>
-        </div>
-        {state ? (
-          <div className="hint">
-            当前占用：线上 {state.usage.remote}/{state.settings.remoteSlots} · 本地 {state.usage.local}/{state.settings.localSlots}
-            {state.environments.leases.length
-              ? `｜持有环境：${state.environments.leases.map((lease) => `${lease.slug}${lease.remote ? ` (${lease.remote})` : ""}`).join("、")}`
-              : ""}
+      <div className="competition-overview" aria-label="比赛状态">
+        <div className="competition-overview-main">
+          <span className={`competition-live-dot${autopilot?.enabled ? " active" : ""}`} />
+          <div>
+            <b>{autopilot?.enabled ? "无人值守运行中" : "自动巡航待命"}</b>
+            <small>{autopilot?.syncing ? "正在同步赛题…" : `主界面开始比赛后，每 ${refreshIntervalMinutes} 分钟检查新题`}</small>
           </div>
-        ) : null}
-      </section>
+        </div>
+        <dl className="competition-metrics">
+          <div><dt>线上容器</dt><dd>{activeEnvironments}<span>/{competition?.settings.remoteSlots ?? remoteSlots}</span></dd></div>
+          <div><dt>刷新间隔</dt><dd>{refreshIntervalMinutes}<span> 分钟</span></dd></div>
+          <div><dt>平台凭证</dt><dd className={remotelyConfigured ? "ok" : "warn"}>{remotelyConfigured ? "已就绪" : "待配置"}</dd></div>
+        </dl>
+      </div>
 
-      <section className="field-group">
-        <h3>大模型网关</h3>
-        <div className="hint" style={{ marginBottom: 8 }}>
-          规则要求所有 LLM 流量必须经赛方提供的网关，否则成绩无效。
-          配置后 economy / strong 两档均自动指向该网关。
-        </div>
-        <label className="field">
-          <span>网关地址（Base URL）</span>
-          <input
-            value={gwURL}
-            onChange={(event) => setGwURL(event.target.value)}
-            placeholder="https://llm-gateway.dasctf.com/llm-gateway/proxy/e/..."
-            spellCheck={false}
-          />
-          <span className="field-hint">
-            赛方网关只需填根地址（如 https://llm-gateway.dasctf.com/llm-gateway/proxy/e/&lt;token&gt;）；Boom 自动处理路径格式。
-          </span>
-        </label>
-        <label className="field">
-          <span>DeepSeek API Key</span>
-          <input
-            type="password"
-            value={gwKey}
-            onChange={(event) => setGwKey(event.target.value)}
-            placeholder="sk-..."
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </label>
-        <label className="field">
-          <span>Model ID</span>
-          <input
-            value={gwModel}
-            onChange={(event) => setGwModel(event.target.value)}
-            spellCheck={false}
-          />
-        </label>
-        <div className="row">
-          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void configureGateway()}>
-            配置网关并设为默认模型
-          </button>
-          <span className="hint">
-            {gwConfigured ? "economy / strong 已指向比赛网关 ✓" : "尚未配置：当前模型不经赛方网关"}
-          </span>
-        </div>
-      </section>
+      <div className="competition-grid">
+        <section className="competition-card competition-connection">
+          <div className="competition-card-head">
+            <span className="competition-card-icon"><Server size={16} /></span>
+            <div><h3>平台接入</h3><p>配置西湖论剑 Agent API 地址与 AccessKey</p></div>
+          </div>
+          <label className="competition-field">
+            <span>Server Host</span>
+            <input
+              className="input mono"
+              type="url"
+              value={serverHost}
+              onChange={(event) => setServerHost(event.target.value)}
+              placeholder="https://pro.dasctf.com"
+              autoComplete="url"
+              spellCheck={false}
+            />
+          </label>
+          <label className="competition-field">
+            <span>AccessKey</span>
+            <input
+              className="input mono"
+              type="password"
+              value={accessKey}
+              onChange={(event) => setAccessKey(event.target.value)}
+              placeholder={remotelyConfigured ? "已配置；留空保存可清除" : "ak_live_..."}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <p className="competition-note"><ShieldCheck size={14} /> 仅以 0600 权限保存在本机，不进入题目目录或运行工作区。</p>
+          <div className="competition-actions">
+            <button type="button" className="btn" disabled={busy} onClick={() => void saveServerHost()}><Server size={15} />保存地址</button>
+            <button type="button" className="btn" disabled={busy} onClick={() => void saveAccessKey()}><KeyRound size={15} />保存凭证</button>
+            <button type="button" className="btn btn-primary" disabled={busy || !remotelyConfigured} onClick={() => void sync()}><CloudDownload size={15} />同步已开放题目</button>
+          </div>
+          <p className="competition-footnote">赛题会分批放出；每次放题后可再次同步，已有题目不会被覆盖。</p>
+        </section>
+
+        <section className="competition-card">
+          <div className="competition-card-head">
+            <span className="competition-card-icon"><RefreshCw size={16} /></span>
+            <div><h3>自动同步与资源</h3><p>控制赛题发现频率与线上容器用量</p></div>
+          </div>
+          <div className="competition-form-grid">
+            <label className="competition-field">
+              <span>刷新赛题间隔（分钟）</span>
+              <input className="input" type="number" min={1} max={60} value={refreshIntervalMinutes} onChange={(event) => setRefreshIntervalMinutes(Number(event.target.value) || 1)} />
+            </label>
+            <label className="competition-field">
+              <span>线上容器并发上限</span>
+              <input className="input" type="number" min={1} max={3} value={remoteSlots} onChange={(event) => setRemoteSlots(Number(event.target.value) || 1)} />
+            </label>
+          </div>
+          <div className="competition-rule"><CircleAlert size={14} />线上容器最多 3 个；可按机器承载能力选择 1–3 个。</div>
+          <div className="competition-actions">
+            <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void saveCapacity()}>保存自动化设置</button>
+            <button
+              type="button"
+              className="btn btn-danger"
+              disabled={busy || (activeEnvironments === 0 && !autopilot?.enabled)}
+              onClick={() => void closeAllEnvironments()}
+            ><Power size={15} />关闭全部靶机</button>
+          </div>
+          <p className="competition-footnote">本地并发由“设置 → 运行参数”统一控制。关闭全部靶机会停止远程任务和自动巡航，但保留本地分析与离线 Writeup。</p>
+        </section>
+
+        <section className="competition-card competition-gateway">
+          <div className="competition-card-head">
+            <span className="competition-card-icon"><Cpu size={16} /></span>
+            <div><h3>赛方大模型网关</h3><p>通过已有 Provider 转发全部 LLM 流量</p></div>
+            <span className="competition-status">手动确认</span>
+          </div>
+          <div className="competition-rule"><CircleAlert size={14} />赛方地址本身就是完整接口；不要附加 <code>/v1</code> 或 <code>/chat/completions</code>。</div>
+          <ol className="competition-steps">
+            <li>打开 <b>Provider 与模型</b>，编辑你正在使用的 Provider（无需新建比赛专用 Provider）。</li>
+            <li>将 Base URL 直接改为赛方网关地址；不要添加 <code>/v1</code>，Boom 会自动适配完整端点。</li>
+            <li>保留该 Provider 的 API Key 与所需 Model ID，再将 Economy、Strong（以及启用时的 Vision）选择为对应模型。</li>
+          </ol>
+          <div className="competition-actions">
+            <button type="button" className="btn btn-primary" onClick={() => openDialog("providers")}><Cpu size={15} />前往 Provider 与模型</button>
+          </div>
+          <p className="competition-footnote">Boom 会保持 SSE、tool_calls 与 usage 的原有处理链路；请在开赛前用一道题确认所有已启用模型都经赛方网关。</p>
+        </section>
+      </div>
     </Modal>
   )
-}
-
-export function formatRemaining(ms: number) {
-  const total = Math.max(0, Math.floor(ms / 1000))
-  const hours = Math.floor(total / 3600)
-  const minutes = Math.floor((total % 3600) / 60)
-  const seconds = total % 60
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
-    : `${minutes}:${String(seconds).padStart(2, "0")}`
 }

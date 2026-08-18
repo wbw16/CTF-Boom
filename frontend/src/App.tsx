@@ -12,7 +12,7 @@ import {
   resolveRunDetail,
   type RunDetailSnapshot,
 } from "./state"
-import type { ChallengeGui, GuiState, RunnerNotification, RunHistory } from "./types"
+import type { ChallengeGui, GuiState, RunnerNotification, RunHistory, XihulunjianNotice } from "./types"
 import { ToastStack, type ToastItem } from "./ui"
 import { TopBar } from "./TopBar"
 import { Queue } from "./Queue"
@@ -20,13 +20,26 @@ import { Detail } from "./Detail"
 import { SettingsDialog } from "./settings/SettingsDialog"
 import { ProvidersDialog } from "./providers/ProvidersDialog"
 import { McpDialog } from "./mcp/McpDialog"
-import { PlatformsDialog } from "./platforms/PlatformsDialog"
 import { CompetitionDialog } from "./competition/CompetitionDialog"
+import { NoticeDialog } from "./competition/NoticeDialog"
 import { ArmorPromptsDialog } from "./armor/ArmorPromptsDialog"
 import { DeleteDialog } from "./delete/DeleteDialog"
 
 const REQUEST_TIMEOUT_MS = 10_000
 const EVENT_REPLAY_LIMIT = 2_000
+const READ_NOTICE_STORAGE_KEY = "boom-xihulunjian-read-notice-ids-v1"
+const MAX_REMEMBERED_NOTICE_IDS = 1_000
+
+function loadReadNoticeIDs() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(READ_NOTICE_STORAGE_KEY) ?? "[]")
+    if (!Array.isArray(stored)) return []
+    return [...new Set(stored.filter((id): id is number => Number.isSafeInteger(id) && id > 0))]
+      .slice(-MAX_REMEMBERED_NOTICE_IDS)
+  } catch {
+    return []
+  }
+}
 
 function detailRun(challenge: ChallengeGui, focused?: { slug: string; id: string } | null) {
   const confirmed = [...challenge.runs].reverse().find(
@@ -57,6 +70,8 @@ export default function App() {
   const [menu, setMenu] = useState<MenuState>(null)
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [now, setNow] = useState(Date.now())
+  const [notices, setNotices] = useState<XihulunjianNotice[]>([])
+  const [readNoticeIDs, setReadNoticeIDs] = useState<number[]>(loadReadNoticeIDs)
   const toastID = useRef(0)
   const dataRef = useRef<GuiState | null>(null)
   const selectedRef = useRef("")
@@ -284,6 +299,31 @@ export default function App() {
     await operation
   }, [loadDetail, storeDetail, toast])
 
+  const refreshNotices = useCallback(async () => {
+    try {
+      const result = await api<{ notices: XihulunjianNotice[] }>("/api/xihulunjian/notices", {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      })
+      setNotices(result.notices)
+    } catch {
+      // A missing credential or a transient platform error should not produce a toast every minute.
+      // Keep the most recently received list visible until a successful refresh replaces it.
+    }
+  }, [])
+
+  const markNoticeRead = useCallback((id: number) => {
+    setReadNoticeIDs((current) => {
+      if (current.includes(id)) return current
+      return [...current, id].slice(-MAX_REMEMBERED_NOTICE_IDS)
+    })
+  }, [])
+
+  const readNoticeIDSet = new Set(readNoticeIDs)
+  const unreadNoticeCount = notices.reduce(
+    (count, notice) => count + (readNoticeIDSet.has(notice.id) ? 0 : 1),
+    0,
+  )
+
   const scheduleRefresh = useCallback(() => {
     stateDirty.current = true
     stateDirtyGeneration.current += 1
@@ -307,6 +347,20 @@ export default function App() {
   useEffect(() => {
     void refresh()
   }, [refresh])
+
+  useEffect(() => {
+    void refreshNotices()
+    const timer = window.setInterval(() => void refreshNotices(), 60_000)
+    return () => window.clearInterval(timer)
+  }, [refreshNotices])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(READ_NOTICE_STORAGE_KEY, JSON.stringify(readNoticeIDs))
+    } catch {
+      // Reading still works for this session if browser storage is unavailable.
+    }
+  }, [readNoticeIDs])
 
   useEffect(() => {
     const source = new EventSource("/api/events")
@@ -493,10 +547,14 @@ export default function App() {
     menu,
     deleteTarget,
     now,
+    notices,
+    unreadNoticeCount,
     select,
     setFilter,
     toggleCollapsed,
     refresh,
+    refreshNotices,
+    markNoticeRead,
     loadDetail,
     toast,
     openDialog,
@@ -518,8 +576,8 @@ export default function App() {
       {dialog === "settings" ? <SettingsDialog /> : null}
       {dialog === "providers" ? <ProvidersDialog /> : null}
       {dialog === "mcp" ? <McpDialog /> : null}
-      {dialog === "platforms" ? <PlatformsDialog /> : null}
       {dialog === "competition" ? <CompetitionDialog /> : null}
+      {dialog === "notices" ? <NoticeDialog /> : null}
       {dialog === "armor" ? <ArmorPromptsDialog /> : null}
       {dialog === "delete" ? <DeleteDialog /> : null}
       {menu ? (

@@ -40,18 +40,18 @@ import {
   saveEnvironmentStore,
   upsertEnvironmentProfile,
 } from "./environment.ts"
-import { configuredPlatformAdapterRegistry } from "./http-platform-adapter.ts"
+import { clearCompetitionAdapterCache, loadCompetitionAdapter } from "./competition/adapter.ts"
+import { CompetitionAutopilot, type AutopilotCycleResult } from "./competition/autopilot.ts"
+import { XIHULUNJIAN_ADAPTER_ID } from "./xihulunjian-platform-adapter.ts"
 import {
-  loadPlatformManifest,
-  normalizePlatformManifest,
-  platformManifestPath,
-  savePlatformManifest,
-} from "./platform-manifest.ts"
-import { adaptOpenApiDocument, readApiDocument } from "./platform-openapi.ts"
+  loadXihulunjianAccessKey,
+  saveXihulunjianAccessKey,
+  saveXihulunjianServerHost,
+  xihulunjianCredentialStatus,
+} from "./xihulunjian-config.ts"
+import { normalizeCompetitionSettings } from "./competition/policy.ts"
 
 const PACKAGE_ROOT = path.resolve(import.meta.dir, "..")
-const HOME_PAGE = path.join(PACKAGE_ROOT, "prototype", "boom-gui-v3.html")
-const APP_SCRIPT = path.join(PACKAGE_ROOT, "prototype", "boom-gui-v3.js")
 const WEB_DIST = path.join(PACKAGE_ROOT, "frontend", "dist")
 const WEB_INDEX = path.join(WEB_DIST, "index.html")
 const webReady = existsSync(WEB_INDEX)
@@ -91,7 +91,15 @@ export type GuiRunnerBackend = Pick<
   | "switchTaskEnvironment"
   | "ensureRuntime"
   | "close"
->
+> & {
+  /**
+   * Competition scheduling, optional so a test backend can omit it. The real runner always provides
+   * both; a backend without them simply runs without match-clock and environment-slot awareness.
+   */
+  setCompetitionSettings?: GuiRunner["setCompetitionSettings"]
+  getCompetitionState?: GuiRunner["getCompetitionState"]
+  closeAllEnvironments?: GuiRunner["closeAllEnvironments"]
+}
 
 export type StartGuiOptions = {
   root: string
@@ -100,6 +108,8 @@ export type StartGuiOptions = {
   open?: boolean
   runner?: GuiRunnerBackend
   startRuntime?: boolean
+  /** Host-wide network switch handed to the runner; "deny" isolates tool sandboxes. */
+  network?: "allow" | "deny"
 }
 
 class HttpError extends Error {
@@ -161,10 +171,14 @@ function settingsFrom(input: Record<string, unknown>, fallback: GuiSettings): Gu
     typeof input.strongModel === "string"
       ? input.strongModel
       : legacyModel ?? fallback.strongModel
+  const visionModel =
+    typeof input.visionModel === "string" ? input.visionModel : fallback.visionModel
   if (!economyModel.includes("/"))
     throw new HttpError(400, "economyModel must be provider/model")
   if (!strongModel.includes("/"))
     throw new HttpError(400, "strongModel must be provider/model")
+  if (visionModel !== "" && !visionModel.includes("/"))
+    throw new HttpError(400, "visionModel must be empty or provider/model")
   const tokens = positive(input.tokens ?? fallback.tokens, "tokens")
   const repeats = positive(input.repeats ?? fallback.repeats, "repeats", 2)
   const minutes = positive(input.minutes ?? fallback.minutes, "minutes")
@@ -212,18 +226,33 @@ function settingsFrom(input: Record<string, unknown>, fallback: GuiSettings): Gu
     typeof input.consultOnCompaction === "boolean"
       ? input.consultOnCompaction
       : fallback.consultOnCompaction
+  const tokenBudgetEnabled =
+    typeof input.tokenBudgetEnabled === "boolean"
+      ? input.tokenBudgetEnabled
+      : fallback.tokenBudgetEnabled
+  const network = input.network === "deny" ? "deny" : "allow"
+  // Local concurrency is a normal runtime setting. Keep the competition admission mirror aligned
+  // with it so this specialized panel never creates a second, conflicting local-concurrency knob.
+  const competition = {
+    ...normalizeCompetitionSettings(input.competition, fallback.competition),
+    localSlots: concurrency,
+  }
   return {
     economyModel,
     strongModel,
+    visionModel,
     tokens,
+    tokenBudgetEnabled,
     repeats,
     minutes,
+    competition,
     concurrency,
     flagFormat,
     executionMode,
     consultModels,
     blindReview,
     consultOnCompaction,
+    network,
   }
 }
 
@@ -337,94 +366,6 @@ function boundedStateRun(run: RunHistory): RunHistory {
   }
 }
 
-async function platformSummaries(root: string) {
-  const directory = path.join(root, "platforms")
-  const entries = await readdir(directory, { withFileTypes: true }).catch(() => [])
-  return Promise.all(entries
-    .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".json"))
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .map(async (entry) => {
-      const id = entry.name.slice(0, -".json".length)
-      try {
-        const manifest = await loadPlatformManifest(root, id)
-        if (!manifest) throw new Error("manifest disappeared while scanning")
-        return {
-          id: manifest.id,
-          name: manifest.name ?? manifest.id,
-          status: manifest.status as "draft" | "ready" | "invalid",
-          profile: manifest.profile,
-          listChallenges: true,
-          acquireChallenges: true,
-          submitFlag: manifest.operations.submitFlag !== undefined,
-          credential: manifest.auth
-            ? { env: manifest.auth.env, configured: Boolean(process.env[manifest.auth.env]?.trim()) }
-            : undefined,
-        }
-      } catch (error) {
-        return {
-          id,
-          name: id,
-          status: "invalid" as const,
-          listChallenges: false,
-          acquireChallenges: false,
-          submitFlag: false,
-          error: error instanceof Error ? error.message : String(error),
-        }
-      }
-    }))
-}
-
-function platformQuery(value: unknown) {
-  if (value === undefined) return {}
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new HttpError(400, "query must be an object")
-  const input = value as Record<string, unknown>
-  const integer = (key: "page" | "pageSize", maximum: number) => {
-    const found = input[key]
-    if (found === undefined) return undefined
-    if (typeof found !== "number" || !Number.isInteger(found) || found < 1 || found > maximum)
-      throw new HttpError(400, `query.${key} must be an integer from 1 to ${maximum}`)
-    return found
-  }
-  const string = (key: "search" | "category" | "difficulty") => {
-    const found = input[key]
-    if (found === undefined || found === "") return undefined
-    if (typeof found !== "string" || found.length > 500 || found.includes("\0"))
-      throw new HttpError(400, `query.${key} must be a short string`)
-    return found.trim()
-  }
-  return {
-    ...(integer("page", 100_000) ? { page: integer("page", 100_000)! } : {}),
-    ...(integer("pageSize", 100) ? { pageSize: integer("pageSize", 100)! } : {}),
-    ...(string("search") ? { search: string("search")! } : {}),
-    ...(string("category") ? { category: string("category")! } : {}),
-    ...(string("difficulty") ? { difficulty: string("difficulty")! } : {}),
-  }
-}
-
-function platformSelection(value: unknown) {
-  if (value === undefined) return undefined
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new HttpError(400, "selection must be an object")
-  const input = value as Record<string, unknown>
-  const identifiers = (key: "ids" | "exclude") => {
-    const found = input[key]
-    if (found === undefined) return undefined
-    if (!Array.isArray(found) || found.length > 20_000 || found.some((item) =>
-      typeof item !== "string" || !item.trim() || item.length > 600 || item.includes("\0")))
-      throw new HttpError(400, `selection.${key} must be an array of challenge IDs`)
-    return [...new Set(found as string[])]
-  }
-  if (input.all !== undefined && typeof input.all !== "boolean")
-    throw new HttpError(400, "selection.all must be a boolean")
-  return {
-    ...(input.all === true ? { all: true } : {}),
-    ...(identifiers("ids") ? { ids: identifiers("ids")! } : {}),
-    ...(identifiers("exclude") ? { exclude: identifiers("exclude")! } : {}),
-    ...(input.query === undefined ? {} : { query: platformQuery(input.query) }),
-  }
-}
-
 function summaryStateRun(run: RunHistory): RunHistory {
   const bounded = boundedStateRun(run)
   return {
@@ -490,15 +431,40 @@ async function removeTree(root: string, target: string) {
   await rm(safe, { recursive: true, force: true })
 }
 
+/**
+ * Opening Boom is intentionally stationary. A saved "running" bit from an earlier process must
+ * never synchronize or solve before the operator presses the main "开始比赛" button.
+ */
+function stationaryRootState(state: RootGuiState): RootGuiState {
+  if (state.settings.competition.autopilotEnabled !== true) return state
+  return {
+    ...state,
+    settings: {
+      ...state.settings,
+      competition: normalizeCompetitionSettings(
+        { ...state.settings.competition, autopilotEnabled: false },
+        state.settings.competition,
+      ),
+    },
+  }
+}
+
 export async function startGuiServer(options: StartGuiOptions) {
+  if (!webReady)
+    throw new Error("Boom GUI 前端尚未构建；请先运行 bun run build:web")
   const hostname = options.hostname ?? "127.0.0.1"
   if (!LOOPBACK.has(hostname)) throw new Error(`Boom GUI only listens on loopback, got: ${hostname}`)
   let root = await canonicalDirectory(options.root)
   const challengeRoot = await lstat(path.join(root, "challenges")).catch(() => undefined)
   if (!challengeRoot?.isDirectory()) throw new Error(`No challenges directory at ${path.join(root, "challenges")}`)
-  let persisted = await loadRootGuiState(root)
-  const runner: GuiRunnerBackend = options.runner ?? new GuiRunner(root)
+  const loaded = await loadRootGuiState(root)
+  let persisted = stationaryRootState(loaded)
+  // Persisted settings win at startup; the CLI flag only seeds a root with no saved state yet.
+  const runner: GuiRunnerBackend = options.runner ?? new GuiRunner(root, undefined, undefined, {
+    network: options.network ?? persisted.settings.network,
+  })
   runner.setConcurrency(persisted.settings.concurrency)
+  runner.setCompetitionSettings?.(persisted.settings.competition)
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>()
   const instanceID = crypto.randomUUID()
   let sequence = 0
@@ -596,6 +562,137 @@ export async function startGuiServer(options: StartGuiOptions) {
     }
   }
 
+  const automaticEnvironmentProfile = async () => {
+    const environments = await loadEnvironmentStore()
+    const profileID = environments.defaultProfileId ?? environments.profiles[0]?.id
+    const profile = profileID ? environments.profiles.find((item) => item.id === profileID) : undefined
+    if (!profile)
+      throw new HttpError(400, "无人值守解题需要先在设置中选择默认 Python 环境")
+    if (profile.status !== "ready")
+      throw new HttpError(400, `默认 Python 环境不可用：${profile.detail ?? profile.status}`)
+    return profile.id
+  }
+
+  /**
+   * Choose only untouched platform challenges, plus a small bounded retry allowance for a task that
+   * ended in a runtime error. This prevents an unattended 10-minute poll from reviving manually
+   * abandoned work, confirmed flags, or an irrecoverable task forever.
+   */
+  const automaticCandidate = async (item: Challenge) => {
+    if (item.platform?.adapter !== XIHULUNJIAN_ADAPTER_ID) return undefined
+    if (item.platform.options?.solved === true) return undefined
+    const saved = persisted.challenges[item.slug]
+    if (saved?.state || saved?.confirmed) return undefined
+    if (runner.getTransientRuns(item.slug).length > 0) return undefined
+    const history = await readChallengeRuns(root, item.slug)
+    const previous = history.at(-1)
+    if (!previous) return { challenge: item }
+    if (previous.taskStatus === "archived" || previous.acceptedFlag || previous.confirmedFlag)
+      return undefined
+    const errorCount = history.filter((run) => run.stop === "error").length
+    // The runner already attempts in-process recovery. Two later polling retries are enough to
+    // cover a transient provider/runtime outage without repeatedly spending the match on one bad task.
+    if (previous.stop === "error" && errorCount <= 2)
+      return { challenge: item, workspace: previous.id }
+    return undefined
+  }
+
+  const enqueueAutomatically = async (downloaded: Challenge[]): Promise<Pick<AutopilotCycleResult, "queued" | "skipped">> => {
+    const profileID = await automaticEnvironmentProfile()
+    const settings = persisted.settings
+    let queued = 0
+    let skipped = 0
+    for (const item of downloaded) {
+      let candidate: { challenge: Challenge; workspace?: string } | undefined
+      try {
+        candidate = await automaticCandidate(item)
+      } catch (error) {
+        skipped += 1
+        broadcast({
+          at: Date.now(),
+          type: "competition.autopilot.challenge.skipped",
+          slug: item.slug,
+          detail: error instanceof Error ? error.message : String(error),
+        })
+        continue
+      }
+      if (!candidate) {
+        skipped += 1
+        continue
+      }
+      try {
+        await runner.enqueue({
+          challenges: [candidate.challenge],
+          model: settings.strongModel,
+          models: { [candidate.challenge.slug]: settings.strongModel },
+          modelPolicy: { economy: settings.economyModel, strong: settings.strongModel },
+          visionModel: settings.visionModel,
+          consultModels: settings.consultModels,
+          blindReview: settings.blindReview,
+          consultOnCompaction: settings.consultOnCompaction,
+          limits: {
+            tokens: settings.tokens,
+            repeats: settings.repeats,
+            timeout: settings.minutes * 60_000,
+            silenceMs: DEFAULT_SILENCE_MS,
+          },
+          flagFormat: settings.flagFormat,
+          environmentProfileId: profileID,
+          executionMode: settings.executionMode,
+          ...(candidate.workspace ? { workspaces: { [candidate.challenge.slug]: candidate.workspace } } : {}),
+        })
+        queued += 1
+      } catch (error) {
+        // One malformed challenge or temporarily unavailable model must not prevent later released
+        // challenges from being admitted. The error is visible in the event stream but never escapes
+        // the polling cycle.
+        skipped += 1
+        broadcast({
+          at: Date.now(),
+          type: "competition.autopilot.enqueue.failed",
+          slug: candidate.challenge.slug,
+          detail: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return { queued, skipped }
+  }
+
+  const synchronizeXihulunjian = async (
+    options: { signal?: AbortSignal; automatic?: boolean } = {},
+  ): Promise<AutopilotCycleResult & { slugs: string[] }> => {
+    const adapter = await loadCompetitionAdapter()
+    if (!adapter) throw new HttpError(400, "请先保存西湖论剑 AccessKey")
+    const downloaded = await adapter.acquireChallenges({ root, signal: options.signal })
+    const admission = options.automatic
+      ? await enqueueAutomatically(downloaded)
+      : { queued: 0, skipped: 0 }
+    const result = { downloaded: downloaded.length, ...admission, slugs: downloaded.map((item) => item.slug) }
+    broadcast({
+      at: Date.now(),
+      type: "xihulunjian.synced",
+      challenges: downloaded.length,
+      ...(options.automatic ? { autopilot: result } : {}),
+    })
+    return result
+  }
+
+  const autopilot = new CompetitionAutopilot({
+    sync: (signal) => exclusive(() => synchronizeXihulunjian({ signal, automatic: true })),
+    intervalMs: (persisted.settings.competition.refreshIntervalMinutes ?? 10) * 60_000,
+    // Unattended mode ends only when the operator stops it. The legacy clock remains readable for
+    // old saved state, but it must not silently stop future catalog polling or solve admission.
+    canRun: () => true,
+    onState: (autopilotState) => {
+      broadcast({ at: Date.now(), type: "competition.autopilot.changed", autopilot: autopilotState })
+    },
+  })
+
+  const competitionState = () => ({
+    ...(runner.getCompetitionState?.() ?? { unavailable: true }),
+    autopilot: autopilot.state(),
+  })
+
   const runDetail = async (
     detailRoot: string,
     detailPersisted: RootGuiState,
@@ -630,7 +727,7 @@ export async function startGuiServer(options: StartGuiOptions) {
 
       try {
         if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-          return new Response(Bun.file(webReady ? WEB_INDEX : HOME_PAGE), {
+          return new Response(Bun.file(WEB_INDEX), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",
@@ -645,17 +742,6 @@ export async function startGuiServer(options: StartGuiOptions) {
           const asset = await staticWebAsset(url.pathname)
           if (asset) return asset
         }
-        if (request.method === "GET" && url.pathname === "/app.js") {
-          return new Response(Bun.file(APP_SCRIPT), {
-            headers: {
-              "Content-Type": "application/javascript; charset=utf-8",
-              "Cache-Control": "no-store",
-              "X-Content-Type-Options": "nosniff",
-              "Referrer-Policy": "no-referrer",
-            },
-          })
-        }
-
         if (request.method === "GET" && url.pathname === "/api/state") return json(await state())
         const runDetailMatch = /^\/api\/challenges\/([^/]+)\/runs\/([^/]+)$/.exec(url.pathname)
         if (request.method === "GET" && runDetailMatch) {
@@ -716,11 +802,15 @@ export async function startGuiServer(options: StartGuiOptions) {
             const challengeDirectory = await lstat(path.join(next, "challenges")).catch(() => undefined)
             if (!challengeDirectory?.isDirectory())
               throw new HttpError(400, `No challenges directory at ${path.join(next, "challenges")}`)
-            const nextPersisted = await loadRootGuiState(next)
+            const nextLoaded = await loadRootGuiState(next)
+            const nextPersisted = stationaryRootState(nextLoaded)
+            autopilot.stop()
             runner.setRoot(next)
             runner.setConcurrency(nextPersisted.settings.concurrency)
+            runner.setCompetitionSettings?.(nextPersisted.settings.competition)
             root = next
             persisted = nextPersisted
+            await runner.applyLiveModelSettings(nextPersisted.settings)
             broadcast({ at: Date.now(), type: "root.changed" })
             return json(await state())
           })
@@ -730,132 +820,201 @@ export async function startGuiServer(options: StartGuiOptions) {
           const input = await body(request)
           return await exclusive(async () => {
             const settings = settingsFrom(input, persisted.settings)
+            if (settings.visionModel) {
+              const models = await runner.getModels()
+              if (!models.some((model) =>
+                model.id === settings.visionModel && model.connected && model.attachment === true
+              )) throw new HttpError(400, "visionModel must be a connected image-capable model")
+            }
             const nextPersisted: RootGuiState = { ...persisted, settings }
             await saveRootGuiState(root, nextPersisted)
             persisted = nextPersisted
             runner.setConcurrency(settings.concurrency)
+            // Optional so an injected test backend need not implement the competition scheduler.
+            runner.setCompetitionSettings?.(settings.competition)
+            autopilot.setIntervalMs((settings.competition.refreshIntervalMinutes ?? 10) * 60_000)
             const switches = await runner.applyLiveModelSettings(settings)
             broadcast({ at: Date.now(), type: "settings.changed" })
             return json({ settings, switches })
           })
         }
 
-        if (request.method === "GET" && url.pathname === "/api/platforms")
-          return json({ platforms: await platformSummaries(root) })
+        // Live match status: clock, environment slots, and current slot usage.
+        if (request.method === "GET" && url.pathname === "/api/competition")
+          return json(competitionState())
 
-        if (request.method === "POST" && url.pathname === "/api/platforms/adapt") {
+        // Start or clear the match clock. The deadline is what drives the endgame and give-up rules,
+        // so it is set explicitly by the operator rather than guessed from the first run.
+        if (request.method === "POST" && url.pathname === "/api/competition/clock") {
           const input = await body(request)
-          if (typeof input.id !== "string" || !input.id.trim())
-            throw new HttpError(400, "id must be a platform adapter ID")
-          if (typeof input.document !== "string" || !input.document.trim())
-            throw new HttpError(400, "document must be an OpenAPI URL or local path")
-          const requestedID = input.id.trim()
-          const documentSource = input.document.trim()
+          if (input.action === "clear") autopilot.stop()
           return await exclusive(async () => {
-            const adapterID = requestedID
-            const target = platformManifestPath(root, adapterID)
-            if (input.force !== true && await lstat(target).catch(() => undefined))
-              throw new HttpError(409, `Platform adapter already exists: ${adapterID}`)
-            try {
-              const document = await readApiDocument(documentSource)
-              const adapted = adaptOpenApiDocument(document, {
-                id: adapterID,
-                ...(typeof input.baseURL === "string" && input.baseURL.trim()
-                  ? { baseURL: input.baseURL.trim() }
-                  : {}),
-                ...(typeof input.name === "string" && input.name.trim()
-                  ? { name: input.name.trim() }
-                  : {}),
-              })
-              await savePlatformManifest(root, adapted.manifest)
-              broadcast({ at: Date.now(), type: "platform.adapted", adapter: adapterID })
-              return json(adapted, 201)
-            } catch (error) {
-              if (error instanceof HttpError) throw error
-              throw new HttpError(400, error instanceof Error ? error.message : String(error))
+            const current = persisted.settings.competition
+            let deadline: number | undefined
+            if (input.action === "start") {
+              const minutes = typeof input.minutes === "number" && Number.isFinite(input.minutes)
+                ? Math.floor(input.minutes)
+                : current.matchMinutes
+              if (minutes < 1) throw new HttpError(400, "minutes must be at least 1")
+              deadline = Date.now() + minutes * 60_000
+            } else if (input.action !== "clear") {
+              throw new HttpError(400, "action must be start or clear")
             }
+            // "clear" must actually drop the deadline, so build the object without it rather than
+            // spreading an undefined over the existing value.
+            const { deadline: _previous, ...rest } = current
+            const competition = normalizeCompetitionSettings(
+              deadline === undefined
+                ? { ...rest, autopilotEnabled: false }
+                : { ...rest, deadline },
+              current,
+            )
+            const settings = { ...persisted.settings, competition }
+            const nextPersisted: RootGuiState = { ...persisted, settings }
+            await saveRootGuiState(root, nextPersisted)
+            persisted = nextPersisted
+            runner.setCompetitionSettings?.(competition)
+            broadcast({ at: Date.now(), type: "competition.clock.changed" })
+            return json(competitionState())
           })
         }
 
-        const platformCatalogMatch = /^\/api\/platforms\/([^/]+)\/catalog$/.exec(url.pathname)
-        if (request.method === "POST" && platformCatalogMatch) {
-          const adapterID = decodeSegment(platformCatalogMatch[1]!)
-          const input = await body(request)
-          const variables = input.variables === undefined
-            ? {}
-            : input.variables && typeof input.variables === "object" && !Array.isArray(input.variables)
-              ? input.variables as Record<string, unknown>
-              : undefined
-          if (!variables) throw new HttpError(400, "variables must be an object")
-          try {
-            const catalog = await configuredPlatformAdapterRegistry().listChallenges(adapterID, {
-              root,
-              options: variables,
-              query: platformQuery(input.query),
+        /**
+         * Main-screen start: arm the match clock and then let the process-lifetime autopilot fetch
+         * immediately. It returns promptly; catalog acquisition and solving continue if the window
+         * is closed or refreshed.
+         */
+        if (request.method === "POST" && url.pathname === "/api/competition/autopilot/start") {
+          return await exclusive(async () => {
+            if (!await loadXihulunjianAccessKey())
+              throw new HttpError(400, "开始比赛前请先在西湖论剑控制台保存 AccessKey")
+            await automaticEnvironmentProfile()
+            const current = persisted.settings.competition
+            const { deadline: _legacyDeadline, ...withoutDeadline } = current
+            const competition = normalizeCompetitionSettings({
+              ...withoutDeadline,
+              autopilotEnabled: true,
+            }, current)
+            const settings = { ...persisted.settings, competition }
+            const nextPersisted: RootGuiState = { ...persisted, settings }
+            await saveRootGuiState(root, nextPersisted)
+            persisted = nextPersisted
+            runner.setConcurrency(settings.concurrency)
+            runner.setCompetitionSettings?.(competition)
+            autopilot.setIntervalMs((competition.refreshIntervalMinutes ?? 10) * 60_000)
+            const autopilotState = autopilot.start()
+            broadcast({ at: Date.now(), type: "competition.autopilot.started", autopilot: autopilotState })
+            return json({ competition: competitionState() }, 202)
+          })
+        }
+
+        /** Stop active work and future polls, while retaining the clock for an intentional resume. */
+        if (request.method === "POST" && url.pathname === "/api/competition/autopilot/stop") {
+          // Do this outside the serialized mutation so a stop interrupts a slow sync immediately.
+          const autopilotState = autopilot.stop()
+          return await exclusive(async () => {
+            const current = persisted.settings.competition
+            const competition = normalizeCompetitionSettings({ ...current, autopilotEnabled: false }, current)
+            const settings = { ...persisted.settings, competition }
+            const nextPersisted: RootGuiState = { ...persisted, settings }
+            await saveRootGuiState(root, nextPersisted)
+            persisted = nextPersisted
+            runner.setCompetitionSettings?.(competition)
+            const stopped = runner.stop()
+            broadcast({ at: Date.now(), type: "competition.autopilot.stopped", stopped, autopilot: autopilotState })
+            return json({ stopped, competition: competitionState() })
+          })
+        }
+
+        /**
+         * Explicit operator kill switch: prevent the unattended loop from creating replacements,
+         * then stop remote work and recover every target lease the runner currently owns.
+         */
+        if (request.method === "POST" && url.pathname === "/api/competition/environments/close") {
+          const closeAllEnvironments = runner.closeAllEnvironments
+          if (!closeAllEnvironments)
+            throw new HttpError(501, "当前运行器不支持批量关闭靶机环境")
+          const autopilotState = autopilot.stop()
+          return await exclusive(async () => {
+            const current = persisted.settings.competition
+            const competition = normalizeCompetitionSettings({ ...current, autopilotEnabled: false }, current)
+            const settings = { ...persisted.settings, competition }
+            const nextPersisted: RootGuiState = { ...persisted, settings }
+            await saveRootGuiState(root, nextPersisted)
+            persisted = nextPersisted
+            runner.setCompetitionSettings?.(competition)
+            const closed = await closeAllEnvironments.call(runner)
+            broadcast({
+              at: Date.now(),
+              type: "competition.environments.closed",
+              detail: `已关闭 ${closed.released} 个靶机环境`,
             })
-            return json({ adapter: adapterID, ...catalog })
-          } catch (error) {
-            if (error instanceof HttpError) throw error
-            throw new HttpError(400, error instanceof Error ? error.message : String(error))
-          }
+            return json({ closed, competition: competitionState(), autopilot: autopilotState })
+          })
         }
 
-        const platformSyncMatch = /^\/api\/platforms\/([^/]+)\/sync$/.exec(url.pathname)
-        if (request.method === "POST" && platformSyncMatch) {
-          const adapterID = decodeSegment(platformSyncMatch[1]!)
+        // This build deliberately exposes one fixed competition integration only.  It has no
+        // manifest editor, OpenAPI importer, adapter IDs, or generic platform routes.
+        if (request.method === "GET" && url.pathname === "/api/xihulunjian/overview") {
+          const adapter = await loadCompetitionAdapter()
+          if (!adapter) throw new HttpError(400, "请先在西湖论剑控制台配置 AccessKey")
+          return json(await adapter.overview(request.signal))
+        }
+
+        if (request.method === "GET" && url.pathname === "/api/xihulunjian/notices") {
+          const adapter = await loadCompetitionAdapter()
+          if (!adapter) throw new HttpError(400, "请先在西湖论剑控制台配置 AccessKey")
+          return json({ notices: await adapter.notices(request.signal) })
+        }
+
+        const noticeDetail = /^\/api\/xihulunjian\/notices\/(\d+)$/.exec(url.pathname)
+        if (request.method === "GET" && noticeDetail) {
+          const id = Number(noticeDetail[1])
+          if (!Number.isSafeInteger(id) || id <= 0) throw new HttpError(400, "公告 ID 非法")
+          const adapter = await loadCompetitionAdapter()
+          if (!adapter) throw new HttpError(400, "请先在西湖论剑控制台配置 AccessKey")
+          return json(await adapter.noticeDetail(id, request.signal))
+        }
+
+        if (request.method === "GET" && url.pathname === "/api/xihulunjian")
+          return json({ credential: await xihulunjianCredentialStatus() })
+
+        if (request.method === "PUT" && url.pathname === "/api/xihulunjian/credential") {
           const input = await body(request)
-          const variables = input.variables === undefined
-            ? {}
-            : input.variables && typeof input.variables === "object" && !Array.isArray(input.variables)
-              ? input.variables as Record<string, unknown>
-              : undefined
-          if (!variables) throw new HttpError(400, "variables must be an object")
+          if (typeof input.value !== "string") throw new HttpError(400, "AccessKey 必须是字符串")
+          const accessKey = input.value
           return await exclusive(async () => {
             try {
-              const downloaded = await configuredPlatformAdapterRegistry().acquireChallenges(adapterID, {
-                root,
-                options: variables,
-                selection: platformSelection(input.selection),
-              })
-              broadcast({
-                at: Date.now(),
-                type: "platform.synced",
-                adapter: adapterID,
-                challenges: downloaded.length,
-              })
-              return json({
-                adapter: adapterID,
-                challenges: downloaded.map((challenge) => challenge.slug),
-              })
+              const credential = await saveXihulunjianAccessKey(accessKey)
+              clearCompetitionAdapterCache()
+              broadcast({ at: Date.now(), type: "xihulunjian.credential.changed" })
+              return json({ credential })
             } catch (error) {
               throw new HttpError(400, error instanceof Error ? error.message : String(error))
             }
           })
         }
 
-        const platformMatch = /^\/api\/platforms\/([^/]+)$/.exec(url.pathname)
-        if (request.method === "GET" && platformMatch) {
-          const adapterID = decodeSegment(platformMatch[1]!)
-          const manifest = await loadPlatformManifest(root, adapterID)
-          if (!manifest) throw new HttpError(404, `No such platform adapter: ${adapterID}`)
-          return json({
-            manifest,
-            credential: manifest.auth
-              ? { env: manifest.auth.env, configured: Boolean(process.env[manifest.auth.env]?.trim()) }
-              : undefined,
-          })
-        }
-        if (request.method === "PUT" && platformMatch) {
-          const adapterID = decodeSegment(platformMatch[1]!)
+        if (request.method === "PUT" && url.pathname === "/api/xihulunjian/server-host") {
           const input = await body(request)
+          if (typeof input.value !== "string") throw new HttpError(400, "Server Host 必须是字符串")
           return await exclusive(async () => {
             try {
-              const manifest = normalizePlatformManifest(input.manifest)
-              if (manifest.id !== adapterID)
-                throw new HttpError(400, "manifest.id must match the URL")
-              await savePlatformManifest(root, manifest)
-              broadcast({ at: Date.now(), type: "platform.changed", adapter: adapterID })
-              return json({ manifest })
+              const saved = await saveXihulunjianServerHost(input.value)
+              clearCompetitionAdapterCache()
+              broadcast({ at: Date.now(), type: "xihulunjian.server-host.changed" })
+              return json(saved)
+            } catch (error) {
+              throw new HttpError(400, error instanceof Error ? error.message : String(error))
+            }
+          })
+        }
+
+        if (request.method === "POST" && url.pathname === "/api/xihulunjian/sync") {
+          return await exclusive(async () => {
+            try {
+              const result = await synchronizeXihulunjian()
+              return json({ challenges: result.slugs })
             } catch (error) {
               if (error instanceof HttpError) throw error
               throw new HttpError(400, error instanceof Error ? error.message : String(error))
@@ -1116,10 +1275,15 @@ export async function startGuiServer(options: StartGuiOptions) {
             throw new HttpError(400, "provider.id must match the URL")
           const apiKey =
             typeof input.apiKey === "string" ? input.apiKey : undefined
+          if (input.apply !== undefined && typeof input.apply !== "boolean")
+            throw new HttpError(400, "apply must be a boolean")
+          // Existing API clients historically applied every save. The GUI now opts out explicitly
+          // for a fast local save, while callers that omit the field keep the old behavior.
+          const apply = input.apply !== false
           return await exclusive(async () => {
-            const saved = await runner.saveProvider(provider, apiKey)
-            broadcast({ at: Date.now(), type: "providers.changed" })
-            return json({ provider: saved })
+            const saved = await runner.saveProvider(provider, apiKey, { apply })
+            if (apply) broadcast({ at: Date.now(), type: "providers.changed" })
+            return json({ ...(saved ? { provider: saved } : {}), applied: apply })
           })
         }
         if (request.method === "DELETE" && providerMatch) {
@@ -1173,6 +1337,7 @@ export async function startGuiServer(options: StartGuiOptions) {
             const {
               economyModel,
               strongModel,
+              visionModel,
               tokens,
               repeats,
               minutes,
@@ -1218,10 +1383,16 @@ export async function startGuiServer(options: StartGuiOptions) {
               model,
               models,
               modelPolicy: { economy: economyModel, strong: strongModel },
+              visionModel,
               consultModels,
               blindReview,
               consultOnCompaction,
-              limits: { tokens, repeats, timeout: minutes * 60_000, silenceMs: DEFAULT_SILENCE_MS },
+              limits: {
+                ...(settings.tokenBudgetEnabled ? { tokens } : {}),
+                repeats,
+                timeout: minutes * 60_000,
+                silenceMs: DEFAULT_SILENCE_MS,
+              },
               flagFormat,
               hint: typeof input.hint === "string" ? input.hint : undefined,
               workspaces,
@@ -1277,7 +1448,10 @@ export async function startGuiServer(options: StartGuiOptions) {
               throw new HttpError(400, "synthesizerModel must be provider/model")
             const requestedRunID =
               typeof input.sourceRunID === "string" ? input.sourceRunID : undefined
-            const tokens = positive(input.tokens ?? persisted.settings.tokens, "tokens")
+            const requestedTokens = input.tokens ?? (
+              persisted.settings.tokenBudgetEnabled ? persisted.settings.tokens : undefined
+            )
+            const tokens = requestedTokens === undefined ? undefined : positive(requestedTokens, "tokens")
             const repeats = positive(input.repeats ?? persisted.settings.repeats, "repeats", 2)
             const minutes = positive(input.minutes ?? persisted.settings.minutes, "minutes")
             const flagFormat =
@@ -1305,7 +1479,7 @@ export async function startGuiServer(options: StartGuiOptions) {
               blindReview: persisted.settings.blindReview,
               consultOnCompaction: persisted.settings.consultOnCompaction,
               limits: {
-                tokens,
+                ...(tokens === undefined ? {} : { tokens }),
                 repeats,
                 timeout: minutes * 60_000,
                 silenceMs: DEFAULT_SILENCE_MS,
@@ -1354,6 +1528,7 @@ export async function startGuiServer(options: StartGuiOptions) {
                 economy: persisted.settings.economyModel,
                 strong: persisted.settings.strongModel,
               },
+              visionModel: persisted.settings.visionModel,
               consultModels: persisted.settings.consultModels,
               blindReview: persisted.settings.blindReview,
               consultOnCompaction: persisted.settings.consultOnCompaction,
@@ -1471,20 +1646,21 @@ export async function startGuiServer(options: StartGuiOptions) {
                 economy: settings.economyModel,
                 strong: settings.strongModel,
               },
+              visionModel: settings.visionModel,
               consultModels: settings.consultModels,
               blindReview: settings.blindReview,
               consultOnCompaction: settings.consultOnCompaction,
               workspaces: { [found.slug]: selected.id },
               limits: {
-                tokens: settings.tokens,
+                ...(settings.tokenBudgetEnabled ? { tokens: settings.tokens } : {}),
                 repeats: settings.repeats,
                 timeout: settings.minutes * 60_000,
                 silenceMs: DEFAULT_SILENCE_MS,
               },
               flagFormat: settings.flagFormat,
               hint: [
-                `用户已人工确认候选 flag ${JSON.stringify(flag)} 不正确。`,
-                "不要再次提交这个候选；结合 NOTES.md 中的记录检查推导或验证环节，然后继续完成原目标。",
+                `The user manually confirmed the candidate flag ${JSON.stringify(flag)} is incorrect.`,
+                "Do not submit this candidate again; review the derivation or verification steps against the NOTES.md record, then continue the original goal.",
                 typeof input.hint === "string" ? input.hint.trim() : "",
               ]
                 .filter(Boolean)
@@ -1533,17 +1709,18 @@ export async function startGuiServer(options: StartGuiOptions) {
                 economy: settings.economyModel,
                 strong: settings.strongModel,
               },
+              visionModel: settings.visionModel,
               purpose: "writeup",
               consultOnCompaction: settings.consultOnCompaction,
               workspaces: { [found.slug]: selected.id },
               limits: {
-                tokens: settings.tokens,
+                ...(settings.tokenBudgetEnabled ? { tokens: settings.tokens } : {}),
                 repeats: settings.repeats,
                 timeout: settings.minutes * 60_000,
                 silenceMs: DEFAULT_SILENCE_MS,
               },
               flagFormat: settings.flagFormat,
-              hint: `已确认 flag：${accepted}。只生成中文的最终可复现 WRITEUP.md，完成后归档。`,
+              hint: `Confirmed flag: ${accepted}. Generate only the final, reproducible Chinese WRITEUP.md, then archive.`,
             })
             broadcast({
               at: Date.now(),
@@ -1684,7 +1861,8 @@ export async function startGuiServer(options: StartGuiOptions) {
     },
   })
 
-  if (!options.runner && options.startRuntime !== false) void runner.ensureRuntime().catch(() => {})
+  if (!options.runner && options.startRuntime !== false)
+    void runner.applyLiveModelSettings(persisted.settings).catch(() => {})
   const heartbeat = setInterval(() => {
     const packet = encoder.encode(`: heartbeat ${Date.now()}\n\n`)
     for (const client of [...clients]) {
@@ -1707,6 +1885,7 @@ export async function startGuiServer(options: StartGuiOptions) {
       closing = true
       // Stop accepting new requests before draining jobs so close is a real lifecycle barrier.
       void server.stop(true)
+      autopilot.stop()
       clearInterval(heartbeat)
       unsubscribe()
       for (const client of clients) {

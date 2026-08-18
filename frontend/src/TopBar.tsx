@@ -1,24 +1,66 @@
-import { useCallback } from "react"
+import { useCallback, useEffect, useState } from "react"
 import {
+  Bell,
   FolderOpen,
   FolderPlus,
+  Medal,
   Moon,
   Play,
   RefreshCw,
   Settings,
   Square,
   Sun,
+  Trophy,
 } from "lucide-react"
 import { useApp } from "./context"
 import { chooseDirectory } from "./bridge"
-import { postJSON } from "./api"
-import { useActions } from "./actions"
-import { CATEGORY_ORDER, latestFlagRun, primary, runnableChallenges } from "./state"
-import type { GuiState } from "./types"
+import { api, postJSON } from "./api"
+import { CATEGORY_ORDER, latestFlagRun, primary } from "./state"
+import type { CompetitionState, GuiState } from "./types"
+
+type MatchOverview = { point: number; rank?: number }
 
 export function TopBar() {
-  const { data, toast, refresh, openDialog, theme, setTheme } = useApp()
-  const { runChallenges } = useActions()
+  const { data, unreadNoticeCount, toast, refresh, openDialog, theme, setTheme } = useApp()
+  const [competition, setCompetition] = useState<CompetitionState | null>(null)
+  const [overview, setOverview] = useState<MatchOverview | null>(null)
+
+  // Poll the match clock so the countdown and slot usage stay honest without a full state refresh.
+  useEffect(() => {
+    let cancelled = false
+    const read = () => {
+      void api<CompetitionState>("/api/competition")
+        .then((next) => {
+          if (!cancelled) setCompetition(next.unavailable ? null : next)
+        })
+        .catch(() => {})
+    }
+    read()
+    const timer = setInterval(read, 5_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [])
+
+  // Rankings change fast enough to be useful during a match, but do not require a high-frequency
+  // poll that competes with challenge acquisition. The adapter serializes this with other platform calls.
+  useEffect(() => {
+    let cancelled = false
+    const read = () => {
+      void api<MatchOverview>("/api/xihulunjian/overview")
+        .then((next) => {
+          if (!cancelled) setOverview(next)
+        })
+        .catch(() => {})
+    }
+    read()
+    const timer = setInterval(read, 20_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [])
 
   const pickRoot = useCallback(async () => {
     if (!data) return
@@ -66,14 +108,21 @@ export function TopBar() {
 
   const runAll = useCallback(async () => {
     if (!data) return
-    const challenges = data.challenges
-    await runChallenges(runnableChallenges(challenges).map((challenge) => challenge.slug))
-  }, [data, runChallenges])
+    try {
+      const result = await postJSON<{ competition: CompetitionState }>("/api/competition/autopilot/start")
+      setCompetition(result.competition)
+      toast("比赛已开始：正在同步题目，并每 10 分钟自动检查新题")
+      await refresh()
+    } catch (error) {
+      toast((error as Error).message, "error")
+    }
+  }, [data, refresh, toast])
 
   const halt = useCallback(async () => {
     try {
-      const result = await postJSON<{ stopped: number }>("/api/runs/stop")
-      toast(`已请求停止 ${result.stopped} 个运行`)
+      const result = await postJSON<{ stopped: number; competition: CompetitionState }>("/api/competition/autopilot/stop")
+      setCompetition(result.competition)
+      toast(`无人值守已停止，并已请求停止 ${result.stopped} 个运行`)
       await refresh()
     } catch (error) {
       toast((error as Error).message, "error")
@@ -103,8 +152,9 @@ export function TopBar() {
   }, [data, toast])
 
   if (!data) return null
-  const { settings, runtime, challenges } = data
-  const busy = runtime.active > 0 || runtime.queued > 0
+  const { runtime, challenges } = data
+  const unattended = competition?.autopilot?.enabled === true
+  const busy = runtime.active > 0 || runtime.queued > 0 || unattended
   const pendingRows = challenges
     .map((challenge) => [challenge, latestFlagRun(challenge)] as const)
     .filter(
@@ -137,27 +187,76 @@ export function TopBar() {
         <button type="button" className="icon-btn" onClick={addChallenge} title="导入题目" aria-label="导入题目">
           <FolderPlus size={14} />
         </button>
-        <span className="spacer" />
-        <span className="runtime-chip" title={runtime.error ?? runtime.status}>
-          <i className={`status-dot${busy || runtime.status === "starting" ? " busy" : ""}${runtime.status === "error" ? " error" : ""}`} />
-          {runtime.error ? "error" : busy ? `运行中 ${runtime.active}/${runtime.concurrency}` : runtime.status}
-        </span>
         <button
           type="button"
-          className={`pending-pill${pendingRows.length ? "" : " zero"}`}
-          onClick={copyPending}
-          title="复制全部待确认 flag"
+          className="competition-entry"
+          onClick={() => openDialog("competition")}
+          title="打开西湖论剑控制台"
         >
-          <b>{pendingRows.length}</b>
-          <span>待确认</span>
+          <Trophy size={14} aria-hidden="true" />
+          <span>西湖论剑控制台</span>
         </button>
+        <button
+          type="button"
+          className="notice-entry"
+          onClick={() => openDialog("notices")}
+          title={unreadNoticeCount ? `通知公告（${unreadNoticeCount} 条未读，每 60 秒自动更新）` : "通知公告（已全部阅读）"}
+          aria-label={unreadNoticeCount ? `查看通知公告，${unreadNoticeCount} 条未读` : "查看通知公告，已全部阅读"}
+        >
+          <Bell size={14} aria-hidden="true" />
+          <span>公告</span>
+          {unreadNoticeCount > 0 ? <b>{unreadNoticeCount}</b> : null}
+        </button>
+        <span
+          className="rank-chip"
+          title="西湖论剑实时排名，每 20 秒更新一次"
+          aria-label={`实时排名：${overview?.rank ? `第 ${overview.rank} 名` : "暂未获取"}`}
+        >
+          <Medal size={14} aria-hidden="true" />
+          <span>实时排名</span>
+          <b>{overview?.rank ? `#${overview.rank}` : "—"}</b>
+          {overview ? <small>{overview.point} 分</small> : null}
+        </span>
+        <span className="spacer" />
+        <div className="run-summary">
+          <span className="runtime-status-stack">
+            <span className="runtime-status-row" title={runtime.error ?? runtime.status}>
+            <i className={`status-dot${busy || runtime.status === "starting" ? " busy" : ""}${runtime.status === "error" ? " error" : ""}`} />
+              <span>运行时</span>
+              <b>{runtime.error ? "异常" : busy ? `运行中 ${runtime.active}/${runtime.concurrency}` : runtime.status}</b>
+            </span>
+            {competition ? (
+              <span
+                className="runtime-status-row"
+                title={
+                  competition.autopilot?.enabled
+                    ? `${competition.autopilot.syncing ? "正在同步赛题" : "无人值守运行中"}｜线上容器 ${competition.usage.remote}/${competition.settings.remoteSlots}`
+                    : "无人值守未启动"
+                }
+              >
+              <RefreshCw size={12} className={competition.autopilot?.syncing ? "spin" : undefined} />
+                <span>{competition.autopilot?.enabled ? competition.autopilot.syncing ? "正在同步" : "自动运行" : "自动待机"}</span>
+                <small>容器 {competition.usage.remote}/{competition.settings.remoteSlots}</small>
+              </span>
+            ) : null}
+          </span>
+          <button
+            type="button"
+            className={`pending-pill${pendingRows.length ? "" : " zero"}`}
+            onClick={copyPending}
+            title="复制全部待确认 flag"
+          >
+            <b>{pendingRows.length}</b>
+            <span>待确认</span>
+          </button>
+        </div>
         {busy ? (
           <button type="button" className="btn btn-dark-utility" onClick={halt}>
             <Square size={12} /> 停止
           </button>
         ) : (
           <button type="button" className="btn btn-primary" onClick={runAll}>
-            <Play size={12} /> 运行可做题
+            <Play size={12} /> 开始比赛
           </button>
         )}
         <button type="button" className="btn btn-dark-utility" onClick={() => openDialog("settings")} title="运行参数会独立保存">

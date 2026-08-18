@@ -1,7 +1,7 @@
 import { lstat, readFile } from "node:fs/promises"
 import path from "node:path"
 import { submitCandidate } from "./candidate-submission.ts"
-import { normalizeChallengeCategory, type Challenge } from "./challenge.ts"
+import { normalizeChallengeCategory, updateChallengeRemote, type Challenge } from "./challenge.ts"
 import {
   addConsultationUsage,
   allocateConsultationBudgets,
@@ -53,10 +53,29 @@ import {
   selectReviewer,
 } from "./orchestration/second-opinion.ts"
 import {
-  PlatformAdapterRegistry,
-  type FlagSubmissionResult,
-} from "./platform-adapter.ts"
-import { configuredPlatformAdapterRegistry } from "./http-platform-adapter.ts"
+  canStart,
+  challengeBudgetMs,
+  DEFAULT_COMPETITION_SETTINGS,
+  decideGiveUp,
+  matchClock,
+  normalizeCompetitionSettings,
+  priorityOf,
+  slotKindFor,
+  type CompetitionSettings,
+  type SlotUsage,
+} from "./competition/policy.ts"
+import { EnvironmentPool, type EnvironmentLease } from "./competition/environments.ts"
+import {
+  gateSubmission,
+  loadSubmissionLedger,
+  recordAttempt,
+  saveSubmissionLedger,
+} from "./competition/submissions.ts"
+import { loadCompetitionAdapter } from "./competition/adapter.ts"
+import {
+  MAX_SUBMISSIONS_PER_CHALLENGE,
+  XIHULUNJIAN_ADAPTER_ID,
+} from "./xihulunjian-platform-adapter.ts"
 import {
   BOOM_CONTEXT_LIMIT,
   loadProviderStore,
@@ -68,6 +87,7 @@ import {
   type ManagedModelConfig,
   type ManagedProviderConfig,
   type ManagedProviderDriver,
+  type ProviderStore,
 } from "./provider-config.ts"
 import {
   loadMcpStore,
@@ -84,8 +104,10 @@ import { importOpenCodeCredentials } from "./runtime/credential-store.ts"
 import type {
   RuntimeHandle,
   RuntimeLauncher,
+  RuntimeAuthMethod,
   RuntimeMessage,
   RuntimeMcpStatus,
+  RuntimeProviderCatalog,
 } from "./runtime-contract.ts"
 import { runChallenge, type Limits, type Outcome, type RunEvent } from "./session.ts"
 import {
@@ -104,6 +126,7 @@ export type ModelInfo = {
   id: string
   name: string
   connected: boolean
+  attachment?: boolean
 }
 
 export type ProviderSummary = {
@@ -129,6 +152,20 @@ export type ProviderDetails = ProviderSummary & {
   baseURL?: string
   driver?: ManagedProviderDriver
   models: ProviderModelInfo[]
+}
+
+type ProviderSnapshot = {
+  listed: RuntimeProviderCatalog
+  authentication: Record<string, RuntimeAuthMethod[]>
+  store: ProviderStore
+}
+
+export type ProviderSaveOptions = {
+  /**
+   * Apply the saved provider definition to the live compatibility runtime immediately.
+   * Omitting this option preserves the historical eager-apply behavior for non-GUI callers.
+   */
+  apply?: boolean
 }
 
 export type McpServerDetails = ManagedMcpServer & {
@@ -169,6 +206,8 @@ export type EnqueueRunsInput = {
   /** Existing task workspace to continue, keyed by challenge slug. */
   workspaces?: Record<string, string>
   modelPolicy?: ModelPolicy
+  /** Optional image-capable model for on-demand inspection by a text-only solver. */
+  visionModel?: string
   /** Shared second-opinion model pool; empty or absent means no blind review is possible. */
   consultModels?: string[]
   /** Defaults to true: review a candidate automatically when the pool allows it. */
@@ -198,6 +237,26 @@ export type EnqueueRunsInput = {
 type AutonomyBaseline = {
   billableTokens: number
   activeSolveMs: number
+}
+
+type FlagSubmissionResult = {
+  adapter: string
+  verdict: "accepted" | "rejected" | "pending"
+  detail: string
+  submittedAt: string
+}
+
+type TestPlatformAdapters = {
+  submitFlagWithRetry(
+    input: {
+      root: string
+      challenge: Challenge
+      workspace: Workspace
+      candidate: string
+      signal?: AbortSignal
+    },
+    options?: { attempts?: number; retryDelayMs?: number },
+  ): Promise<FlagSubmissionResult>
 }
 
 type Job = {
@@ -264,6 +323,21 @@ type Job = {
   resumeSessionID?: string
   handoffHistory?: RuntimeMessage[]
   handoffWarning?: string
+  /** Why this queued job was passed over, surfaced so a waiting challenge is never silently stuck. */
+  admissionHold?: string
+  /** Remote environment lease held for this job, released when it finishes. */
+  environmentLease?: EnvironmentLease
+}
+
+/** Platform points recorded when the challenge was synchronized, used for scheduling order. */
+function challengeScore(challenge: Challenge) {
+  const value = challenge.platform?.options?.score
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
 }
 
 type ModelSwitchRequest = {
@@ -308,9 +382,12 @@ export type ManualConsultationSchedule = {
 export type LiveModelSettings = {
   economyModel: string
   strongModel: string
+  visionModel?: string
   consultModels: string[]
   blindReview: boolean
   consultOnCompaction: boolean
+  /** Host-wide network switch; changing it regenerates the runtime so sandboxes and permissions follow. */
+  network: "allow" | "deny"
 }
 
 export type LiveSwitchResult = {
@@ -320,18 +397,31 @@ export type LiveSwitchResult = {
 }
 
 const FALLBACK_MODELS: ModelInfo[] = [
-  { id: "free/deepseek-v4-flash-free", name: "DeepSeek V4 Flash (free)", connected: true },
+  { id: "free/deepseek-v4-flash-free", name: "DeepSeek V4 Flash (free)", connected: true, attachment: false },
 ]
 
 const RUN_RECOVERY_ATTEMPTS = 2
 const REMOTE_URL_MISSING = "missing remote URL"
 
-function remoteURLBlockedDetail(continuation: boolean) {
-  return continuation
-    ? `${REMOTE_URL_MISSING}: 该题需要远程服务，但尚未填写服务地址；本轮不会启动解题模型，请填写 URL 后再继续。`
-    : `${REMOTE_URL_MISSING}: 本地分析已完成，但尚未填写服务地址；请填写 URL 后再继续。`
-}
+/**
+ * A challenge waiting for one of the three scarce environments still gets a local-first turn.
+ *
+ * In the competition build this is real work rather than triage: reversing the binary and developing
+ * an exploit offline is exactly what keeps the environment slots turning over quickly, so the budget
+ * is larger than the general-purpose build's "wait for a human URL" pass.
+ */
+const LOCAL_FIRST_TURN_TOKENS = 120_000
+const LOCAL_FIRST_TURN_TIMEOUT_MS = 12 * 60_000
 
+/** A confirmed flag frees the target; its offline report gets a small fresh budget. */
+const WRITEUP_TURN_TOKENS = 24_000
+const WRITEUP_TURN_TIMEOUT_MS = 5 * 60_000
+
+/**
+ * Legacy manual-URL block detection. The competition build provisions environments automatically, so
+ * nothing produces this stop any more; it is still recognized so a task carried over from a run made
+ * by the general-purpose build keeps its existing follow-up behavior.
+ */
 function isRemoteURLBlocked(outcome: Pick<Outcome, "stop" | "detail">) {
   return outcome.stop === "blocked" && outcome.detail?.includes(REMOTE_URL_MISSING) === true
 }
@@ -344,7 +434,7 @@ export function recoverableRunOutcome(
   const detail = outcome.detail ?? ""
   if (
     outcome.stop === "stalled" &&
-    /(?:repeated the same|degenerate text repetition|output ceiling exceeded)/i.test(detail)
+    /(?:repeated the same|degenerate text repetition|output ceiling exceeded|note-gate)/i.test(detail)
   ) return true
   if (outcome.stop !== "error") return false
   if (["unknown", "empty", "length", "content-filter", "cancelled"].includes(outcome.finish ?? "")) return true
@@ -360,21 +450,23 @@ function recoveryHint(
   attempt: number,
 ) {
   const action = outcome.stop === "stalled"
-    ? "上一轮触发了防循环保护。跳过导致循环的调用或输出方式，不要重复相同动作。"
+    ? /note-gate/i.test(outcome.detail ?? "")
+      ? "The previous turn ended after repeated tool calls with no durable record. This turn, first call ctf-note kind=checkpoint to write the current goal, facts, assumptions, ruled-out directions, and next step into NOTES.md, then continue solving."
+      : "The previous turn tripped the anti-loop guard. Skip the call or output pattern that caused the loop; do not repeat the same action."
     : outcome.stop === "silent"
-      ? "上一轮 Provider 长时间无响应，现已使用新会话恢复。"
-      : "上一轮遇到可恢复的 Provider/运行时异常，现已使用新会话恢复。"
+      ? "The previous turn's provider was unresponsive for a long time; a fresh session was used to resume."
+      : "The previous turn hit a recoverable provider/runtime error; a fresh session was used to resume."
   const summary = outcome.recoveryContext?.summary.trim()
   const snapshot = summary
-    ? "以下是停滞前自动导出的活动上下文快照（含工具调用与关键结果，已截断）：\n\n" + summary
+    ? "Activity-context snapshot auto-exported before the stall (tool calls and key results, truncated):\n\n" + summary
     : outcome.recoveryContext?.contextWarning
-      ? `停滞前尝试导出活动上下文失败：${outcome.recoveryContext.contextWarning}`
+      ? `Failed to export activity context before the stall: ${outcome.recoveryContext.contextWarning}`
       : ""
   return [
     action,
-    `这是第 ${attempt}/${RUN_RECOVERY_ATTEMPTS} 次自动恢复；work/ 与 NOTES.md 中的已有成果保持不变。`,
-    outcome.detail ? `原停止原因：${outcome.detail}` : "",
-    "先检查持久状态，从最后一个未完成步骤继续；不要从头重做。",
+    `This is recovery attempt ${attempt}/${RUN_RECOVERY_ATTEMPTS}; prior results in work/ and NOTES.md are unchanged.`,
+    outcome.detail ? `Original stop reason: ${outcome.detail}` : "",
+    "Check the durable state first and continue from the last incomplete step; do not redo from scratch.",
     snapshot,
   ].filter(Boolean).join("\n")
 }
@@ -496,12 +588,39 @@ async function finalWriteupReady(directory: string, acceptedFlag: string) {
   return text.includes(acceptedFlag) && text.trim().length >= acceptedFlag.length + 40
 }
 
+function writeupLimits(job: Pick<Job, "limits">): Limits {
+  return {
+    ...job.limits,
+    // The runtime cannot reliably complete even a tiny turn below this floor.  It is independent
+    // of a solve budget that may have been consumed exactly when the flag was accepted.
+    ...(job.limits.tokens === undefined
+      ? {}
+      : { tokens: Math.max(1_000, Math.min(job.limits.tokens, WRITEUP_TURN_TOKENS)) }),
+    timeout: Math.min(job.limits.timeout, WRITEUP_TURN_TIMEOUT_MS),
+  }
+}
+
 function asResult(job: Job, outcome: Outcome, finishedAt: number) {
   const totals = job.task ? taskTotals(job.task) : {
     tokens: outcome.tokens,
     billableTokens: outcome.billable,
     cost: outcome.cost,
   }
+  // A writeup is a later turn in the same task. Keep the already accepted candidate and platform
+  // verdict visible in result.json rather than making the final report look like it has no answer.
+  const accepted = job.task?.acceptedFlag
+  const candidates = outcome.candidates.length > 0
+    ? outcome.candidates
+    : accepted ? [accepted.value] : []
+  const primaryCandidate = outcome.primaryCandidate ?? accepted?.value
+  const platformSubmission = job.platformSubmission ?? (accepted
+    ? {
+        adapter: accepted.source,
+        verdict: "accepted" as const,
+        detail: accepted.detail,
+        submittedAt: accepted.acceptedAt,
+      }
+    : undefined)
   return {
     slug: job.challenge.slug,
     run_id: job.workspace!.runID,
@@ -518,18 +637,18 @@ function asResult(job: Job, outcome: Outcome, finishedAt: number) {
     tokens: totals.tokens,
     billable_tokens: totals.billableTokens,
     cost: totals.cost,
-    candidates: outcome.candidates,
-    primary_candidate: outcome.primaryCandidate,
+    candidates,
+    primary_candidate: primaryCandidate,
     alternatives: outcome.alternatives ?? [],
     candidate_source: outcome.candidateSource,
     verification: outcome.verification,
-    platform_submission: job.platformSubmission === undefined
+    platform_submission: platformSubmission === undefined
       ? undefined
       : {
-          adapter: job.platformSubmission.adapter,
-          verdict: job.platformSubmission.verdict,
-          detail: job.platformSubmission.detail,
-          submitted_at: job.platformSubmission.submittedAt,
+          adapter: platformSubmission.adapter,
+          verdict: platformSubmission.verdict,
+          detail: platformSubmission.detail,
+          submitted_at: platformSubmission.submittedAt,
         },
     flag_format: job.flagFormat,
     started_at: new Date(job.startedAt!).toISOString(),
@@ -537,7 +656,8 @@ function asResult(job: Job, outcome: Outcome, finishedAt: number) {
     duration_ms: Math.max(0, finishedAt - job.startedAt!),
     last_tool: job.lastTool,
     limits: {
-      tokens: job.limits.tokens,
+      // null is deliberate JSON: it distinguishes an unlimited run from an omitted legacy field.
+      tokens: job.limits.tokens ?? null,
       repeats: job.limits.repeats,
       timeout_ms: job.limits.timeout,
     },
@@ -599,16 +719,34 @@ export class GuiRunner {
   private runtimePromise?: Promise<RuntimeHandle>
   private retiredRuntimes = new Set<RuntimeHandle>()
   private launchRuntime: RuntimeLauncher
+  /** Host-wide network switch applied to the runtime and its tool sandboxes. */
+  private network: "allow" | "deny" = "allow"
   /** Last applied economy/strong policy; resolved into tier-declared agent resources on launch. */
   private runtimeModelPolicy?: ModelPolicy
-  private platformAdapters: PlatformAdapterRegistry
+  /** Present only when the selected solver is text-only and a vision model is configured. */
+  private runtimeVisionModel?: string
+  /** Optional legacy injection retained for isolated runner tests; the product has no generic adapter path. */
+  private testPlatformAdapters?: TestPlatformAdapters
   private runtimeStatus: RuntimeState["status"] = "starting"
   private runtimeError?: string
   private models: ModelInfo[] = FALLBACK_MODELS
+  /**
+   * A dialog list request is immediately followed by a details request. Share that snapshot for a
+   * very short window so opening Provider settings does not issue the same two RPCs twice.
+   */
+  private providerSnapshotCache?: { expiresAt: number; value: ProviderSnapshot }
+  private providerSnapshotRequest?: { generation: number; value: Promise<ProviderSnapshot> }
+  private providerSnapshotGeneration = 0
   private queue: Job[] = []
   private active = new Map<string, Job>()
   private executions = new Set<Promise<void>>()
   private concurrency = 1
+  /**
+   * Competition scheduling state. The platform allows only three challenge environments at once and
+   * the match is short, so admission is resource-aware rather than a single global concurrency cap.
+   */
+  private competition: CompetitionSettings = DEFAULT_COMPETITION_SETTINGS
+  private environments?: EnvironmentPool
   private listeners = new Set<(notification: RunnerNotification) => void>()
   private closed = false
   private platformSubmissionRetryDelayMs: number
@@ -618,13 +756,14 @@ export class GuiRunner {
     // Boom owns Provider credentials; the compatibility adapter may reuse OpenCode's built-in
     // model catalog. Native remains available only through an injected launcher in protocol tests.
     launchRuntime: RuntimeLauncher = startOpenCodeRuntime,
-    platformAdapters: PlatformAdapterRegistry = configuredPlatformAdapterRegistry(),
-    options: { platformSubmissionRetryDelayMs?: number } = {},
+    platformAdapters?: TestPlatformAdapters,
+    options: { platformSubmissionRetryDelayMs?: number; network?: "allow" | "deny" } = {},
   ) {
     this.root = root
     this.launchRuntime = launchRuntime
-    this.platformAdapters = platformAdapters
+    this.testPlatformAdapters = platformAdapters
     this.platformSubmissionRetryDelayMs = options.platformSubmissionRetryDelayMs ?? 5_000
+    this.network = options.network ?? "allow"
   }
 
   getRoot() {
@@ -648,6 +787,328 @@ export class GuiRunner {
     })
     this.pump()
     return concurrency
+  }
+
+  /** Apply competition scheduling settings. Safe to call while work is in flight. */
+  setCompetitionSettings(value: unknown) {
+    this.competition = normalizeCompetitionSettings(value, this.competition)
+    this.environmentPool().setCapacity(this.competition.remoteSlots)
+    this.notify({
+      at: Date.now(),
+      type: "competition.settings.changed",
+      detail: JSON.stringify(this.competition),
+    })
+    this.pump()
+    return this.competition
+  }
+
+  getCompetitionSettings() {
+    return this.competition
+  }
+
+  /**
+   * Environment leases, created lazily so a runner without a competition adapter never allocates one.
+   * Recovery goes through the configured platform adapter; a failure frees the local slot anyway
+   * because holding it after losing track of the remote state would strand it for the whole match.
+   */
+  private environmentPool() {
+    if (!this.environments) {
+      this.environments = new EnvironmentPool(
+        this.competition.remoteSlots,
+        async (exerciseId) => {
+          const adapter = await this.competitionAdapter()
+          if (adapter) await adapter.recoverEnvironment(exerciseId)
+        },
+      )
+    }
+    return this.environments
+  }
+
+  /** The fixed 西湖论剑 adapter, when an AccessKey is configured. */
+  private async competitionAdapter() {
+    const adapter = await loadCompetitionAdapter()
+    return adapter
+  }
+
+  /**
+   * Candidate submission is deliberately single-platform in the product build. A supplied adapter
+   * is accepted only as a test fixture so the runner's verdict state machine can remain unit-tested
+   * without making a live 西湖论剑 request.
+   */
+  private async submitCandidateToPlatform(input: {
+    challenge: Challenge
+    workspace: Workspace
+    candidate: string
+    signal?: AbortSignal
+  }): Promise<FlagSubmissionResult> {
+    if (input.challenge.platform?.adapter === XIHULUNJIAN_ADAPTER_ID) {
+      const adapter = await this.competitionAdapter().catch(() => undefined)
+      if (!adapter) {
+        return {
+          adapter: XIHULUNJIAN_ADAPTER_ID,
+          verdict: "pending",
+          detail: "西湖论剑 AccessKey 未配置；等待人工确认",
+          submittedAt: new Date().toISOString(),
+        }
+      }
+      let last: FlagSubmissionResult | undefined
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        if (attempt > 1) await new Promise<void>((resolve) => setTimeout(resolve, this.platformSubmissionRetryDelayMs))
+        if (input.signal?.aborted) break
+        try {
+          const result = await adapter.submitFlag(input)
+          last = result
+          if (result.verdict !== "pending" || attempt === 2) return result
+        } catch (error) {
+          if (attempt === 2) {
+            return {
+              adapter: XIHULUNJIAN_ADAPTER_ID,
+              verdict: "pending",
+              detail: `西湖论剑提交失败；等待人工确认：${errorText(error)}`,
+              submittedAt: new Date().toISOString(),
+            }
+          }
+        }
+      }
+      return last ?? {
+        adapter: XIHULUNJIAN_ADAPTER_ID,
+        verdict: "pending",
+        detail: "自动提交已取消；等待人工确认",
+        submittedAt: new Date().toISOString(),
+      }
+    }
+
+    // Kept unreachable in normal product setup: no UI, API route, or CLI command can configure a
+    // generic adapter. It only supports the repository's injected unit-test fakes.
+    if (this.testPlatformAdapters)
+      return this.testPlatformAdapters.submitFlagWithRetry({ root: this.root, ...input }, {
+        retryDelayMs: this.platformSubmissionRetryDelayMs,
+      })
+    return {
+      adapter: "manual",
+      verdict: "pending",
+      detail: "未配置西湖论剑题目；等待人工确认",
+      submittedAt: new Date().toISOString(),
+    }
+  }
+
+  getCompetitionState() {
+    const clock = matchClock(this.competition, Date.now())
+    const pool = this.environmentPool()
+    return {
+      settings: this.competition,
+      clock,
+      environments: {
+        used: pool.size,
+        limit: pool.limit,
+        leases: pool.active().map((lease) => ({
+          slug: lease.slug,
+          exerciseId: lease.exerciseId,
+          ...(lease.remote ? { remote: lease.remote } : {}),
+          ...(lease.expireTime === undefined ? {} : { expireTime: lease.expireTime }),
+        })),
+      },
+      usage: this.slotUsage(),
+    }
+  }
+
+  /**
+   * Bring up this challenge's environment if it needs one, taking a lease from the scarce pool.
+   *
+   * Never throws: a platform outage or a stuck environment must not fail the challenge outright,
+   * because the solver can still make offline progress. The returned detail explains what happened so
+   * it can be recorded and surfaced.
+   */
+  private async provisionEnvironment(job: Job): Promise<{ remote?: string; detail?: string }> {
+    if (job.purpose !== "solve") return {}
+    if (slotKindFor(job.challenge) !== "remote") return {}
+    const exerciseId = job.challenge.platform?.challengeID
+    if (!exerciseId) return {}
+    const adapter = await this.competitionAdapter().catch(() => undefined)
+    if (!adapter) return {}
+
+    const pool = this.environmentPool()
+    // A live, unexpired lease is reused as-is; re-provisioning would waste match time.
+    const existing = pool.held(job.challenge.slug)
+    if (existing?.remote && !pool.expired(job.challenge.slug)) {
+      job.environmentLease = existing
+      return { remote: existing.remote }
+    }
+    // An expired lease must be recovered before a new one is requested, or the slot leaks.
+    if (existing && pool.expired(job.challenge.slug)) {
+      const released = await pool.release(job.challenge.slug)
+      if (released.error)
+        this.recordEvent(job, {
+          at: Date.now(),
+          type: "status",
+          status: "environment.recover.failed",
+          text: released.error.message,
+        })
+    }
+
+    const lease = pool.acquire(job.challenge.slug, exerciseId)
+    if (!lease)
+      return { detail: `线上环境已占满 ${pool.size}/${pool.limit}，本轮先做本地分析` }
+    job.environmentLease = lease
+    this.recordEvent(job, {
+      at: Date.now(),
+      type: "status",
+      status: "environment.starting",
+      text: `申请靶机环境（${pool.size}/${pool.limit} 占用）`,
+    })
+    try {
+      const detail = await adapter.ensureEnvironment(exerciseId, { signal: job.controller.signal })
+      const remote = detail.endpoint?.remote
+      pool.update(job.challenge.slug, {
+        ...(remote ? { remote } : {}),
+        ...(detail.endpoint?.expireTime === undefined
+          ? {}
+          : { expireTime: detail.endpoint.expireTime }),
+      })
+      if (!remote) {
+        await pool.release(job.challenge.slug)
+        delete job.environmentLease
+        return { detail: "平台未返回可用的靶机地址，本轮先做本地分析" }
+      }
+      // Persist so a later turn and the GUI both see the address.
+      await updateChallengeRemote(job.challenge, remote).catch(() => {})
+      this.recordEvent(job, {
+        at: Date.now(),
+        type: "status",
+        status: "environment.ready",
+        text: `靶机地址 ${remote}${
+          detail.endpoint?.expireTime
+            ? `，过期时间 ${new Date(detail.endpoint.expireTime).toISOString()}`
+            : ""
+        }`,
+      })
+      return { remote }
+    } catch (error) {
+      // Free the slot: a failed start must not hold one of three environments hostage.
+      await pool.release(job.challenge.slug)
+      delete job.environmentLease
+      const message = errorText(error)
+      this.recordEvent(job, {
+        at: Date.now(),
+        type: "status",
+        status: "environment.start.failed",
+        text: message,
+      })
+      return { detail: `靶机环境启动失败，本轮先做本地分析：${message}` }
+    }
+  }
+
+  /**
+   * Whether the competition clock says to stop solving this challenge, and why.
+   *
+   * Returns undefined while the challenge is still worth pursuing. A challenge holding a candidate is
+   * never stopped here, because submitting is cheap and a wrong flag costs no time in this competition.
+   */
+  private competitionStop(job: Job) {
+    if (!job.task) return undefined
+    const activeMs = activeSolveTimeMs(job.task.turns)
+    const hasCandidate = Boolean(
+      job.task.acceptedFlag ??
+        job.task.turns.some((turn) => turn.candidates.length > 0),
+    )
+    const decision = decideGiveUp({
+      challenge: job.challenge,
+      settings: this.competition,
+      activeMs,
+      hasCandidate,
+      // Progress bookkeeping lives in the autonomy state; turns without candidates are the signal
+      // available here without another disk read on the scheduling path.
+      yieldsWithoutProgress: 0,
+      now: Date.now(),
+    })
+    return decision.action === "give-up" ? decision.reason : undefined
+  }
+
+  /**
+   * Give back this job's environment.
+   *
+   * A challenge keeps its environment while a follow-up turn for the same challenge is already queued
+   * (the common local-first -> remote-solve transition), because recovering and re-provisioning would
+   * waste both match time and a slot handoff. Anything else releases immediately.
+   */
+  private async releaseEnvironmentFor(job: Job) {
+    if (!job.environmentLease) return
+    const pool = this.environmentPool()
+    // A writeup is offline: do not keep a scarce target alive merely to document a solved task.
+    const stillNeeded = this.queue.some((queued) =>
+      queued.challenge.slug === job.challenge.slug && queued.purpose === "solve",
+    )
+    if (stillNeeded) return
+    const result = await pool.release(job.challenge.slug)
+    if (result.error) {
+      this.notify({
+        at: Date.now(),
+        type: "environment.recover.failed",
+        slug: job.challenge.slug,
+        detail: result.error.message,
+      })
+    } else if (result.released) {
+      this.notify({
+        at: Date.now(),
+        type: "environment.recovered",
+        slug: job.challenge.slug,
+        detail: `已回收靶机环境（${pool.size}/${pool.limit} 占用）`,
+      })
+    }
+    delete job.environmentLease
+  }
+
+  /**
+   * Stop only work that could use a remote target, then recover every lease owned by this runner.
+   * Local analysis and an already-offline writeup are deliberately left alone.
+   */
+  async closeAllEnvironments() {
+    const pool = this.environmentPool()
+    const leases = pool.active()
+    const remoteJob = (job: Job) => job.purpose === "solve" && slotKindFor(job.challenge) === "remote"
+    let stopped = 0
+
+    const retained: Job[] = []
+    for (const job of this.queue) {
+      if (!remoteJob(job)) {
+        retained.push(job)
+        continue
+      }
+      job.controller.abort()
+      stopped += 1
+      this.notify({ at: Date.now(), type: "run.aborted", slug: job.challenge.slug, runID: job.queueID })
+    }
+    this.queue = retained
+
+    for (const job of this.active.values()) {
+      if (!remoteJob(job)) continue
+      job.controller.abort()
+      stopped += 1
+    }
+
+    const errors = await pool.releaseAll()
+    for (const job of this.active.values()) delete job.environmentLease
+    const detail = errors.length === 0
+      ? `已关闭 ${leases.length} 个靶机环境，停止 ${stopped} 个远程任务`
+      : `已请求关闭 ${leases.length} 个靶机环境；${errors.length} 个回收请求失败`
+    this.notify({ at: Date.now(), type: "environments.closed", detail })
+    this.pump()
+    return {
+      stopped,
+      released: leases.length,
+      errors: errors.map((error) => error.message),
+    }
+  }
+
+  /** How many local and remote slots the currently active jobs occupy. */
+  private slotUsage(): SlotUsage {
+    let local = 0
+    let remote = 0
+    for (const job of this.active.values()) {
+      if (job.purpose === "solve" && slotKindFor(job.challenge) === "remote") remote += 1
+      else local += 1
+    }
+    return { local, remote }
   }
 
   hasWork() {
@@ -720,7 +1181,11 @@ export class GuiRunner {
     this.runtimeStatus = "starting"
     this.runtimeError = undefined
     this.notify({ at: Date.now(), type: "runtime.starting" })
-    this.runtimePromise = this.launchRuntime({ models: this.runtimeModelPolicy })
+    this.runtimePromise = this.launchRuntime({
+      models: this.runtimeModelPolicy,
+      ...(this.runtimeVisionModel ? { visionModel: this.runtimeVisionModel } : {}),
+      network: this.network,
+    })
       .then(async (started) => {
         if (this.closed) {
           await started.close()
@@ -748,18 +1213,25 @@ export class GuiRunner {
 
   private async refreshModels() {
     if (!this.runtime?.provider) return
-    const catalog = await this.runtime.provider.listProviders()
+    const [catalog, store] = await Promise.all([
+      this.runtime.provider.listProviders(),
+      loadProviderStore(),
+    ])
     const connected = new Set(catalog.connected)
     const models: ModelInfo[] = []
     for (const provider of catalog.all) {
       // The provider manager exposes the full catalog. The run settings remain intentionally small:
       // only providers that the active runtime reports ready are selectable for an actual task.
       if (!connected.has(provider.id)) continue
+      const configured = new Map(
+        (store.providers[provider.id]?.models ?? []).map((model) => [model.id, model]),
+      )
       for (const model of Object.values(provider.models)) {
         models.push({
           id: publicRuntimeModel(provider.id, model.id),
           name: `${provider.name} · ${model.name}`,
           connected: true,
+          attachment: configured.get(model.id)?.attachment ?? model.attachment,
         })
       }
     }
@@ -845,14 +1317,36 @@ export class GuiRunner {
     this.notify({ at: Date.now(), type: "mcp.changed" })
   }
 
-  private async providerSnapshot() {
-    const runtime = await this.providerRuntime()
-    const [listed, authentication, store] = await Promise.all([
-      runtime.listProviders(),
-      runtime.listProviderAuth(),
-      loadProviderStore(),
-    ])
-    return { listed, authentication, store }
+  private async providerSnapshot(): Promise<ProviderSnapshot> {
+    const now = Date.now()
+    if (this.providerSnapshotCache && this.providerSnapshotCache.expiresAt > now)
+      return this.providerSnapshotCache.value
+
+    const generation = this.providerSnapshotGeneration
+    const pending = this.providerSnapshotRequest
+    if (pending?.generation === generation) return pending.value
+
+    const value = (async () => {
+      const runtime = await this.providerRuntime()
+      const [listed, authentication, store] = await Promise.all([
+        runtime.listProviders(),
+        runtime.listProviderAuth(),
+        loadProviderStore(),
+      ])
+      const snapshot = { listed, authentication, store }
+      // A dialog loads the Provider list and then its selected Provider. Coalesce those duplicate
+      // runtime RPCs, while keeping the cache short-lived and invalidating it on every mutation.
+      if (generation === this.providerSnapshotGeneration)
+        this.providerSnapshotCache = { value: snapshot, expiresAt: Date.now() + 1_500 }
+      return snapshot
+    })()
+    this.providerSnapshotRequest = { generation, value }
+    try {
+      return await value
+    } finally {
+      if (this.providerSnapshotRequest?.value === value)
+        this.providerSnapshotRequest = undefined
+    }
   }
 
   async getProviders(): Promise<ProviderSummary[]> {
@@ -913,33 +1407,47 @@ export class GuiRunner {
       Object.values(catalog?.models ?? {}).map((item) => [item.id, item]),
     )
     const managedModels = new Map(
-      (managed?.models ?? []).map((item) => [item.id, item]),
+      (managed?.models ?? []).map((item) => [item.catalogID ?? item.id, item]),
     )
-    const models: ProviderModelInfo[] = [
-      ...[...catalogModels.values()].map((item) => ({
-        id: item.id,
-        name: managedModels.get(item.id)?.name ?? item.name,
+    const renamedCatalogIDs = new Set(
+      (managed?.models ?? [])
+        .filter((item) => item.catalogID && item.catalogID !== item.id)
+        .map((item) => item.id),
+    )
+    const modelsByID = new Map<string, ProviderModelInfo>()
+    for (const item of catalogModels.values()) {
+      // A renamed catalog model is rendered once using its saved ID, instead of also exposing the
+      // runtime's original catalog entry as a duplicate.
+      if (renamedCatalogIDs.has(item.id) && !managedModels.has(item.id)) continue
+      const configured = managedModels.get(item.id)
+      const id = configured?.id ?? item.id
+      modelsByID.set(id, {
+        id,
+        ...(configured ? { catalogID: item.id } : {}),
+        name: configured?.name ?? item.name,
         context: BOOM_CONTEXT_LIMIT,
-        output: managedModels.get(item.id)?.output ?? item.limit.output,
-        reasoning: managedModels.get(item.id)?.reasoning ?? item.reasoning,
-        attachment: managedModels.get(item.id)?.attachment ?? item.attachment,
-        ...(managedModels.get(item.id)?.pricing ?? item.pricing
-          ? { pricing: managedModels.get(item.id)?.pricing ?? item.pricing }
+        output: configured?.output ?? item.limit.output,
+        reasoning: configured?.reasoning ?? item.reasoning,
+        attachment: configured?.attachment ?? item.attachment,
+        ...(configured?.pricing ?? item.pricing
+          ? { pricing: configured?.pricing ?? item.pricing }
           : {}),
-        ...(managedModels.get(item.id)?.armorPrompt
-          ? { armorPrompt: managedModels.get(item.id)?.armorPrompt }
+        ...(configured?.armorPrompt
+          ? { armorPrompt: configured.armorPrompt }
           : {}),
+        enabled: !hidden.has(id),
+        source: "catalog",
+      })
+    }
+    for (const item of managed?.models ?? []) {
+      if (catalogModels.has(item.catalogID ?? item.id)) continue
+      modelsByID.set(item.id, {
+        ...item,
         enabled: !hidden.has(item.id),
-        source: "catalog" as const,
-      })),
-      ...(managed?.models ?? [])
-        .filter((item) => !catalogModels.has(item.id))
-        .map((item) => ({
-          ...item,
-          enabled: !hidden.has(item.id),
-          source: "custom" as const,
-        })),
-    ].sort((a, b) => a.name.localeCompare(b.name))
+        source: "custom",
+      })
+    }
+    const models = [...modelsByID.values()].sort((a, b) => a.name.localeCompare(b.name))
     const methods = authentication[providerID] ?? []
     const connected = new Set(listed.connected)
     const catalogDriver = catalog?.driver === "openai-compatible" || catalog?.driver === "openai" || catalog?.driver === "anthropic"
@@ -962,8 +1470,8 @@ export class GuiRunner {
       ...(managed?.api ?? catalog?.api
         ? { api: managed?.api ?? catalog?.api }
         : {}),
-      ...(catalog?.baseURL ?? managed?.baseURL
-        ? { baseURL: catalog?.baseURL ?? managed?.baseURL }
+      ...(managed?.baseURL ?? catalog?.baseURL
+        ? { baseURL: managed?.baseURL ?? catalog?.baseURL }
         : {}),
       ...(selectedDriver ? { driver: selectedDriver } : {}),
       models,
@@ -999,6 +1507,7 @@ export class GuiRunner {
     // boundary, then the final owner closes it.
     // A concurrent read may still be starting the first generation. Let that launch settle before
     // detaching it, otherwise its late completion could overwrite the freshly configured handle.
+    this.invalidateProviderSnapshot()
     if (!this.runtime && this.runtimePromise)
       await this.runtimePromise.catch(() => undefined)
     if (this.runtime) this.retiredRuntimes.add(this.runtime)
@@ -1010,6 +1519,11 @@ export class GuiRunner {
     } finally {
       this.closeUnusedRetiredRuntimes()
     }
+  }
+
+  private invalidateProviderSnapshot() {
+    this.providerSnapshotGeneration += 1
+    this.providerSnapshotCache = undefined
   }
 
   async getArmorPrompts(): Promise<ArmorPromptPreset[]> {
@@ -1025,12 +1539,16 @@ export class GuiRunner {
     return saved.armorPrompts
   }
 
-  async saveProvider(input: ManagedProviderConfig, apiKey?: string) {
+  async saveProvider(
+    input: ManagedProviderConfig,
+    apiKey?: string,
+    options: ProviderSaveOptions = {},
+  ): Promise<ProviderDetails | undefined> {
     const normalized = normalizeManagedProvider(input)
-    const runtime = await this.providerRuntime()
-    const listed = await runtime.listProviders()
+    // Reuse the list that populated the settings dialog rather than making another RPC solely to
+    // save a local draft. The cache is invalidated below before any subsequent read.
+    const { listed, store } = await this.providerSnapshot()
     const catalog = listed.all.find((provider) => provider.id === normalized.id)
-    const store = await loadProviderStore()
     const armorPrompts = new Set(store.armorPrompts.map((item) => item.id))
     const unknownArmorPrompt = normalized.models.find(
       (item) => item.armorPrompt && !armorPrompts.has(item.armorPrompt),
@@ -1044,19 +1562,15 @@ export class GuiRunner {
       throw new Error(`No runtime provider with ID: ${normalized.id}`)
     store.providers[normalized.id] = normalized
     await saveProviderStore(store)
-    let restarted = false
-    if (normalized.custom && !catalog) {
-      await this.restartRuntime()
-      restarted = true
-    }
+    this.invalidateProviderSnapshot()
     const secret = apiKey?.trim()
     if (secret) {
-      const credentialRuntime = await this.ensureRuntime()
-      if (!credentialRuntime.provider)
-        throw new Error(`Runtime backend ${credentialRuntime.backend} does not support provider credentials`)
-      await credentialRuntime.provider.setProviderCredential(normalized.id, secret)
+      // Credentials are stored in Boom's private credential store. They are injected into the
+      // compatibility process on its next launch, so saving a key does not itself need a restart.
+      await (await this.providerRuntime()).setProviderCredential(normalized.id, secret)
     }
-    if (!restarted) await this.restartRuntime()
+    if (options.apply === false) return undefined
+    await this.restartRuntime()
     await this.requestProviderHandoff(normalized.id, `Provider ${normalized.id} 配置已更新`)
     this.notify({ at: Date.now(), type: "providers.changed" })
     return this.getProvider(normalized.id)
@@ -1135,25 +1649,34 @@ export class GuiRunner {
     return this.models
   }
 
+  private visionModelFor(workModel: string, requested?: string) {
+    if (!requested) return undefined
+    const vision = this.models.find((model) => model.id === requested)
+    if (!vision?.connected || vision.attachment !== true)
+      throw new Error(`Vision model must be a connected image-capable model: ${requested}`)
+    const work = this.models.find((model) => model.id === workModel)
+    return work?.attachment === false ? requested : undefined
+  }
+
   private async compatibilityWarnings(model: string) {
     const [providerID, ...modelParts] = model.split("/")
     const modelID = modelParts.join("/")
     const warnings: string[] = []
     if (!this.runtime?.capabilities.toolCalls)
-      warnings.push("新 Runtime 不支持工具调用，只能使用已有上下文与文件状态")
+      warnings.push("The new runtime does not support tool calls; only existing context and file state are available")
     if (!this.runtime?.capabilities.web)
-      warnings.push("新 Runtime 不提供 Web 能力，需要改用本地工具或已有网络证据")
+      warnings.push("The new runtime has no web capability; use local tools or existing network evidence instead")
     try {
       const provider = await this.getProvider(providerID!)
       const selected = provider.models.find((item) => item.id === modelID)
       if (provider.disabled || !provider.connected)
-        warnings.push(`Provider ${providerID} 当前未连接，新轮次可能需要补充认证或权限`)
+        warnings.push(`Provider ${providerID} is not connected; the new turn may need additional auth or permissions`)
       if (!selected)
-        warnings.push(`模型 ${modelID} 未出现在 Provider ${providerID} 的当前目录中`)
+        warnings.push(`Model ${modelID} is not present in Provider ${providerID}'s current catalog`)
       else if (!selected.attachment)
-        warnings.push("新模型不支持图片附件；需要通过文件或命令行工具读取相关内容")
+        warnings.push("The new model does not support image attachments; read relevant content via files or command-line tools")
     } catch (error) {
-      warnings.push(`无法确认新 Provider 的兼容性：${errorText(error)}`)
+      warnings.push(`Could not confirm the new provider's compatibility: ${errorText(error)}`)
     }
     return [...new Set(warnings)]
   }
@@ -1194,15 +1717,22 @@ export class GuiRunner {
   }
 
   async applyLiveModelSettings(settings: LiveModelSettings): Promise<LiveSwitchResult> {
+    await this.ensureRuntime()
     const policy = { economy: settings.economyModel, strong: settings.strongModel }
+    const visionModel = this.visionModelFor(policy.strong, settings.visionModel)
     // Worker agent resources resolve their tier at runtime launch. A changed tier policy therefore
-    // needs a fresh runtime generation; active jobs re-bind it at their next safe boundary.
-    const tierPolicyChanged =
+    // needs a fresh runtime generation; active jobs re-bind it at their next safe boundary. The
+    // network switch is compile-time too: sandboxes and web-tool permissions only follow a restart.
+    const runtimePolicyChanged =
       this.runtimeModelPolicy === undefined ||
       this.runtimeModelPolicy.economy !== policy.economy ||
-      this.runtimeModelPolicy.strong !== policy.strong
-    if (tierPolicyChanged) {
+      this.runtimeModelPolicy.strong !== policy.strong ||
+      this.runtimeVisionModel !== visionModel ||
+      this.network !== settings.network
+    if (runtimePolicyChanged) {
       this.runtimeModelPolicy = policy
+      this.runtimeVisionModel = visionModel
+      this.network = settings.network
       await this.restartRuntime()
     }
     const targets = new Set<string>()
@@ -1229,7 +1759,7 @@ export class GuiRunner {
       const model = job.purpose === "writeup" ? policy.economy : policy.strong
       const modelWarnings = warningMap.get(model) ?? []
       modelWarnings.forEach((warning) => warnings.add(warning))
-      if (model === job.model && !tierPolicyChanged) {
+      if (model === job.model && !runtimePolicyChanged) {
         job.modelPolicy = policy
         job.consultModels = [...settings.consultModels]
         job.blindReview = settings.blindReview
@@ -1243,8 +1773,8 @@ export class GuiRunner {
         blindReview: settings.blindReview,
         consultOnCompaction: settings.consultOnCompaction,
         requestedAt: Date.now(),
-        reason: tierPolicyChanged && model === job.model
-          ? "用户修改了 Worker 模型档位"
+        reason: runtimePolicyChanged && model === job.model
+          ? "用户修改了运行模型或 Vision 设置"
           : "用户修改了运行模型策略",
         warnings: modelWarnings,
       })
@@ -1286,8 +1816,22 @@ export class GuiRunner {
       if (!policy.economy.includes("/") || !policy.strong.includes("/"))
         throw new Error("Model policy requires provider/model values")
     }
-    if (!this.runtimeModelPolicy && input.modelPolicy) this.runtimeModelPolicy = input.modelPolicy
+    const desiredPolicy = input.modelPolicy ?? {
+      economy: input.model,
+      strong: input.model,
+    }
+    const runtimeAlreadyStarted = this.runtime !== undefined
+    const policyChanged =
+      this.runtimeModelPolicy === undefined ||
+      this.runtimeModelPolicy.economy !== desiredPolicy.economy ||
+      this.runtimeModelPolicy.strong !== desiredPolicy.strong
+    if (policyChanged) this.runtimeModelPolicy = desiredPolicy
     await this.ensureRuntime()
+    const visionModel = this.visionModelFor(input.model, input.visionModel)
+    if ((runtimeAlreadyStarted && policyChanged) || this.runtimeVisionModel !== visionModel) {
+      this.runtimeVisionModel = visionModel
+      await this.restartRuntime()
+    }
     if (this.closed) throw new Error("GUI runner is closed")
     const seen = new Set<string>()
     for (const challenge of input.challenges) {
@@ -1448,15 +1992,63 @@ export class GuiRunner {
     return { mode: "before-start", runID: queued.queueID, model: input.solverModel }
   }
 
+  /**
+   * Pick the next admissible job.
+   *
+   * Ordering is by competition priority rather than enqueue order, so a locally solvable easy
+   * challenge is never stuck behind one waiting for a scarce environment. A job that cannot start
+   * right now (its slot class is full, or the endgame has begun) is skipped rather than blocking the
+   * queue, which is what keeps a saturated remote pool from starving local work.
+   */
+  private nextAdmissible() {
+    const now = Date.now()
+    const usage = this.slotUsage()
+    const candidates = this.queue
+      .map((job, index) => ({ job, index }))
+      .filter(({ job }) => job.controller.signal.aborted || !this.active.has(job.challenge.slug))
+    if (candidates.length === 0) return undefined
+
+    const ranked = candidates
+      .map((entry) => ({
+        ...entry,
+        priority: entry.job.controller.signal.aborted
+          ? Number.NEGATIVE_INFINITY
+          : priorityOf({
+              challenge: entry.job.challenge,
+              score: challengeScore(entry.job.challenge),
+              attempts: entry.job.task?.turns.length ?? 0,
+              progressed: entry.job.continuation ? undefined : true,
+            }, now),
+      }))
+      .sort((left, right) => left.priority - right.priority || left.index - right.index)
+
+    for (const entry of ranked) {
+      // An aborted job is drained immediately: it consumes no slot and must not linger.
+      if (entry.job.controller.signal.aborted) return entry
+      // The final report never talks to a target, so it must not wait for or consume a remote slot.
+      const kind = entry.job.purpose === "writeup" ? "local" : slotKindFor(entry.job.challenge)
+      const admission = canStart({
+        kind,
+        usage,
+        settings: this.competition,
+        // Continuations and writeups are finishing existing work, so the endgame does not block them.
+        finishing: entry.job.continuation || entry.job.purpose === "writeup",
+        now,
+      })
+      if (admission.allowed) return entry
+      entry.job.admissionHold = admission.reason
+    }
+    return undefined
+  }
+
   private pump() {
     while (!this.closed && this.active.size < this.concurrency && this.queue.length > 0) {
-      const next = this.queue.findIndex(
-        (queued) => queued.controller.signal.aborted || !this.active.has(queued.challenge.slug),
-      )
-      if (next < 0) break
-      const [job] = this.queue.splice(next, 1)
+      const chosen = this.nextAdmissible()
+      if (!chosen) break
+      const [job] = this.queue.splice(chosen.index, 1)
       if (!job) break
       if (job.controller.signal.aborted) continue
+      delete job.admissionHold
       this.active.set(job.challenge.slug, job)
       const execution = this.execute(job)
         .catch((error) => {
@@ -1478,7 +2070,10 @@ export class GuiRunner {
             runID: job.workspace?.runID,
           })
           this.closeUnusedRetiredRuntimes()
-          this.pump()
+          // Release the environment before pumping so the freed slot is visible to the next job.
+          // This runs on every terminal path, including a thrown error, which is what prevents one
+          // of the three scarce environments from leaking for the rest of the match.
+          void this.releaseEnvironmentFor(job).finally(() => this.pump())
         })
       this.executions.add(execution)
       void execution.then(
@@ -1520,15 +2115,17 @@ export class GuiRunner {
     if (!job.task) return undefined
     const totals = taskTotals(job.task)
     const baseline = job.autonomyBaseline ?? { billableTokens: 0, activeSolveMs: 0 }
-    const tokens = Math.floor(
-      job.autonomyBudget.tokens - Math.max(0, totals.billableTokens - baseline.billableTokens),
-    )
+    const tokens = job.autonomyBudget.tokens === undefined
+      ? undefined
+      : Math.floor(
+        job.autonomyBudget.tokens - Math.max(0, totals.billableTokens - baseline.billableTokens),
+      )
     const timeout = Math.floor(
       job.autonomyBudget.timeout -
         Math.max(0, activeSolveTimeMs(job.task.turns) - baseline.activeSolveMs),
     )
-    if (tokens < 1_000 || timeout < 1_000) return undefined
-    return { ...job.limits, tokens, timeout } satisfies Limits
+    if ((tokens !== undefined && tokens < 1_000) || timeout < 1_000) return undefined
+    return { ...job.limits, ...(tokens === undefined ? {} : { tokens }), timeout } satisfies Limits
   }
 
   private async handleAgentConsultationRequest(
@@ -1608,8 +2205,24 @@ export class GuiRunner {
   }) {
     const job = input.source
     if (!job.workspace || !job.task || job.controller.signal.aborted) return false
-    const limits = this.remainingAutonomyLimits(job)
+    const limits = input.purpose === "writeup"
+      ? writeupLimits(job)
+      : this.remainingAutonomyLimits(job)
     if (!limits) return false
+    // Competition time discipline: a writeup is required for scoring and always proceeds, but more
+    // solving is only worth queueing while this challenge still deserves the match clock.
+    if (input.purpose === "solve") {
+      const stop = this.competitionStop(job)
+      if (stop) {
+        this.recordEvent(job, {
+          at: Date.now(),
+          type: "status",
+          status: "competition.give-up",
+          text: stop,
+        })
+        return false
+      }
+    }
     const at = Date.now()
     const event: RunEvent = {
       at,
@@ -1633,8 +2246,15 @@ export class GuiRunner {
       blindReview: job.blindReview,
       consultOnCompaction: job.consultOnCompaction,
       executionMode: job.executionMode,
-      autonomyBudget: job.autonomyBudget,
-      autonomyBaseline: job.autonomyBaseline,
+      autonomyBudget: input.purpose === "writeup"
+        ? { tokens: limits.tokens, timeout: limits.timeout }
+        : job.autonomyBudget,
+      autonomyBaseline: input.purpose === "writeup"
+        ? {
+            billableTokens: taskTotals(job.task).billableTokens,
+            activeSolveMs: activeSolveTimeMs(job.task.turns),
+          }
+        : job.autonomyBaseline,
       autonomyEscalations: [...job.autonomyEscalations],
       ...(input.consultation
         ? {
@@ -1818,9 +2438,9 @@ export class GuiRunner {
         level: 1,
         status: "failed",
         hint: [
-          "自动停滞会诊没有取得可用结论，但任务继续。",
-          `失败原因：${errorText(error)}`,
-          "先检查 work/ 与 NOTES.md，从最后一个未完成步骤继续；不要把会诊失败当作题目完成。",
+          "The stall-triggered consultation produced no usable conclusion, but the task continues.",
+          `Failure reason: ${errorText(error)}`,
+          "Check work/ and NOTES.md first and continue from the last incomplete step; do not treat the consultation failure as the challenge being done.",
         ].join("\n"),
         tokens: 0,
         billable: 0,
@@ -1956,37 +2576,24 @@ export class GuiRunner {
           detail: "aborted by user",
         }
       } else {
+        // Competition build: an environment is provisioned automatically instead of waiting for a
+        // human to paste a URL. The lease is taken here, at solve time, so the three scarce slots are
+        // held only while a challenge is actually being worked on.
+        const provisioned = await this.provisionEnvironment(job)
+        if (provisioned.remote) challenge.remote = provisioned.remote
         const localFirstWithoutRemote =
           job.purpose === "solve" &&
           challenge.serviceRequired === true &&
           !challenge.remote?.trim()
-        const mustWaitForRemote = localFirstWithoutRemote && job.continuation
-        let canSolve = !mustWaitForRemote
-        if (mustWaitForRemote) {
-          outcome = {
-            stop: "blocked",
-            tokens: 0,
-            billable: 0,
-            cost: 0,
-            reply: "",
-            candidates: [],
-            detail: remoteURLBlockedDetail(true),
-          }
-          this.recordEvent(job, {
-            at: Date.now(),
-            type: "status",
-            status: "service.remote.blocked",
-            text: outcome.detail,
-          })
-        } else if (localFirstWithoutRemote) {
-          // A missing service address is not a scheduler prerequisite. Attachments and source often
-          // support substantial offline progress. This is the one local-first turn; once it ends,
-          // the task enters the explicit remote-address block until the user supplies an endpoint.
+        // Without an environment the solver still gets a bounded local pass: attachments and source
+        // usually carry real progress, and exploit development does not need the target yet.
+        let canSolve = true
+        if (localFirstWithoutRemote) {
           this.recordEvent(job, {
             at: Date.now(),
             type: "status",
             status: "service.remote-missing.local-first",
-            text: "未配置服务地址；本轮先进行本地分析，结束后等待用户填写 URL",
+            text: provisioned.detail ?? "暂无可用靶机环境；本轮先进行本地分析与 exp 开发",
           })
         }
         let runtime: RuntimeHandle | undefined
@@ -1998,6 +2605,15 @@ export class GuiRunner {
           job.promptVersion = runtime.promptVersion
         }
         let limits = job.limits
+        if (localFirstWithoutRemote) {
+          limits = {
+            ...limits,
+            ...(limits.tokens === undefined
+              ? {}
+              : { tokens: Math.min(limits.tokens, LOCAL_FIRST_TURN_TOKENS) }),
+            timeout: Math.min(limits.timeout, LOCAL_FIRST_TURN_TIMEOUT_MS),
+          }
+        }
         let hint = job.hint
         let preprocessingTokens = 0
         let preprocessingBillable = 0
@@ -2008,11 +2624,13 @@ export class GuiRunner {
             experts: job.consultationInput.expertModels,
             synthesizer: job.consultationInput.synthesizerModel,
           })
-          const consultationBudgets = allocateConsultationBudgets(
-            limits.tokens,
-            job.consultationInput.expertModels.length,
-            consultationWindows,
-          )
+          const consultationBudgets = limits.tokens === undefined
+            ? undefined
+            : allocateConsultationBudgets(
+              limits.tokens,
+              job.consultationInput.expertModels.length,
+              consultationWindows,
+            )
           const solverTimeout = Math.max(1, Math.floor(limits.timeout * 0.5))
           this.recordEvent(job, {
             at: Date.now(),
@@ -2056,7 +2674,7 @@ export class GuiRunner {
             })
             hint = [consultationHint(job.consultation), job.hint?.trim()]
               .filter(Boolean)
-              .join("\n\n用户追加提示：")
+              .join("\n\nUser-added hint: ")
             const remaining = remainingLimits(limits, job.consultation)
             if (!remaining) {
               canSolve = false
@@ -2072,7 +2690,9 @@ export class GuiRunner {
             } else {
               limits = {
                 ...remaining,
-                tokens: Math.min(remaining.tokens, consultationBudgets.solverTokens),
+                ...(consultationBudgets === undefined
+                  ? {}
+                  : { tokens: Math.min(remaining.tokens!, consultationBudgets.solverTokens) }),
                 timeout: Math.min(remaining.timeout, solverTimeout),
               }
             }
@@ -2100,39 +2720,38 @@ export class GuiRunner {
               text: failure,
             })
             hint = [
-              "多模型会诊没有取得任何可用专家方案；失败结果已逐份保存在 work/.boom/consultations/。",
+              "The multi-model consultation produced no usable expert plans; each failure was saved under work/.boom/consultations/.",
               job.consultationInput.resumeSessionID
-                ? "直接恢复原 solver session，沿用其中的历史与当前工作状态继续。"
-                : "启动新的 solver turn，沿用同一任务的 NOTES.md 与工作区状态继续。",
+                ? "Resume the original solver session directly, reusing its history and current work state to continue."
+                : "Start a fresh solver turn, reusing the same task's NOTES.md and workspace state to continue.",
               failure,
               job.hint?.trim(),
             ].filter(Boolean).join("\n\n")
             limits = {
               ...limits,
-              tokens: consultationBudgets.solverTokens,
+              ...(consultationBudgets === undefined ? {} : { tokens: consultationBudgets.solverTokens }),
               timeout: solverTimeout,
             }
           }
           job.consultationPhase = "complete"
         }
         if (canSolve && runtime) {
-          if (challenge.remote?.trim()) {
+          const resumeSessionID = job.resumeSessionID ?? job.consultationInput?.resumeSessionID
+          const needsFreshContinuationHandoff =
+            job.continuation && job.purpose === "solve" && !resumeSessionID
+          if (job.purpose === "solve" && challenge.remote?.trim() && !needsFreshContinuationHandoff) {
             hint = [
-              `远程服务地址：${JSON.stringify(challenge.remote.trim())}`,
+              `Remote service address: ${JSON.stringify(challenge.remote.trim())}`,
               hint,
             ].filter(Boolean).join("\n\n")
           }
           if (localFirstWithoutRemote) {
             hint = [
-              "该题标记为可能需要外部服务，但当前没有配置 URL 或 host:port。先完成附件、源码、静态分析和所有可离线验证；不要因为缺少地址而等待或立即判定失败。只有在证据表明确实必须连接服务时，才在 NOTES.md 中记录具体阻塞点、所需协议和地址类型，随后结束本轮等待用户补充地址。",
+              "This challenge needs a target environment, but no address is available yet (the online environment has a concurrency cap and is queuing). This turn, do everything that does not need the target: analyze attachments and source, reverse-engineer, build and locally self-test an exploit, and write reusable scripts and conclusions into NOTES.md. Do not wait or declare failure just because the address is missing; once the environment is allocated a later turn will do the live integration directly.",
               hint,
             ].filter(Boolean).join("\n\n")
           }
-          if (
-            job.continuation &&
-            job.purpose === "solve" &&
-            !job.consultationInput?.resumeSessionID
-          ) {
+          if (needsFreshContinuationHandoff) {
             const handoff = await buildHandoffSummary({
               directory: job.workspace.directory,
               challenge,
@@ -2156,7 +2775,7 @@ export class GuiRunner {
             hint,
             continuation: job.continuation || job.task.turns.length > 0,
             promptCapabilities: await solverPromptCapabilities(runtime, challenge.category),
-            resumeSessionID: job.resumeSessionID ?? job.consultationInput?.resumeSessionID,
+            resumeSessionID,
             handoffHistory: job.handoffHistory,
             handoffWarning: job.handoffWarning,
             handoffSignal: job.switchController.signal,
@@ -2190,22 +2809,19 @@ export class GuiRunner {
               cost: outcome.cost + preprocessingCost,
             }
         }
+        // The local-first pass is finished. In the competition build this is not a dead end waiting on
+        // a human: the challenge goes back to the queue to claim an environment slot when one frees up.
         if (
           localFirstWithoutRemote &&
-          !mustWaitForRemote &&
           outcome.stop !== "aborted" &&
-          outcome.stop !== "switched"
+          outcome.stop !== "switched" &&
+          outcome.candidates.length === 0
         ) {
-          outcome = {
-            ...outcome,
-            stop: "blocked",
-            detail: remoteURLBlockedDetail(false),
-          }
           this.recordEvent(job, {
             at: Date.now(),
             type: "status",
-            status: "service.remote.blocked",
-            text: outcome.detail,
+            status: "service.remote.queued",
+            text: "本地分析结束，等待线上环境槽位后继续联调",
           })
         }
       }
@@ -2235,17 +2851,43 @@ export class GuiRunner {
     await job.eventWrites
     if (job.task && job.turnID) {
       if (outcome.primaryCandidate && !job.controller.signal.aborted) {
-        try {
-          job.platformSubmission = await this.platformAdapters.submitFlagWithRetry(
-            {
-              root: this.root,
-              challenge: { ...job.challenge, flagFormat: job.flagFormat },
-              workspace: job.workspace!,
-              candidate: outcome.primaryCandidate,
-              signal: job.controller.signal,
-            },
-            { retryDelayMs: this.platformSubmissionRetryDelayMs },
-          )
+        // Anti-brute-force gate. The platform allows 50 submissions per challenge and forbids
+        // brute-forcing, so Boom keeps a far lower ceiling and never resends a value it already tried.
+        // The ledger is durable, so restarting mid-match cannot reset the count.
+        const ledger = await loadSubmissionLedger(this.root, job.challenge.slug).catch(() =>
+          ({ version: 1 as const, slug: job.challenge.slug, attempts: [] }))
+        const gate = gateSubmission({
+          ledger,
+          candidate: outcome.primaryCandidate,
+          maxSubmissions: MAX_SUBMISSIONS_PER_CHALLENGE,
+        })
+        if (!gate.allowed) {
+          job.platformSubmission = {
+            adapter: job.challenge.platform?.adapter ?? "manual",
+            verdict: "pending",
+            detail: `未提交：${gate.reason}`,
+            submittedAt: new Date().toISOString(),
+          }
+          this.recordEvent(job, {
+            at: Date.now(),
+            type: "status",
+            status: "candidate.submission.skipped",
+            text: gate.reason,
+          })
+        } else try {
+          job.platformSubmission = await this.submitCandidateToPlatform({
+            challenge: { ...job.challenge, flagFormat: job.flagFormat },
+            workspace: job.workspace!,
+            candidate: outcome.primaryCandidate,
+            signal: job.controller.signal,
+          })
+          // Record the attempt regardless of verdict: a pending submission still consumed quota.
+          await saveSubmissionLedger(this.root, recordAttempt(ledger, {
+            value: gate.value,
+            verdict: job.platformSubmission.verdict,
+            at: job.platformSubmission.submittedAt,
+            detail: job.platformSubmission.detail.slice(0, 500),
+          })).catch(() => {})
         } catch (error) {
           job.platformSubmission = {
             adapter: job.challenge.platform?.adapter ?? "manual",
@@ -2337,7 +2979,7 @@ export class GuiRunner {
         job.task = await rejectTaskFlag(
           job.workspace!.directory,
           outcome.primaryCandidate,
-          `${job.platformSubmission?.adapter ?? "platform"} 已判定错误`,
+          `${job.platformSubmission?.adapter ?? "platform"} judged the flag incorrect`,
         )
       }
     }
@@ -2362,37 +3004,37 @@ export class GuiRunner {
       if (limits) {
         const at = Date.now()
         const warning = request?.warnings.length
-          ? `兼容性影响：${request.warnings.join("；")}`
-          : "未发现已知兼容性降级"
+          ? `Compatibility impact: ${request.warnings.join("; ")}`
+          : "No known compatibility degradation"
         const transitionHint = request && environment
           ? [
-              `模型热切换：${job.model} -> ${request.model}。`,
-              `任务环境切换：${job.executionMode} -> ${environment.executionMode}（${environment.profileId}）。`,
+              `Model hot-swap: ${job.model} -> ${request.model}.`,
+              `Task environment switch: ${job.executionMode} -> ${environment.executionMode} (${environment.profileId}).`,
               warning,
-              "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
+              "Preserve the prior task context, work/, NOTES.md, and completed tool results; continue from the step after the boundary.",
             ].join("\n")
           : request
             ? request.model === job.model
               ? [
-                  "Worker 模型档位已更新：下一次 boom-worker / boom-worker-pro 委派将使用新的 economy/strong 模型。",
+                  "Worker model tier updated: the next boom-worker / boom-worker-pro delegation will use the new economy/strong model.",
                   warning,
-                  "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
+                  "Preserve the prior task context, work/, NOTES.md, and completed tool results; continue from the step after the boundary.",
                 ].join("\n")
               : [
-                  `模型热切换：${job.model} -> ${request.model}。`,
+                  `Model hot-swap: ${job.model} -> ${request.model}.`,
                   warning,
-                  "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
+                  "Preserve the prior task context, work/, NOTES.md, and completed tool results; continue from the step after the boundary.",
                 ].join("\n")
             : environment
               ? [
-                  "任务环境已切换，下一次会话使用新环境声明。",
-                  "保留原任务上下文、work/、NOTES.md 与已完成工具结果，从边界后的下一步继续。",
+                  "Task environment switched; the next session uses the new environment declaration.",
+                  "Preserve the prior task context, work/, NOTES.md, and completed tool results; continue from the step after the boundary.",
                 ].join("\n")
-              : "保留原任务活动上下文、work/、NOTES.md 与已完成工具结果。"
+              : "Preserve the prior task activity context, work/, NOTES.md, and completed tool results."
         const hint = manualConsultation
           ? [
-              "用户在主 agent 运行过程中发起了多模型会诊。",
-              "先基于刚刚导出的活动上下文完成会诊，再把综合计划交还主 agent 继续当前任务。",
+              "The user started a multi-model consultation while the main agent was running.",
+              "Complete the consultation from the just-exported activity context, then hand the synthesized plan back to the main agent to continue the task.",
               transitionHint,
             ].join("\n")
           : transitionHint
@@ -2483,9 +3125,9 @@ export class GuiRunner {
                 handoffWarning: [
                   ...(request?.warnings ?? []),
                   outcome.handoff?.contextWarning
-                    ? `旧会话上下文快照提示：${outcome.handoff.contextWarning}`
+                    ? `Prior-session context snapshot notice: ${outcome.handoff.contextWarning}`
                     : "",
-                ].filter(Boolean).join("；"),
+                ].filter(Boolean).join("; "),
               }
             : {}),
         }
@@ -2503,6 +3145,28 @@ export class GuiRunner {
           detail: hint,
         })
         queuedProductFollowup = true
+      }
+    }
+    if (
+      !queuedProductFollowup &&
+      job.task &&
+      job.workspace &&
+      job.purpose === "solve" &&
+      candidateDisposition === "accepted"
+    ) {
+      const accepted = job.task.acceptedFlag?.value
+      if (accepted) {
+        queuedProductFollowup = this.queueTaskFollowup({
+          source: job,
+          purpose: "writeup",
+          writeupAttempts: 1,
+          status: "writeup.queued",
+          hint: [
+            `Confirmed flag: ${accepted}. The target environment will be released immediately.`,
+            "Now generate the Chinese WRITEUP.md offline from challenge/, work/, and NOTES.md only.",
+            "If a PoC/script was actually used, include its path, invocation, and complete source; if not, do not invent one — just write the core idea, evidence, and reproduction steps.",
+          ].join("\n"),
+        })
       }
     }
     if (!queuedProductFollowup && job.task && job.workspace && job.purpose === "writeup") {
@@ -2531,7 +3195,7 @@ export class GuiRunner {
           purpose: "writeup",
           writeupAttempts: job.writeupAttempts + 1,
           status: "writeup.retry.queued",
-          hint: "最终中文 WRITEUP.md 尚未包含已确认 flag 和完整可复现步骤，请只补全 Writeup 后结束。",
+          hint: "The final Chinese WRITEUP.md does not yet contain the confirmed flag or enough derivation. If there is no PoC, do not invent one; just write the verified reasoning and reproduction steps, then finish.",
         })
       }
     } else if (!remoteURLBlocked && job.task && outcome.primaryCandidate && candidateDisposition === "rejected") {
@@ -2540,9 +3204,9 @@ export class GuiRunner {
         purpose: "solve",
         status: "candidate.rejected.continue",
         hint: [
-          `候选 ${JSON.stringify(outcome.primaryCandidate)} 已被判定错误，不要再次提交。`,
-          `平台判定：${job.platformSubmission?.adapter ?? "platform"} — ${outcome.verification?.detail ?? job.platformSubmission?.detail ?? "无更多信息"}`,
-          "检查此前推导中的错误并继续寻找新的 flag；获得新候选后立刻调用 ctf-submit。",
+          `Candidate ${JSON.stringify(outcome.primaryCandidate)} was judged incorrect; do not submit it again.`,
+          `Platform verdict: ${job.platformSubmission?.adapter ?? "platform"} — ${outcome.verification?.detail ?? job.platformSubmission?.detail ?? "no further info"}`,
+          "Check the error in the prior derivation and keep looking for a new flag; call ctf-submit as soon as you have a new candidate.",
         ].join("\n"),
       })
     }
@@ -2575,8 +3239,8 @@ export class GuiRunner {
           purpose: "solve",
           status: `consultation.${request.trigger}.queued`,
           hint: request.trigger === "compaction"
-            ? "上下文已完成压缩。先执行多模型会诊，再依据综合计划从 NOTES.md 与工作区状态继续求解。"
-            : `主模型主动请求多模型会诊：${request.reason}`,
+            ? "The context has been compacted. Run the multi-model consultation first, then continue solving from NOTES.md and the workspace state per the synthesized plan."
+            : `The main model proactively requested a multi-model consultation: ${request.reason}`,
           consultation: request,
         })
       }

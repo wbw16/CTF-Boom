@@ -20,6 +20,7 @@ export function startBoomToolBridge(registry: CompiledBoomAgentRegistry) {
   const deniedOrigins = new Set<string>()
   const host = createBoomToolHost(registry.catalog, {
     networkBroker: createBoomNetworkBroker({ deniedOrigins }),
+    network: registry.network,
   })
   const server = Bun.serve({
     hostname: "127.0.0.1",

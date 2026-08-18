@@ -17,7 +17,6 @@ import {
 } from "./environment.ts"
 import { DEFAULT_SILENCE_MS, type Limits } from "./session.ts"
 import { aggregateEvaluation, collectEvaluationSamples, evaluationMarkdown } from "./evaluation.ts"
-import { platformCommand } from "./platform-command.ts"
 import { mcpCommand } from "./mcp-command.ts"
 import { GuiRunner } from "./runner.ts"
 import { readChallengeRuns, readRunHistory, type RunHistory } from "./history.ts"
@@ -44,6 +43,7 @@ type Args = {
   pythonProfile?: string
   pythonInterpreter?: string
   executionMode: ExecutionMode
+  network: "allow" | "deny"
 }
 
 function usage(code = 1): never {
@@ -56,7 +56,6 @@ function usage(code = 1): never {
     "Commands:",
     "  run [options] [slug...]  solve one or more challenges",
     "  gui [options]            open the local Boom workbench",
-    "  platform <action>        adapt a competition API or download challenges",
     "  mcp <action>             manage Boom MCP servers through Boom Runtime",
     "  doctor                   verify the local installation",
     "  evaluate [--root <dir>]  summarize existing run results",
@@ -76,6 +75,7 @@ function usage(code = 1): never {
     `  --repeats <n>            abort after N identical tool calls (default: ${DEFAULTS.repeats})`,
     `  --minutes <n>            per-challenge wall-clock ceiling (default: ${DEFAULTS.minutes})`,
     `  --concurrency <n>        challenges solved at once (default: ${DEFAULTS.concurrency})`,
+    "  --no-network             run fully offline: refuse web tools and isolate bash/boom-exec",
     "",
     "The main solver may request consultation itself; context compaction also triggers one.",
     "With no slugs, run processes every challenge under <root>/challenges.",
@@ -87,6 +87,7 @@ function usage(code = 1): never {
     "  --browser          open the compatibility browser interface",
     "  --headless         start only the local API and print its URL",
     "  --no-open          alias for --headless",
+    "  --no-network       run fully offline: refuse web tools and isolate bash/boom-exec",
     "",
   ].join("\n"))
   process.exit(code)
@@ -164,6 +165,7 @@ function parse(argv: string[]): Args {
     concurrency: DEFAULTS.concurrency,
     only: [],
     executionMode: "managed",
+    network: "allow",
   }
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]!
@@ -192,11 +194,13 @@ function parse(argv: string[]): Args {
     else if (arg === "--repeats") args.limits.repeats = Number(value())
     else if (arg === "--minutes") args.limits.timeout = Number(value()) * 60_000
     else if (arg === "--concurrency") args.concurrency = Number(value())
+    else if (arg === "--no-network") args.network = "deny"
     else if (arg === "-h" || arg === "--help") usage(0)
     else if (arg.startsWith("-")) usage()
     else args.only.push(arg)
   }
-  if (!Number.isFinite(args.limits.tokens) || args.limits.tokens <= 0) usage()
+  const tokenLimit = args.limits.tokens
+  if (typeof tokenLimit !== "number" || !Number.isFinite(tokenLimit) || tokenLimit <= 0) usage()
   if (!Number.isFinite(args.limits.repeats) || args.limits.repeats < 2) usage()
   if (!Number.isFinite(args.limits.timeout) || args.limits.timeout <= 0) usage()
   if (!Number.isFinite(args.concurrency) || args.concurrency < 1) usage()
@@ -292,7 +296,7 @@ async function run(argv: string[]) {
     throw new Error(`No challenges found under ${path.join(args.root, "challenges")}`)
 
   const answers = await loadAnswers(args.root)
-  const runner = new GuiRunner(args.root)
+  const runner = new GuiRunner(args.root, undefined, undefined, { network: args.network })
   runner.setConcurrency(args.concurrency)
   const runIDs = new Map<string, string>()
   let interrupted: "SIGINT" | "SIGTERM" | undefined
@@ -378,7 +382,6 @@ async function main() {
     return
   }
   if (command === "gui") return gui(argv)
-  if (command === "platform") return platformCommand(argv)
   if (command === "mcp") return mcpCommand(argv)
   if (command === "version" || command === "--version" || command === "-v") {
     process.stdout.write(`${await packageVersion()}\n`)

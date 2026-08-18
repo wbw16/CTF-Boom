@@ -25,6 +25,7 @@ function options(mode: GuiMode): GuiCommandOptions {
     port: 0,
     mode,
     help: false,
+    network: "allow",
   }
 }
 
@@ -37,12 +38,14 @@ describe("GUI command arguments", () => {
       port: 0,
       mode: "native",
       help: false,
+      network: "allow",
     })
     expect(parseGuiArgs([], { cwd, platform: "linux" })).toEqual({
       root: path.join(cwd, "ctf"),
       port: 0,
       mode: "browser",
       help: false,
+      network: "allow",
     })
   })
 
@@ -78,6 +81,7 @@ describe("GUI command arguments", () => {
         port: item.port ?? 0,
         mode: item.mode,
         help: item.help ?? false,
+        network: "allow",
       })
     }
   })
@@ -110,7 +114,13 @@ describe("GUI command arguments", () => {
 describe("GUI command lifecycle", () => {
   test("closes the server when the native client exits", async () => {
     const childExit = deferred<number>()
-    const serverCalls: Array<{ root: string; hostname: string; port: number; open: boolean }> = []
+    const serverCalls: Array<{
+      root: string
+      hostname: string
+      port: number
+      open: boolean
+      network: "allow" | "deny"
+    }> = []
     let closeCount = 0
     let terminateCount = 0
     let launchedURL: string | undefined
@@ -143,6 +153,7 @@ describe("GUI command lifecycle", () => {
         hostname: "127.0.0.1",
         port: 0,
         open: false,
+        network: "allow",
       },
     ])
     expect(launchedURL).toBe("http://127.0.0.1:41001/")

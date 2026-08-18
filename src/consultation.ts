@@ -110,7 +110,7 @@ export const DEFAULT_CONSULTATION_HISTORY_TOKENS = 48_000
 function bounded(text: string | undefined, maximum: number) {
   const value = text?.trim() ?? ""
   if (value.length <= maximum) return value
-  return `${value.slice(0, maximum)}\n\n[内容已截断，共 ${value.length} 字符]`
+  return `${value.slice(0, maximum)}\n\n[truncated, ${value.length} chars total]`
 }
 
 function scaledBound(maximum: number, scale: number) {
@@ -119,14 +119,14 @@ function scaledBound(maximum: number, scale: number) {
 
 function challengeSummary(challenge: Challenge, scale = 1) {
   return [
-    `题目：${challenge.slug}`,
-    `分类：${challenge.category ?? "OTHER"}`,
-    `Flag 格式：${challenge.flagFormat.trim() || "由求解模型判断"}`,
-    `附件：${challenge.files.length === 0 ? "无" : challenge.files.join(", ")}`,
-    challenge.remote ? `远程目标：${JSON.stringify(challenge.remote)}` : "",
+    `Challenge: ${challenge.slug}`,
+    `Category: ${challenge.category ?? "OTHER"}`,
+    `Flag format: ${challenge.flagFormat.trim() || "for the solver to determine"}`,
+    `Attachments: ${challenge.files.length === 0 ? "none" : challenge.files.join(", ")}`,
+    challenge.remote ? `Remote target: ${JSON.stringify(challenge.remote)}` : "",
     "",
-    "题目说明：",
-    bounded(challenge.description, scaledBound(MAX_DESCRIPTION, scale)) || "（无）",
+    "Challenge statement:",
+    bounded(challenge.description, scaledBound(MAX_DESCRIPTION, scale)) || "(none)",
   ]
     .filter((line) => line !== "")
     .join("\n")
@@ -136,7 +136,7 @@ function boundedHeadAndTail(text: string, maximum: number) {
   const value = text.trim()
   if (value.length <= maximum) return value
   if (maximum < 80) return value.slice(0, maximum)
-  const marker = `\n...[内容已截断，共 ${value.length} 字符]...\n`
+  const marker = `\n...[truncated, ${value.length} chars total]...\n`
   const available = maximum - marker.length
   const head = Math.ceil(available * 0.6)
   return `${value.slice(0, head)}${marker}${value.slice(value.length - (available - head))}`
@@ -146,10 +146,10 @@ function renderHistoryMessage(message: RuntimeMessage) {
   const lines: string[] = []
   for (const part of message.parts) {
     if (part.type === "tool") {
-      lines.push(`工具：${part.tool ?? "unknown"}${part.state ? `（${part.state}）` : ""}`)
-      if (part.input) lines.push(`输入：${boundedHeadAndTail(part.input, 1_500)}`)
-      if (part.output) lines.push(`输出：${boundedHeadAndTail(part.output, 3_000)}`)
-      if (part.error) lines.push(`错误：${boundedHeadAndTail(part.error, 1_500)}`)
+      lines.push(`Tool: ${part.tool ?? "unknown"}${part.state ? ` (${part.state})` : ""}`)
+      if (part.input) lines.push(`Input: ${boundedHeadAndTail(part.input, 1_500)}`)
+      if (part.output) lines.push(`Output: ${boundedHeadAndTail(part.output, 3_000)}`)
+      if (part.error) lines.push(`Error: ${boundedHeadAndTail(part.error, 1_500)}`)
     } else if (part.text) {
       lines.push(boundedHeadAndTail(part.text, 4_000))
     }
@@ -166,7 +166,7 @@ function renderHistoryMessage(message: RuntimeMessage) {
  */
 export function compressConsultationHistory(messages: RuntimeMessage[], maximum = MAX_WORK) {
   const limit = Math.max(0, Math.floor(maximum))
-  if (limit === 0 || messages.length === 0) return "（暂无已完成的工作记录）"
+  if (limit === 0 || messages.length === 0) return "(no work recorded yet)"
   const selected: string[] = []
   let used = 0
   let omitted = 0
@@ -190,8 +190,8 @@ export function compressConsultationHistory(messages: RuntimeMessage[], maximum 
     selected.unshift(rendered)
     used += separator + cost
   }
-  const body = selected.join("\n\n") || "（暂无已完成的工作记录）"
-  return omitted > 0 ? `[较早的 ${omitted} 条记录已省略]\n${body}` : body
+  const body = selected.join("\n\n") || "(no work recorded yet)"
+  return omitted > 0 ? `[${omitted} older entries omitted]\n${body}` : body
 }
 
 export function buildConsultationContext(input: {
@@ -218,19 +218,19 @@ export function buildConsultationContext(input: {
   const recentWork = compressConsultationHistory(input.history ?? [], historyMaximum)
   const status = bounded(input.stopDetail, scaledBound(MAX_DETAIL, scale))
   const work = [
-    ...(status ? [`当前状态：${status}`, ""] : []),
+    ...(status ? [`Current status: ${status}`, ""] : []),
     recentWork,
   ].join("\n")
   const clues = [
-    bounded(input.notes, scaledBound(MAX_CLUES, scale)) || "（暂无线索记录）",
+    bounded(input.notes, scaledBound(MAX_CLUES, scale)) || "(no clues recorded)",
     ...(input.artifacts?.length
-      ? ["", "相关产物：", ...input.artifacts.map((artifact) => `- ${artifact}`)]
+      ? ["", "Related artifacts:", ...input.artifacts.map((artifact) => `- ${artifact}`)]
       : []),
     ...(input.rejectedFlags?.length
-      ? ["", "已拒绝 flag（不得重复提交）：", ...input.rejectedFlags.map((flag) => `- ${flag}`)]
+      ? ["", "Rejected flags (do not resubmit):", ...input.rejectedFlags.map((flag) => `- ${flag}`)]
       : []),
     ...(input.contextWarning
-      ? ["", `上下文读取提示：${bounded(input.contextWarning, scaledBound(MAX_DETAIL, scale))}`]
+      ? ["", `Context read notice: ${bounded(input.contextWarning, scaledBound(MAX_DETAIL, scale))}`]
       : []),
   ].join("\n")
   return {
@@ -242,27 +242,27 @@ export function buildConsultationContext(input: {
 
 export function renderConsultationContext(context: ConsultationContext) {
   return [
-    "## 题目摘要",
+    "## Challenge summary",
     context.challenge,
     "",
-    "## 已经完成的工作",
+    "## Work done so far",
     context.work,
     "",
-    "## 获得的线索",
+    "## Clues",
     context.clues,
   ].join("\n")
 }
 
 function expertPrompt(context: ConsultationContext) {
   return [
-    "你是一名 CTF 专家。请根据题目摘要、已经完成的工作和获得的线索，给出你对这道题的解决思路和下一步建议，避免重复已经尝试过的内容。",
+    "You are a CTF expert. Given the challenge summary, work done so far, and clues below, give your solving approach and next-step recommendation; avoid repeating what was already tried.",
     "",
     renderConsultationContext(context),
   ].join("\n")
 }
 
 function expertLabel(index: number) {
-  return `专家 ${index + 1}`
+  return `Expert ${index + 1}`
 }
 
 const MAX_PLAN_CHARS = 12_000
@@ -278,12 +278,12 @@ function synthesisPrompt(
   planChars = MAX_PLAN_CHARS,
 ) {
   return [
-    "下面是几位 CTF 专家给出的思路。请结合题目摘要和当前进展，整理出最可行的解题方案。",
+    "Several CTF experts gave the approaches below. Reconcile them with the challenge summary and current progress into the single most actionable plan.",
     "",
     renderConsultationContext(context),
     ...plans.flatMap((plan, index) => [
       "",
-      `${expertLabel(index)}（${plan.model}）：`,
+      `${expertLabel(index)} (${plan.model}):`,
       boundedHeadAndTail(plan.text, Math.max(1, Math.floor(planChars))),
     ]),
   ].join("\n")
@@ -417,13 +417,13 @@ function degradedPlan(
   degradation: ConsultationDegradation,
 ): ConsultationReply {
   const introduction = degradation.reason === "insufficient-experts"
-    ? "会诊未取得足够的独立专家方案，无法形成多专家共识。以下仅存方案未经综合，请逐项验证后再执行。"
-    : "综合模型未能完成语义合并。以下成功专家方案保持原样，请比较其证据依赖并逐项验证。"
+    ? "The consultation did not obtain enough independent expert plans to form multi-expert consensus. The surviving plans below are unsynthesized; verify each before acting on it."
+    : "The synthesizer could not complete the semantic merge. The successful expert plans below are kept as-is; compare their evidence dependencies and verify each before acting on it."
   return {
     model: "boom/degraded",
     text: [
       introduction,
-      `降级原因：${degradation.detail}`,
+      `Degradation reason: ${degradation.detail}`,
       ...plans.flatMap((plan, index) => [
         "",
         `## ${expertLabel(index)} · ${plan.model}`,
@@ -577,7 +577,7 @@ export async function conductConsultation(input: {
     if (plans.length < CONSULT_EXPERTS.minimum) {
       degraded = {
         reason: "insufficient-experts",
-        detail: `仅 ${plans.length} 位专家成功，综合至少需要 ${CONSULT_EXPERTS.minimum} 位`,
+        detail: `Only ${plans.length} expert(s) succeeded; synthesis needs at least ${CONSULT_EXPERTS.minimum}`,
       }
       merged = degradedPlan(plans, degraded)
     } else if (deadline?.aborted) {
@@ -852,15 +852,15 @@ async function persistExpertSettlement(
 
 export function consultationHint(consultation: Consultation) {
   if (consultation.degraded) return [
-    "本次多模型会诊已降级，未形成可靠的多专家综合结论。先读 work/CONSULTATION.md。",
-    "把保留下来的专家方案视为待验证假设；自行比较证据成本，不要把单一意见当作共识。",
-    `降级原因：${consultation.degraded.detail}`,
+    "This multi-model consultation was degraded; no reliable multi-expert synthesis was produced. Read work/CONSULTATION.md first.",
+    "Treat the surviving expert plans as unverified hypotheses; compare their evidence costs yourself; do not treat any single opinion as consensus.",
+    `Degradation reason: ${consultation.degraded.detail}`,
     "",
     consultation.merged.text,
   ].join("\n")
   return [
-    "这是多模型会诊综合出的下一阶段计划。先读 work/CONSULTATION.md。",
-    "把计划当作需要用证据检验的路线，而不是已经成立的结论；发现前提不成立时应调整。",
+    "This is the next-phase plan synthesized by the multi-model consultation. Read work/CONSULTATION.md first.",
+    "Treat the plan as a route to test with evidence, not a settled conclusion; adjust it when a premise turns out to be false.",
     "",
     consultation.merged.text,
   ].join("\n")
@@ -895,31 +895,31 @@ export async function persistConsultation(directory: string, consultation: Consu
   await writeFile(
     path.join(work, "CONSULTATION.md"),
     [
-      "# 多模型会诊",
+      "# Multi-model consultation",
       "",
-      `- 触发：${consultation.trigger}`,
-      `- 会诊 ID：${consultation.id}`,
-      ...(consultation.sourceRunID ? [`- 来源运行：${consultation.sourceRunID}`] : []),
-      `- 专家：${consultation.plans.map((plan) => plan.model).join("、")}`,
-      `- 综合：${consultation.merged.model}`,
-      ...(consultation.degraded ? [`- 降级：${consultation.degraded.detail}`] : []),
+      `- Trigger: ${consultation.trigger}`,
+      `- Consultation ID: ${consultation.id}`,
+      ...(consultation.sourceRunID ? [`- Source run: ${consultation.sourceRunID}`] : []),
+      `- Experts: ${consultation.plans.map((plan) => plan.model).join(", ")}`,
+      `- Synthesizer: ${consultation.merged.model}`,
+      ...(consultation.degraded ? [`- Degradation: ${consultation.degraded.detail}`] : []),
       ...(consultation.failures.length > 0
-        ? [`- 失败专家：${consultation.failures.map((failure) => failure.model).join("、")}`]
+        ? [`- Failed experts: ${consultation.failures.map((failure) => failure.model).join(", ")}`]
         : []),
       ...consultation.plans.flatMap((plan, index) => [
         "",
-        `## ${expertLabel(index)}：${plan.model}`,
+        `## ${expertLabel(index)}: ${plan.model}`,
         "",
         plan.text,
       ]),
       ...consultation.failures.flatMap((failure) => [
         "",
-        `## 专家失败：${failure.model}`,
+        `## Failed expert: ${failure.model}`,
         "",
         failure.error,
       ]),
       "",
-      `${consultation.degraded ? "## 降级计划" : "## 综合计划"}：${consultation.merged.model}`,
+      `${consultation.degraded ? "## Degraded plan" : "## Synthesized plan"}: ${consultation.merged.model}`,
       "",
       consultation.merged.text,
       "",
@@ -942,11 +942,11 @@ export function addConsultationUsage<T extends {
 }
 
 export function remainingLimits(limits: Limits, consultation: Consultation): Limits | undefined {
-  const tokens = limits.tokens - consultation.billable
+  const tokens = limits.tokens === undefined ? undefined : limits.tokens - consultation.billable
   const elapsed =
     new Date(consultation.finishedAt).valueOf() -
     new Date(consultation.startedAt).valueOf()
   const timeout = limits.timeout - Math.max(0, elapsed)
-  if (tokens <= 0 || timeout <= 0) return undefined
-  return { ...limits, tokens, timeout }
+  if ((tokens !== undefined && tokens <= 0) || timeout <= 0) return undefined
+  return { ...limits, ...(tokens === undefined ? {} : { tokens }), timeout }
 }

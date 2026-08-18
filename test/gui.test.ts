@@ -3,16 +3,18 @@ import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/
 import os from "node:os"
 import path from "node:path"
 import { mergeTransient, startGuiServer, type GuiRunnerBackend } from "../src/gui.ts"
+import { DEFAULT_GUI_SETTINGS, saveRootGuiState } from "../src/gui-state.ts"
 import type { RunHistory } from "../src/history.ts"
 import { GuiRunner, type McpServerDetails } from "../src/runner.ts"
 
 type Harness = Awaited<ReturnType<typeof harness>>
+type HarnessOptions = { persistedAutopilot?: boolean }
 
 async function exists(target: string) {
   return (await stat(target).catch(() => undefined)) !== undefined
 }
 
-async function harness() {
+async function harness(options: HarnessOptions = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-gui-api-"))
   const root = path.join(directory, "ctf")
   const challenge = path.join(root, "challenges", "alpha")
@@ -44,9 +46,19 @@ async function harness() {
 
   const previousHome = process.env.BOOM_HOME
   process.env.BOOM_HOME = path.join(directory, "home")
+  if (options.persistedAutopilot) {
+    await saveRootGuiState(root, {
+      settings: {
+        ...DEFAULT_GUI_SETTINGS,
+        competition: { ...DEFAULT_GUI_SETTINGS.competition, autopilotEnabled: true },
+      },
+      challenges: {},
+    })
+  }
   let subscribed: ((notification: unknown) => void) | undefined
   const enqueued: unknown[] = []
   const stops: Array<string | undefined> = []
+  let closeAllCalls = 0
   const concurrencyChanges: number[] = []
   let schedulerConcurrency = 1
   const providerChanges: Array<{ action: string; value?: unknown }> = []
@@ -121,7 +133,10 @@ async function harness() {
         subscribed = undefined
       }
     },
-    getModels: async () => [{ id: "free/test", name: "Test Model", connected: true }],
+    getModels: async () => [
+      { id: "free/test", name: "Test Model", connected: true, attachment: false },
+      { id: "free/vision", name: "Vision Model", connected: true, attachment: true },
+    ],
     getProviders: async () => [provider],
     getProvider: async () => provider,
     getArmorPrompts: async () => armorPrompts,
@@ -212,6 +227,10 @@ async function harness() {
       stops.push(slug)
       return 1
     },
+    closeAllEnvironments: async () => {
+      closeAllCalls += 1
+      return { stopped: 2, released: 3, errors: [] }
+    },
     getTransientRuns: () => [],
     switchTaskEnvironment: (input: {
       slug: string
@@ -244,6 +263,7 @@ async function harness() {
     started,
     enqueued,
     stops,
+    get closeAllCalls() { return closeAllCalls },
     concurrencyChanges,
     providerChanges,
     mcpChanges,
@@ -286,6 +306,53 @@ async function request(
 }
 
 describe("GUI HTTP surface", () => {
+  test("opens stationary even when an earlier session persisted unattended mode", async () => {
+    const one = await harness({ persistedAutopilot: true })
+    try {
+      const competition = await request(one, "/api/competition")
+      expect(competition.status).toBe(200)
+      expect(await competition.json()).toMatchObject({
+        autopilot: { enabled: false, syncing: false },
+      })
+      expect(one.enqueued).toHaveLength(0)
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("stores an editable 西湖论剑 Server Host outside the challenge root", async () => {
+    const one = await harness()
+    try {
+      const saved = await request(one, "/api/xihulunjian/server-host", "PUT", {
+        value: "https://contest.example.test/agent/",
+      })
+      expect(saved.status).toBe(200)
+      expect(await saved.json()).toEqual({ serverHost: "https://contest.example.test/agent" })
+
+      const status = await request(one, "/api/xihulunjian")
+      expect(status.status).toBe(200)
+      expect(await status.json()).toMatchObject({
+        credential: { configured: false, serverHost: "https://contest.example.test/agent" },
+      })
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("closes all tracked target environments through the competition kill switch", async () => {
+    const one = await harness()
+    try {
+      const response = await request(one, "/api/competition/environments/close", "POST", {})
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({
+        closed: { stopped: 2, released: 3, errors: [] },
+      })
+      expect(one.closeAllCalls).toBe(1)
+    } finally {
+      await one.close()
+    }
+  })
+
   test("returns fallback state immediately without starting the runtime from /api/state", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "boom-gui-starting-"))
     const root = path.join(directory, "ctf")
@@ -390,8 +457,8 @@ describe("GUI HTTP surface", () => {
       expect(client).toContain("/api/providers")
       expect(client).toContain("从 OpenCode 迁移凭据")
       expect(client).toContain("/api/mcp")
-      expect(client).toContain("/api/platforms")
-      expect(client).toContain("/api/platforms/adapt")
+      expect(client).toContain("/api/xihulunjian")
+      expect(client).not.toContain("/api/platforms")
       expect(client).toContain("/api/armor-prompts")
       expect(client).toContain("Boom Runtime 已应用 Provider 配置并刷新模型目录")
 
@@ -416,7 +483,7 @@ describe("GUI HTTP surface", () => {
       expect(initial.runtime.status).toBe("ready")
       expect(initial.instanceID).toBeString()
       expect(initial.sequence).toBeGreaterThanOrEqual(0)
-      expect(initial.models.map((model) => model.id)).toEqual(["free/test"])
+      expect(initial.models.map((model) => model.id)).toEqual(["free/test", "free/vision"])
       expect(initial.challenges).toHaveLength(1)
       expect(initial.challenges[0]).toMatchObject({
         slug: "alpha",
@@ -637,9 +704,15 @@ describe("GUI HTTP surface", () => {
       expect(JSON.parse(await readFile(path.join(one.root, "challenges", "alpha", "meta.json"), "utf8")))
         .toEqual({ service_required: true, custom_field: "preserved" })
 
+      const invalidVision = await request(one, "/api/settings", "PATCH", {
+        visionModel: "free/test",
+      })
+      expect(invalidVision.status).toBe(400)
+
       const settings = await request(one, "/api/settings", "PATCH", {
         economyModel: "free/economy",
         strongModel: "free/strong",
+        visionModel: "free/vision",
         tokens: 2_000,
         repeats: 3,
         minutes: 2,
@@ -654,6 +727,7 @@ describe("GUI HTTP surface", () => {
         settings: {
           economyModel: "free/economy",
           strongModel: "free/strong",
+          visionModel: "free/vision",
           tokens: 2_000,
           minutes: 2,
           consultModels: ["free/expert-a", "free/expert-b"],
@@ -733,6 +807,33 @@ describe("GUI HTTP surface", () => {
     }
   })
 
+  test("queues a time-only run when the token budget is disabled", async () => {
+    const one = await harness()
+    try {
+      const settings = await request(one, "/api/settings", "PATCH", {
+        tokenBudgetEnabled: false,
+        minutes: 2,
+        repeats: 3,
+      })
+      expect(settings.status).toBe(200)
+      expect(await settings.json()).toMatchObject({
+        settings: { tokenBudgetEnabled: false, minutes: 2, repeats: 3 },
+      })
+
+      const queued = await request(one, "/api/runs", "POST", {
+        slugs: ["alpha"],
+        runIDs: { alpha: one.runID },
+      })
+      expect(queued.status).toBe(202)
+      expect(one.enqueued[0]).toMatchObject({
+        limits: { repeats: 3, timeout: 120_000 },
+      })
+      expect((one.enqueued[0] as { limits: Record<string, unknown> }).limits.tokens).toBeUndefined()
+    } finally {
+      await one.close()
+    }
+  })
+
   test("accepts a manual consultation while the challenge agent is live", async () => {
     const one = await harness()
     try {
@@ -807,153 +908,6 @@ describe("GUI HTTP surface", () => {
         storagePath: "CRYPTO/category-beta",
       }))
     } finally {
-      await one.close()
-    }
-  })
-
-  test("adapts and synchronizes a competition API through the GUI", async () => {
-    const one = await harness()
-    const competition = Bun.serve({
-      port: 0,
-      async fetch(request) {
-        const url = new URL(request.url)
-        if (url.pathname === "/openapi.json") {
-          return Response.json({
-            openapi: "3.0.3",
-            info: { title: "GUI Test CTF", version: "1" },
-            servers: [{ url: `${url.origin}/api` }],
-            components: {
-              schemas: {
-                Challenge: {
-                  type: "object",
-                  properties: {
-                    id: { type: "integer" },
-                      name: { type: "string" },
-                      category: { type: "string" },
-                    description: { type: "string" },
-                    files: { type: "array", items: { type: "string" } },
-                  },
-                },
-              },
-            },
-            paths: {
-              "/challenges": {
-                get: {
-                  operationId: "listChallenges",
-                  responses: { "200": { content: { "application/json": { schema: {
-                    type: "object",
-                    properties: { data: { type: "array", items: { $ref: "#/components/schemas/Challenge" } } },
-                  } } } } },
-                },
-              },
-              "/challenges/{challenge_id}": {
-                get: {
-                  operationId: "getChallenge",
-                  responses: { "200": { content: { "application/json": { schema: {
-                    type: "object",
-                    properties: { data: { $ref: "#/components/schemas/Challenge" } },
-                  } } } } },
-                },
-              },
-              "/challenges/attempt": {
-                post: {
-                  operationId: "submitFlagAttempt",
-                  requestBody: { content: { "application/json": { schema: {
-                    type: "object",
-                    required: ["challenge_id", "submission"],
-                    properties: {
-                      challenge_id: { type: "integer" },
-                      submission: { type: "string" },
-                    },
-                  } } } },
-                  responses: { "200": { content: { "application/json": { schema: {
-                    type: "object",
-                    properties: { data: { type: "object", properties: {
-                      status: { type: "string" },
-                      message: { type: "string" },
-                    } } },
-                  } } } } },
-                },
-              },
-            },
-          })
-        }
-        if (url.pathname === "/api/challenges")
-          return Response.json({ data: [{ id: 9, name: "gui-beta", category: "WEB" }] })
-        if (url.pathname === "/api/challenges/9")
-          return Response.json({ data: {
-            id: 9,
-            name: "gui-beta",
-            category: "WEB",
-            description: "Downloaded through the GUI.",
-            files: ["/files/input.bin"],
-          } })
-        if (url.pathname === "/files/input.bin") return new Response("gui evidence")
-        if (url.pathname === "/api/challenges/attempt")
-          return Response.json({ data: { status: "correct", message: "ok" } })
-        return new Response("missing", { status: 404 })
-      },
-    })
-    try {
-      expect(await (await request(one, "/api/platforms")).json()).toEqual({ platforms: [] })
-      const adapted = await request(one, "/api/platforms/adapt", "POST", {
-        id: "gui-ctf",
-        document: `http://127.0.0.1:${competition.port}/openapi.json`,
-      })
-      expect(adapted.status).toBe(201)
-      expect(await adapted.json()).toMatchObject({
-        manifest: {
-          id: "gui-ctf",
-          status: "ready",
-          operations: { submitFlag: { request: { method: "POST" } } },
-        },
-        warnings: [],
-      })
-      expect(await (await request(one, "/api/platforms")).json()).toMatchObject({
-        platforms: [{
-          id: "gui-ctf",
-          status: "ready",
-          listChallenges: true,
-          acquireChallenges: true,
-          submitFlag: true,
-        }],
-      })
-      const inspected = await request(one, "/api/platforms/gui-ctf")
-      const manifest = (await inspected.json() as { manifest: Record<string, unknown> }).manifest
-      const saved = await request(one, "/api/platforms/gui-ctf", "PUT", {
-        manifest: { ...manifest, name: "GUI Updated CTF" },
-      })
-      expect(saved.status).toBe(200)
-      expect(await saved.json()).toMatchObject({ manifest: { name: "GUI Updated CTF" } })
-
-      const catalog = await request(one, "/api/platforms/gui-ctf/catalog", "POST", {
-        variables: { game_id: "42" },
-        query: { page: 1, pageSize: 50 },
-      })
-      expect(catalog.status).toBe(200)
-      expect(await catalog.json()).toMatchObject({
-        adapter: "gui-ctf",
-        total: 1,
-        items: [{ id: "9", challengeID: "9", title: "gui-beta" }],
-      })
-
-      const synced = await request(one, "/api/platforms/gui-ctf/sync", "POST", {
-        variables: { game_id: "42" },
-        selection: { ids: ["9"] },
-      })
-      expect(synced.status).toBe(200)
-      expect(await synced.json()).toEqual({ adapter: "gui-ctf", challenges: ["gui-beta"] })
-      expect(await readFile(path.join(one.root, "challenges", "WEB", "gui-beta", "files", "input.bin"), "utf8"))
-        .toBe("gui evidence")
-      expect(JSON.parse(await readFile(path.join(one.root, "challenges", "WEB", "gui-beta", "meta.json"), "utf8")))
-        .toMatchObject({
-          platform: { adapter: "gui-ctf", challenge_id: "9", options: { game_id: "42" } },
-        })
-      const state = await request(one, "/api/state")
-      expect((await state.json() as { challenges: Array<{ slug: string; category: string }> }).challenges)
-        .toContainEqual(expect.objectContaining({ slug: "gui-beta", category: "WEB" }))
-    } finally {
-      competition.stop(true)
       await one.close()
     }
   })
@@ -1081,10 +1035,10 @@ describe("GUI HTTP surface", () => {
           strong: "free/deepseek-v4-flash-free",
         },
         workspaces: { alpha: rejected.runID },
-        hint: expect.stringContaining("已人工确认候选 flag"),
+        hint: expect.stringContaining("manually confirmed the candidate flag"),
       })
       expect(await Bun.file(path.join(rejected.run, "NOTES.md")).text()).toContain(
-        "用户已确认错误",
+        "user confirmed incorrect",
       )
       expect(
         await Bun.file(path.join(rejected.run, "task.json")).text(),

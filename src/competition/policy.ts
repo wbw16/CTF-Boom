@@ -20,6 +20,9 @@ export const DEFAULT_LOCAL_SLOTS = 5
 
 export const DEFAULT_MATCH_MINUTES = 180
 
+/** Default catalog refresh cadence for the contest's batched releases. */
+export const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
+
 /**
  * Once this little time remains, stop opening new challenges and spend what is left finishing work
  * that already has something to show. Scores decay as more teams solve a challenge, so a late start
@@ -52,18 +55,24 @@ const DIFFICULTY_RANK: Record<string, number> = {
 
 export type CompetitionSettings = {
   remoteSlots: number
+  /** How often unattended mode checks the platform for newly released challenges. */
+  refreshIntervalMinutes?: number
   localSlots: number
   matchMinutes: number
   endgameMinutes: number
   /** Epoch ms when the match ends; absent until the operator starts the clock. */
   deadline?: number
+  /** Persisted intent to resume unattended catalog polling when the desktop server restarts. */
+  autopilotEnabled?: boolean
 }
 
 export const DEFAULT_COMPETITION_SETTINGS: CompetitionSettings = {
   remoteSlots: DEFAULT_REMOTE_SLOTS,
+  refreshIntervalMinutes: DEFAULT_REFRESH_INTERVAL_MINUTES,
   localSlots: DEFAULT_LOCAL_SLOTS,
   matchMinutes: DEFAULT_MATCH_MINUTES,
   endgameMinutes: DEFAULT_ENDGAME_MINUTES,
+  autopilotEnabled: false,
 }
 
 export function normalizeCompetitionSettings(
@@ -84,12 +93,21 @@ export function normalizeCompetitionSettings(
     ? Math.floor(input.deadline)
     : undefined
   return {
-    // The remote cap may be raised only deliberately; exceeding the platform's limit gets the
-    // environment requests rejected, so the default must not silently drift upward.
-    remoteSlots: positive(input.remoteSlots, fallback.remoteSlots, 8),
+    // The platform permits at most three target environments. Operators may intentionally use
+    // fewer slots, but a higher value would only turn into rejected API requests.
+    remoteSlots: positive(input.remoteSlots, fallback.remoteSlots, DEFAULT_REMOTE_SLOTS),
+    refreshIntervalMinutes: positive(
+      input.refreshIntervalMinutes,
+      fallback.refreshIntervalMinutes ?? DEFAULT_REFRESH_INTERVAL_MINUTES,
+      60,
+    ),
     localSlots: positive(input.localSlots, fallback.localSlots, 32),
     matchMinutes: positive(input.matchMinutes, fallback.matchMinutes, 24 * 60),
     endgameMinutes: positive(input.endgameMinutes, fallback.endgameMinutes, 120),
+    autopilotEnabled:
+      typeof input.autopilotEnabled === "boolean"
+        ? input.autopilotEnabled
+        : fallback.autopilotEnabled === true,
     ...(deadline === undefined ? {} : { deadline }),
   }
 }

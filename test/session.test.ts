@@ -70,11 +70,11 @@ describe("candidate extraction", () => {
 describe("model-declared results", () => {
   test("requires a Chinese final writeup while preserving literal technical material", () => {
     const prompt = buildWriteupPrompt("flag{confirmed}")
-    expect(prompt).toContain("Writeup 必须使用中文")
-    expect(prompt).toContain("命令、代码、文件路径与 flag 保持原样")
-    expect(prompt).toContain("用代码块嵌入脚本的完整源码")
-    expect(prompt).toContain("不得省略、截断或用省略号代替任何代码")
-    expect(prompt).toContain("已确认 flag：flag{confirmed}")
+    expect(prompt).toContain("Write the writeup in Chinese")
+    expect(prompt).toContain("Keep commands, code, file paths, and the literal flag unchanged")
+    expect(prompt).toContain("complete source in a fenced code block")
+    expect(prompt).toContain("no truncation, ellipsis, or file-reference substitutes")
+    expect(prompt).toContain("Confirmed flag: flag{confirmed}")
   })
 
   test("extracts flag and verification fields from a writeup", () => {
@@ -216,38 +216,49 @@ describe("run controls", () => {
     const base = buildPrompt()
 
     expect(buildPrompt("   ")).toBe(base)
-    expect(buildPrompt("  优先检查压缩包注释  ")).toBe(`${base}\n\n用户追加提示：优先检查压缩包注释`)
+    expect(buildPrompt("  优先检查压缩包注释  ")).toBe(`${base}\n\nUser-added hint: 优先检查压缩包注释`)
   })
 
   test("adds category-specific priorities without overriding challenge evidence", () => {
     const web = buildPrompt(undefined, "web")
-    expect(web).toContain("正在解一道 CTF WEB 类型题目")
-    expect(web).toContain("HTTP 行为、路由、参数、会话与鉴权")
-    expect(web).toContain("以实际证据为准")
+    expect(web).toContain("You are solving a CTF WEB challenge")
+    expect(web).toContain("HTTP behavior, routes, params, sessions, auth")
+    expect(web).toContain("follow actual evidence")
 
     const pwn = buildPrompt(undefined, "PWN")
-    expect(pwn).toContain("正在解一道 CTF PWN 类型题目")
-    expect(pwn).toContain("内存破坏面")
+    expect(pwn).toContain("You are solving a CTF PWN challenge")
+    expect(pwn).toContain("memory-corruption surface")
+  })
+
+  test("keeps shared turn rules ahead of category and dynamic continuation state", () => {
+    const prompt = buildContinuationPrompt("remote=challenge.example:31337", "WEB")
+    const shared = prompt.indexOf("# Continue turn")
+    const category = prompt.indexOf("You are solving a CTF WEB challenge")
+    const dynamic = prompt.indexOf("User-added hint: remote=challenge.example:31337")
+
+    expect(shared).toBeGreaterThanOrEqual(0)
+    expect(category).toBeGreaterThan(shared)
+    expect(dynamic).toBeGreaterThan(category)
   })
 
   test("adds the headless IDA workflow only for eligible categories when the capability is available", () => {
     const reverseWithoutIda = buildPrompt(undefined, "REVERSE")
-    expect(reverseWithoutIda).not.toContain("headless IDA Pro MCP")
+    expect(reverseWithoutIda).not.toContain("Headless IDA Pro MCP")
 
     const reverseWithIda = buildPrompt(undefined, "REVERSE", { headlessIda: true })
-    expect(reverseWithIda).toContain("headless IDA Pro MCP（idalib）")
-    expect(reverseWithIda).toContain("复制到 work/ida/")
-    expect(reverseWithIda).toContain("idb_open 的 force_headless 模式")
-    expect(reverseWithIda).toContain("不要仅因 shell 工具可用就跳过 IDA")
-    expect(reverseWithIda).toContain("归档到 work/ida/results/")
+    expect(reverseWithIda).toContain("Headless IDA Pro MCP (idalib)")
+    expect(reverseWithIda).toContain("to work/ida/")
+    expect(reverseWithIda).toContain("idb_open in force_headless mode")
+    expect(reverseWithIda).toContain("do not skip IDA merely because shell tools are available")
+    expect(reverseWithIda).toContain("auto-archived under work/ida/results/")
     expect(reverseWithIda).toContain("idalib_boom_ida_get")
-    expect(reverseWithIda).toContain("不要重复查询同样的函数")
+    expect(reverseWithIda).toContain("not re-query the same functions")
 
     const pwnContinuation = buildContinuationPrompt(undefined, "PWN", { headlessIda: true })
-    expect(pwnContinuation).toContain("survey_binary、list_funcs、decompile")
+    expect(pwnContinuation).toContain("survey_binary, list_funcs, decompile")
 
     const webWithIda = buildPrompt(undefined, "WEB", { headlessIda: true })
-    expect(webWithIda).not.toContain("headless IDA Pro MCP")
+    expect(webWithIda).not.toContain("Headless IDA Pro MCP")
   })
 
   test("returns an aborted outcome before creating a runtime conversation when the signal is already aborted", async () => {

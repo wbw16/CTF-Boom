@@ -63,6 +63,13 @@ export type CompiledBoomAgentRegistry = {
   promptVersion: string
   catalog: BoomToolCatalog
   agents: CompiledBoomAgent[]
+  /**
+   * Host-wide network policy captured at compile time. "deny" overrides every profile's
+   * `effects.network` (so webfetch/websearch are refused on both runtimes) and is handed to the
+   * tool host so bash/boom-exec sandboxes drop network too. Consumers read it from the registry
+   * instead of threading the option through their own constructors.
+   */
+  network: "allow" | "deny"
 }
 
 const AGENT_ID = /^boom(?:-[a-z][a-z0-9-]*)?$/
@@ -202,6 +209,8 @@ export async function compileBoomAgentRegistry(
   resourceRoot: string,
   mcpServers: ManagedMcpServer[] = [],
   models?: ModelPolicy,
+  visionModel?: string,
+  network: "allow" | "deny" = "allow",
 ): Promise<CompiledBoomAgentRegistry> {
   const runtimeRoot = path.join(resourceRoot, "runtime")
   const [policy, identity, catalog, entries] = await Promise.all([
@@ -218,12 +227,28 @@ export async function compileBoomAgentRegistry(
       readFile(path.join(directory, "SYSTEM.md"), "utf8"),
     ])
     const resource = parseAgent(JSON.parse(resourceSource), directory)
-    const profile = catalog.profiles[resource.toolProfile]
-    if (!profile) throw new Error(`Unknown Boom tool profile ${resource.toolProfile} for ${resource.id}`)
+    const baseProfile = catalog.profiles[resource.toolProfile]
+    if (!baseProfile) throw new Error(`Unknown Boom tool profile ${resource.toolProfile} for ${resource.id}`)
+    let profile: BoomToolProfile = baseProfile
+    // A host-wide network deny overrides the profile's own policy, so every agent (solver, worker,
+    // consultant, …) is uniformly offline and the runtime permission layer refuses web tools.
+    if (network === "deny")
+      profile = { ...profile, effects: { ...profile.effects, network: "deny" } }
+    if (resource.id === "boom" && visionModel)
+      profile = { ...profile, tools: [...profile.tools, "describe-image"] }
     const prompt = createPromptBundle({
       policy: [{ source: "runtime/policies/immutable.md", content: policy, stability: "stable", cacheable: true, sensitivity: "public" }],
       identity: [{ source: "runtime/identity.md", content: identity, stability: "stable", cacheable: true, sensitivity: "public" }],
-      role: [{ source: `runtime/agents/${id}/SYSTEM.md`, content: role, stability: "stable", cacheable: true, sensitivity: "public" }],
+      role: [
+        { source: `runtime/agents/${id}/SYSTEM.md`, content: role, stability: "stable", cacheable: true, sensitivity: "public" },
+        ...(resource.id === "boom" && visionModel ? [{
+          source: "runtime:vision-tool",
+          content: "Your current model cannot inspect images directly. When visible image content matters, call `describe-image` with a task-relative path and a focused question; use local tools for byte-level image analysis.",
+          stability: "stable" as const,
+          cacheable: true,
+          sensitivity: "public" as const,
+        }] : []),
+      ],
       tools: [{ source: `runtime/tool-profiles.json#${resource.toolProfile}`, content: toolContract(resource.toolProfile, profile), stability: "stable", cacheable: true, sensitivity: "public" }],
     })
     return {
@@ -240,7 +265,7 @@ export async function compileBoomAgentRegistry(
     models: models ?? null,
     agents: agents.map((agent) => ({ id: agent.resource.id, resource: agent.resource, prompt: agent.prompt.promptVersion })),
   }))
-  return { version: 1, promptVersion, catalog, agents }
+  return { version: 1, promptVersion, catalog, agents, network }
 }
 
 /** Generate the private OpenCode compatibility files from Boom-owned neutral resources. */
@@ -249,8 +274,10 @@ export async function installOpenCodeAgentResources(
   targetRoot: string,
   mcpServers: ManagedMcpServer[] = [],
   models?: ModelPolicy,
+  visionModel?: string,
+  network: "allow" | "deny" = "allow",
 ) {
-  const registry = await compileBoomAgentRegistry(resourceRoot, mcpServers, models)
+  const registry = await compileBoomAgentRegistry(resourceRoot, mcpServers, models, visionModel, network)
   const agentDirectory = path.join(targetRoot, "agent")
   await mkdir(agentDirectory, { recursive: true })
   await Promise.all(registry.agents.map((agent) =>

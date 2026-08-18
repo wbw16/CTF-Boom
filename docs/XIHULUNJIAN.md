@@ -108,33 +108,33 @@ Base URL `https://pro.dasctf.com`，`{serverHost}/slab-match/api/v1/agent`。
 
 ## 凭证
 
-- Server Host 与 AccessKey 可在前端修改。
-- AccessKey 按既有安全边界经环境变量引用，不明文存入 manifest，
-  前端只显示是否已配置、不回显明文。
+- 比赛服务器固定为 `https://pro.dasctf.com`；专用构建不提供 Server Host、适配器 ID
+  或 OpenAPI 清单编辑。
+- AccessKey 只由西湖论剑控制台写入；前端只显示是否已配置、不回显明文。
 - 大模型网关 baseURL 作为 provider 配置项，可随时修改，不硬编码。
 
-AccessKey 的落盘位置是 `~/.config/boom/platform-credentials.json`（0600，
-可用 `BOOM_HOME` 改写），由 `src/platform-credentials.ts` 管理。
-GUI 用户无法为已运行的进程设置环境变量，因此 Boom 在启动时把存储的凭证
-加载进 `process.env`；**已存在的环境变量优先**，避免显式导出的密钥被旧值覆盖。
-该值不写入 `<root>/platforms/*.json`、不进入题目目录或运行工作区、不回传前端。
+AccessKey 的落盘位置是 `~/.config/boom/xihulunjian.json`（0600，
+可用 `BOOM_HOME` 改写），由 `src/xihulunjian-config.ts` 管理。若设置
+`BOOM_XIHULUNJIAN_ACCESS_KEY`，该显式环境变量优先。该值不进入题目目录、
+运行工作区或 API 响应。
 
 ## 使用方式
 
-无 OpenAPI 文档，因此用内置 profile 而非文档推断创建适配器：
+从 **设置 → 西湖论剑控制台** 完成以下操作：
 
-```sh
-boom platform adapt --id xihu --profile xihulunjian \
-  --base-url https://pro.dasctf.com --root ./ctf
+1. 保存 AccessKey；
+2. 每次放题后点击“同步已开放题目”；
+3. 设置赛题刷新间隔与线上容器并发上限；本地并发由“设置 → 运行参数”统一控制；
+4. 配置赛方网关，并确认 Economy / Strong 都已切换。
 
-export BOOM_PLATFORM_XIHU_TOKEN=<AccessKey>   # 或在前端填写
-boom platform sync --id xihu --root ./ctf
-```
+赛时从主界面点击 **开始比赛** 即可进入无人值守模式：Boom 会立即同步已开放题目并自动
+排队求解；每次同步完成后按所设间隔再检查一次新题。巡航在 GUI 服务端运行，
+网页刷新或关闭不会停止。平台网络、限流、超时和 5xx 错误会作有界退避重试；单道题的数据
+异常、不可用题目或单题入队失败会记录后跳过，不会阻塞后续同步或其他题目的自动解题。点击
+主界面的“停止”会取消后续巡航并停止当前运行，但保留比赛时钟，便于有意恢复。
 
-GUI 对应接口：
-
-- `POST /api/platforms/profile`（`{profile:"xihulunjian", id, baseURL}`）创建适配器
-- `PUT /api/platforms/<id>/credential`（`{value}`）写入 AccessKey，只写不读
+专用 GUI API 为 `GET /api/xihulunjian`、`PUT /api/xihulunjian/credential` 和
+`POST /api/xihulunjian/sync`；不存在通用 `/api/platforms/*` 路由或 `boom platform` 命令。
 
 ## 调度实现说明
 
@@ -175,20 +175,22 @@ GUI 对应接口：
   - `GET <网关>` 返回 405，没有模型列表接口
 - 网关把请求模型映射到 `deepseek-v4-flash`（以响应里的 `model` 字段为准）。
 
-Boom 的 `openai-compatible` driver 会在 Base URL 后面拼接 `chat/completions`，
-与这种"根即端点"的网关冲突。为此新增**精确端点标记**：
+OpenCode 的 `openai-compatible` Provider 会在 Base URL 后拼接 `chat/completions`，
+与这种“根即端点”的网关冲突。Boom 会自动识别西湖论剑网关 URL，并在本机通过受限代理将
+标准 `/v1/chat/completions` 请求透明转发到该根端点；SSE、tool_calls 与 usage 保持原样。
+旧配置末尾的 `!` 仍兼容，但不再需要。
 
-> Base URL 末尾追加 `!` 表示"这就是完整端点，不要再拼路径"。
-
-配置（Providers → 新建自定义 provider）：
+配置（设置 → Provider 与模型 → 编辑正在使用的 Provider；**无需创建比赛专用
+Provider**）：
 
 - Driver：`openai-compatible`
-- Base URL：`https://llm-gateway.dasctf.com/llm-gateway/proxy/e/<token>` **末尾加 `!`**
-- API Key：自己的 DeepSeek Key（以 `Authorization: Bearer` 发送）
-- Model ID：`deepseek-chat`
+- Base URL：直接填写 `https://llm-gateway.dasctf.com/llm-gateway/proxy/e/<token>`，**不要添加** `/v1`、`/chat/completions` 或 `!`
+- API Key：保留原始上游 Provider 的 API Key（以 `Authorization: Bearer` 发送）；例如百炼 Qwen 使用自己的百炼 API Key
+- Model ID：填写所选上游模型的 ID
 
-验证方式：设置里选中该 provider/model 后运行一道题，事件流里应出现
-`model: deepseek-v4-flash`。开赛前必须确认 economy/strong 两档都指向网关 provider，
+保留该 Provider 的 API Key 与 Model ID，再在设置里将 economy/strong 两档，以及启用时的
+vision 模型，都选为该 Provider 的模型。验证方式：运行一道题，事件流里应出现
+`model: deepseek-v4-flash`。
 默认的 `free/deepseek-v4-flash-free` 不经过网关。
 
 ## 已验证行为（对照真实平台）

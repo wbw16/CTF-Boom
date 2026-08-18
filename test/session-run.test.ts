@@ -177,7 +177,7 @@ describe("runChallenge integration seam", () => {
     )
 
     const firstPrompt = promptBodies[0]!
-    expect(firstPrompt.text).toEndWith("用户追加提示：先检查文件类型")
+    expect(firstPrompt.text).toEndWith("User-added hint: 先检查文件类型")
     expect(seen.map((event) => event.type)).toEqual(["session", "text", "tool", "usage", "status"])
     expect(seen.find((event) => event.type === "usage")).toMatchObject({
       tokens: 12,
@@ -863,8 +863,8 @@ describe("runChallenge integration seam", () => {
 
     expect(promptBodies).toHaveLength(2)
     const recovery = promptBodies[1]!
-    expect(recovery.text).toContain("达到 Provider 单次输出长度上限")
-    expect(recovery.text).toContain("写入 work/")
+    expect(recovery.text).toContain("single-turn output length cap")
+    expect(recovery.text).toContain("into work/")
     expect(seen).toContainEqual(
       expect.objectContaining({ type: "retry", status: "length-recovery" }),
     )
@@ -888,7 +888,7 @@ describe("runChallenge integration seam", () => {
     }))
 
     expect(promptBodies).toHaveLength(2)
-    expect(promptBodies[1]!.text).toContain("运行服务故障中断")
+    expect(promptBodies[1]!.text).toContain("interrupted by a runtime fault")
     expect(seen).toContainEqual(expect.objectContaining({ type: "retry", status: "transient" }))
     expect(outcome).toMatchObject({ stop: "completed", finish: "stop" })
   })
@@ -908,7 +908,7 @@ describe("runChallenge integration seam", () => {
     const outcome = await runChallenge(input({ onEvent: (event: RunEvent) => seen.push(event) }))
 
     expect(promptBodies).toHaveLength(2)
-    expect(promptBodies[1]!.text).toContain("结束状态不明确")
+    expect(promptBodies[1]!.text).toContain("finish state was ambiguous")
     expect(seen).toContainEqual(expect.objectContaining({ type: "retry", status: "unknown-recovery" }))
     expect(outcome).toMatchObject({
       stop: "completed",
@@ -972,7 +972,7 @@ describe("runChallenge integration seam", () => {
     const outcome = await runChallenge(input({ onEvent: (event: RunEvent) => seen.push(event) }))
 
     expect(promptBodies).toHaveLength(2)
-    expect(promptBodies[1]!.text).toContain("内容安全策略")
+    expect(promptBodies[1]!.text).toContain("blocked by a content-safety policy")
     expect(seen).toContainEqual(expect.objectContaining({ type: "retry", status: "content-filter-recovery" }))
     expect(outcome).toMatchObject({
       stop: "completed",
@@ -996,7 +996,7 @@ describe("runChallenge integration seam", () => {
     const outcome = await runChallenge(input({ onEvent: (event: RunEvent) => seen.push(event) }))
 
     expect(promptBodies).toHaveLength(2)
-    expect(promptBodies[1]!.text).toContain("主动取消了响应")
+    expect(promptBodies[1]!.text).toContain("provider cancelled the previous turn's response")
     expect(seen).toContainEqual(expect.objectContaining({ type: "retry", status: "cancelled-recovery" }))
     expect(outcome).toMatchObject({
       stop: "completed",
@@ -1045,5 +1045,245 @@ describe("runChallenge integration seam", () => {
       detail: "length recovery skipped because no billable token budget remains",
       retries: [],
     })
+  })
+
+  test("uses the time limit without a token ceiling when tokens are omitted", async () => {
+    promptResults = [{
+      usage: { input: 20, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+      cost: 0.5,
+      finish: "length",
+      parts: [{ type: "text", text: "truncated but still within the time limit" }],
+    }]
+    const outcome = await runChallenge(input({ limits: { repeats: 5, timeout: 10_000 } }))
+    expect(promptBodies).toHaveLength(2)
+    expect(outcome).toMatchObject({
+      stop: "completed",
+      finish: "stop",
+      retries: ["1:length-recovery"],
+    })
+  })
+
+  test("emits a heartbeat when tool activity outlives model text", async () => {
+    pendingPrompt = true
+    eventStream = {
+      async *[Symbol.asyncIterator]() {
+        while (promptBodies.length === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "call-1",
+          tool: "bash",
+          state: { status: "running", input: { command: "cd work && ./solve" } },
+        } as RuntimeEvent
+        await new Promise((resolve) => setTimeout(resolve, 80))
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "call-1",
+          tool: "bash",
+          state: { status: "completed", title: "bash · exit 0" },
+        } as RuntimeEvent
+      },
+    }
+    const seen: RunEvent[] = []
+    const outcomePromise = runChallenge(input({
+      limits: {
+        tokens: 1_000,
+        repeats: 5,
+        timeout: 10_000,
+        heartbeatTextSilenceMs: 20,
+        heartbeatMinIntervalMs: 10,
+      },
+      onEvent: (event: RunEvent) => seen.push(event),
+    }))
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    resolvePrompt?.(finished)
+    const outcome = await outcomePromise
+
+    const heartbeats = seen.filter((event) => event.type === "status" && event.status === "heartbeat")
+    expect(heartbeats.length).toBe(1)
+    expect(heartbeats[0]!.text).toContain("仍在运行")
+    expect(heartbeats[0]!.text).toContain("工具调用")
+    expect(outcome).toMatchObject({ stop: "completed" })
+  })
+
+  test("heartbeat is throttled and reset by model text", async () => {
+    pendingPrompt = true
+    const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+    eventStream = {
+      async *[Symbol.asyncIterator]() {
+        while (promptBodies.length === 0) await pause()
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "call-1",
+          tool: "bash",
+          state: { status: "running", input: { command: "one" } },
+        } as RuntimeEvent
+        await new Promise((resolve) => setTimeout(resolve, 60))
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "call-1",
+          tool: "bash",
+          state: { status: "completed", title: "bash · exit 0" },
+        } as RuntimeEvent
+        // Model text resets the silence clock: a tool finishing right after must not beat again.
+        yield { type: "text-delta", sessionID: "session-1", delta: "仍在分析" } as RuntimeEvent
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "call-2",
+          tool: "bash",
+          state: { status: "running", input: { command: "two" } },
+        } as RuntimeEvent
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "call-2",
+          tool: "bash",
+          state: { status: "completed", title: "bash · exit 0" },
+        } as RuntimeEvent
+        // Silence again: the second heartbeat fires once, not per tool call.
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "call-3",
+          tool: "bash",
+          state: { status: "running", input: { command: "three" } },
+        } as RuntimeEvent
+        await new Promise((resolve) => setTimeout(resolve, 70))
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "call-3",
+          tool: "bash",
+          state: { status: "completed", title: "bash · exit 0" },
+        } as RuntimeEvent
+      },
+    }
+    const seen: RunEvent[] = []
+    const outcomePromise = runChallenge(input({
+      limits: {
+        tokens: 1_000,
+        repeats: 5,
+        timeout: 10_000,
+        heartbeatTextSilenceMs: 20,
+        heartbeatMinIntervalMs: 10,
+      },
+      onEvent: (event: RunEvent) => seen.push(event),
+    }))
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    resolvePrompt?.(finished)
+    await outcomePromise
+
+    const heartbeats = seen.filter((event) => event.type === "status" && event.status === "heartbeat")
+    expect(heartbeats.length).toBe(2)
+  })
+
+  test("note gate hard-stops a turn when many tools run without a durable note", async () => {
+    pendingPrompt = true
+    const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+    eventStream = {
+      async *[Symbol.asyncIterator]() {
+        while (promptBodies.length === 0) await pause()
+        for (let index = 1; index <= 3; index += 1) {
+          yield {
+            type: "tool-state",
+            sessionID: "session-1",
+            callID: `call-${index}`,
+            tool: "bash",
+            state: { status: "running", input: { command: `cmd ${index}` } },
+          } as RuntimeEvent
+          yield {
+            type: "tool-state",
+            sessionID: "session-1",
+            callID: `call-${index}`,
+            tool: "bash",
+            state: { status: "completed", title: "bash · exit 0" },
+          } as RuntimeEvent
+        }
+      },
+    }
+    const seen: RunEvent[] = []
+    const outcomePromise = runChallenge(input({
+      purpose: "solve",
+      limits: { tokens: 1_000, repeats: 5, timeout: 10_000, noteGateToolCalls: 3 },
+      onEvent: (event: RunEvent) => seen.push(event),
+    }))
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    resolvePrompt?.(finished)
+    const outcome = await outcomePromise
+
+    // The gate no longer asks in the same session; it ends the turn so the next round must checkpoint.
+    expect(promptBodies).toHaveLength(1)
+    expect(seen).toContainEqual(expect.objectContaining({ type: "status", status: "note-gate" }))
+    expect(seen).toContainEqual(expect.objectContaining({ type: "status", status: "note-gate.hard" }))
+    expect(outcome).toMatchObject({
+      stop: "stalled",
+      detail: expect.stringContaining("note-gate"),
+    })
+  })
+
+  test("note gate is cancelled by a durable write and does not re-fire in the same turn", async () => {
+    pendingPrompt = true
+    const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+    eventStream = {
+      async *[Symbol.asyncIterator]() {
+        while (promptBodies.length === 0) await pause()
+        // Two plain tools, then a durable note: the counter resets at the note, so the gate's
+        // threshold of three is never reached even though the turn runs many tools in total.
+        for (let index = 1; index <= 2; index += 1) {
+          yield {
+            type: "tool-state",
+            sessionID: "session-1",
+            callID: `call-${index}`,
+            tool: "bash",
+            state: { status: "running", input: { command: `cmd ${index}` } },
+          } as RuntimeEvent
+          yield {
+            type: "tool-state",
+            sessionID: "session-1",
+            callID: `call-${index}`,
+            tool: "bash",
+            state: { status: "completed", title: "bash · exit 0" },
+          } as RuntimeEvent
+        }
+        yield {
+          type: "tool-state",
+          sessionID: "session-1",
+          callID: "note-1",
+          tool: "ctf-note",
+          state: { status: "completed", title: "note -> NOTES.md" },
+        } as RuntimeEvent
+        for (let index = 3; index <= 4; index += 1) {
+          yield {
+            type: "tool-state",
+            sessionID: "session-1",
+            callID: `call-${index}`,
+            tool: "bash",
+            state: { status: "running", input: { command: `cmd ${index}` } },
+          } as RuntimeEvent
+          yield {
+            type: "tool-state",
+            sessionID: "session-1",
+            callID: `call-${index}`,
+            tool: "bash",
+            state: { status: "completed", title: "bash · exit 0" },
+          } as RuntimeEvent
+        }
+      },
+    }
+    const outcomePromise = runChallenge(input({
+      purpose: "solve",
+      limits: { tokens: 1_000, repeats: 5, timeout: 10_000, noteGateToolCalls: 3 },
+    }))
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    resolvePrompt?.(finished)
+    const outcome = await outcomePromise
+
+    expect(promptBodies).toHaveLength(1)
+    expect(outcome).toMatchObject({ stop: "completed" })
   })
 })

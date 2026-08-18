@@ -227,7 +227,7 @@ export async function acceptTaskFlag(input: {
 export async function rejectTaskFlag(
   directory: string,
   flag: string,
-  detail = "用户已确认错误",
+  detail = "user confirmed incorrect",
 ) {
   const task = await loadTaskRecord(directory)
   if (!task) throw new Error("This run has no task metadata")
@@ -243,7 +243,7 @@ export async function rejectTaskFlag(
   const notes = await readFile(notesPath, "utf8")
   const marker = `- \`${flag.replace(/`/g, "\\`")}\`（${detail.replace(/[\r\n]+/g, " ")}）`
   if (!notes.includes(marker)) {
-    const heading = "## 用户否定的 Flag"
+    const heading = "## User-rejected flags"
     const next = notes.includes(heading)
       ? `${notes.trimEnd()}\n${marker}\n`
       : `${notes.trimEnd()}\n\n${heading}\n\n${marker}\n`

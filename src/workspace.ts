@@ -12,31 +12,31 @@ export type Workspace = {
 
 const NOTES_SKELETON = `# NOTES
 
-这是跨轮次、跨模型共享的任务记忆。由 ctf-note 工具维护。
+Shared cross-turn, cross-model task memory. Maintained by the ctf-note tool.
 
-## 当前目标
+## Current goal
 
-恢复并验证题目 flag。
+Recover and verify the challenge flag.
 
-## 已确认事实
+## Confirmed facts
 
-- 暂无。
+- None yet.
 
-## 当前假设
+## Current hypotheses
 
-- 暂无。
+- None yet.
 
-## 已排除方向
+## Ruled-out directions
 
-- 暂无。
+- None yet.
 
-## 关键产物
+## Key artifacts
 
-- 暂无。
+- None yet.
 
-## 下一步计划
+## Next steps
 
-- 阅读题目说明与附件。
+- Read the challenge statement and attachments.
 `
 
 /**

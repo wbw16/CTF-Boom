@@ -57,7 +57,7 @@ describe("multi-model consultation", () => {
       ask: async ({ model, title, prompt }) => {
         calls.push(title)
         if (title !== "Boom consult synthesis") {
-          expect(prompt).toContain("你是一名 CTF 专家")
+          expect(prompt).toContain("You are a CTF expert")
           expect(prompt).not.toContain("停止条件")
           waiting += 1
           if (waiting === 2) releaseExperts()
@@ -155,7 +155,7 @@ describe("multi-model consultation", () => {
         return reply(model, `draft ${model}`)
       },
     })
-    expect(synthesisPrompt).toContain("整理出最可行的解题方案")
+    expect(synthesisPrompt).toContain("most actionable plan")
     expect(synthesisPrompt).not.toContain("不构成独立印证")
   })
 
@@ -176,9 +176,9 @@ describe("multi-model consultation", () => {
     expect(context.clues).toContain("confirmed opcode table")
     expect(context.clues).toContain("work/opcodes.json")
     expect(context.clues).toContain("flag{wrong}")
-    expect(rendered).toContain("## 题目摘要")
-    expect(rendered).toContain("## 已经完成的工作")
-    expect(rendered).toContain("## 获得的线索")
+    expect(rendered).toContain("## Challenge summary")
+    expect(rendered).toContain("## Work done so far")
+    expect(rendered).toContain("## Clues")
   })
 
   test("compaction context includes the surviving runtime summary and recent execution history", () => {
@@ -231,7 +231,7 @@ describe("multi-model consultation", () => {
 
     expect(work).toContain("useful-start")
     expect(work).toContain("useful-end")
-    expect(work).toContain("内容已截断")
+    expect(work).toContain("truncated")
   })
 
   test("keeps dense CJK history within the requested token budget", () => {
@@ -279,11 +279,11 @@ describe("multi-model consultation", () => {
       await persistConsultation(directory, consultation)
 
       const markdown = await Bun.file(path.join(directory, "work", "CONSULTATION.md")).text()
-      expect(markdown).toContain("## 专家 1：openai/one")
-      expect(markdown).toContain("## 专家 2：anthropic/two")
-      expect(markdown).toContain("## 专家 3：google/three")
+      expect(markdown).toContain("## Expert 1: openai/one")
+      expect(markdown).toContain("## Expert 2: anthropic/two")
+      expect(markdown).toContain("## Expert 3: google/three")
       expect(markdown).toContain("draft google/three")
-      expect(markdown).toContain("## 综合计划：openai/main")
+      expect(markdown).toContain("## Synthesized plan: openai/main")
       const saved = await Bun.file(path.join(directory, "work", "consultation.json")).json()
       expect(saved.plans).toHaveLength(3)
     } finally {
@@ -306,7 +306,7 @@ describe("multi-model consultation", () => {
       await persistConsultation(directory, consultation)
 
       expect(await Bun.file(path.join(directory, "work", "CONSULTATION.md")).text()).toContain(
-        "## 综合计划：openai/main",
+        "## Synthesized plan: openai/main",
       )
       const saved = await Bun.file(path.join(directory, "work", "consultation.json")).json()
       expect(saved).toMatchObject({

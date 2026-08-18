@@ -231,7 +231,7 @@ function preview(text: string) {
   if (text.length <= MAX_PREVIEW_CHARS * 2 + 60) return text
   return [
     text.slice(0, MAX_PREVIEW_CHARS),
-    `\n… [中间 ${text.length - MAX_PREVIEW_CHARS * 2} 字符省略] …\n`,
+    `\n… [${text.length - MAX_PREVIEW_CHARS * 2} middle chars omitted] …\n`,
     text.slice(-MAX_PREVIEW_CHARS),
   ].join("")
 }
@@ -241,13 +241,13 @@ function localToolDefinitions() {
     {
       name: "boom_ida_get",
       description:
-        "分段读取已归档的 IDA 查询结果。ID 来自结果指针消息或 boom_ida_list；输出按行分块，避免一次性塞满上下文。",
+        "Read an archived IDA query result in segments. The ID comes from a result-pointer message or boom_ida_list; output is line-chunked to avoid overflowing the context.",
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "归档 ID（指针消息或 boom_ida_list 中的 id）" },
-          start_line: { type: "integer", minimum: 1, default: 1, description: "起始行，1 开始" },
-          max_lines: { type: "integer", minimum: 1, maximum: MAX_GET_LINES, default: 400, description: "返回的最大行数" },
+          id: { type: "string", description: "Archive ID (from a pointer message or boom_ida_list)" },
+          start_line: { type: "integer", minimum: 1, default: 1, description: "Start line, 1-indexed" },
+          max_lines: { type: "integer", minimum: 1, maximum: MAX_GET_LINES, default: 400, description: "Maximum number of lines to return" },
         },
         required: ["id"],
         additionalProperties: false,
@@ -255,11 +255,11 @@ function localToolDefinitions() {
     },
     {
       name: "boom_ida_list",
-      description: "列出最近归档的 IDA 查询结果（工具、目标函数、文件与大小），用于恢复上下文后快速定位已有分析。",
+      description: "List recently archived IDA query results (tool, target function, file, and size) to quickly relocate existing analysis after restoring context.",
       inputSchema: {
         type: "object",
         properties: {
-          limit: { type: "integer", minimum: 1, maximum: 500, default: 100, description: "最多返回条数" },
+          limit: { type: "integer", minimum: 1, maximum: 500, default: 100, description: "Maximum number of entries to return" },
         },
         additionalProperties: false,
       },
@@ -323,16 +323,16 @@ async function writeArtifact(directory: string, id: string, text: string) {
 }
 
 function pointerMessage(tool: string, text: string, entry: ManifestEntry) {
-  const truncated = entry.truncated ? " · 上游已截断" : ""
-  const repeat = entry.repeat ? " · 与上次同参查询内容一致，未重复写盘" : ""
+  const truncated = entry.truncated ? " · upstream truncated" : ""
+  const repeat = entry.repeat ? " · same as the previous same-arg query; not rewritten" : ""
   const lines = text.split("\n").length
   const content = [
-    `[IDA 结果已归档] work/ida/results/${entry.file}`,
-    `工具 ${tool} · ${entry.chars} 字符 · ${lines} 行${truncated}${repeat}`,
+    `[IDA result archived] work/ida/results/${entry.file}`,
+    `Tool ${tool} · ${entry.chars} chars · ${lines} lines${truncated}${repeat}`,
     "",
     preview(text),
     "",
-    `完整内容分段读取：idalib_boom_ida_get(id="${entry.id}")；最近归档列表：idalib_boom_ida_list()。`,
+    `Read the full content in segments: idalib_boom_ida_get(id="${entry.id}"); recent archive list: idalib_boom_ida_list().`,
   ].join("\n")
   return { content: [{ type: "text", text: content }], isError: false }
 }
@@ -422,27 +422,27 @@ async function splitAnalyzeBatch(
       })
       const result = response.result as ToolResult | undefined
       if (response.error || !result || result.isError)
-        throw new Error(response.error?.message ?? "上游查询失败")
+        throw new Error(response.error?.message ?? "upstream query failed")
       const text = resultText(result)
-      if (!text) throw new Error("上游返回空结果")
+      if (!text) throw new Error("upstream returned an empty result")
       const subArgs = { ...args, queries: [query] }
       const entry = await archive(state, name, subArgs, text, {
         truncated: upstreamTruncated(result),
         functions: [label],
       })
-      if (!entry) throw new Error("归档失败")
+      if (!entry) throw new Error("archiving failed")
       lines.push(
-        `- ${label}: work/ida/results/${entry.file} (${entry.chars} 字符${entry.truncated ? " · 上游截断" : ""})`,
+        `- ${label}: work/ida/results/${entry.file} (${entry.chars} chars${entry.truncated ? " · upstream truncated" : ""})`,
       )
     } catch (error) {
-      lines.push(`- ${label}: 查询失败 — ${errorText(error)}`)
+      lines.push(`- ${label}: query failed — ${errorText(error)}`)
     }
   }
   const content = [
-    `[IDA analyze_batch 拆批归档] 原批量结果超过上游输出上限，已按函数重查并归档 ${items.length} 份：`,
+    `[IDA analyze_batch split-and-archive] The original batch result exceeded the upstream output cap; re-queried per function and archived ${items.length} item(s):`,
     ...lines,
     "",
-    `用 idalib_boom_ida_get(id="<id>") 分段读取对应文件；全部列表：idalib_boom_ida_list()。`,
+    `Read each file in segments with idalib_boom_ida_get(id="<id>"); full list: idalib_boom_ida_list().`,
   ].join("\n")
   return { content: [{ type: "text", text: content }], isError: false }
 }
@@ -462,7 +462,7 @@ function callUpstream(state: ProxyState, message: Rpc) {
   return new Promise<Rpc>((resolve, reject) => {
     const timer = setTimeout(() => {
       state.upstreamPending.delete(id)
-      reject(new Error(`上游响应超时（${UPSTREAM_TIMEOUT_MS / 1000}s）`))
+      reject(new Error(`upstream response timeout (${UPSTREAM_TIMEOUT_MS / 1000}s)`))
     }, UPSTREAM_TIMEOUT_MS)
     state.upstreamPending.set(id, { resolve, reject, timer })
     sendUp(state, { ...message, id })
@@ -479,15 +479,15 @@ async function handleLocalTool(state: ProxyState, message: Rpc) {
     if (name === "boom_ida_get") {
       const directory = state.resultsDir ?? await ensureResultsDir(state)
       const id = typeof args.id === "string" ? args.id.trim() : ""
-      if (!directory) throw new Error("IDA 结果归档不可用（未发现任务工作区）")
-      if (!id) throw new Error("boom_ida_get 需要 id 参数")
+      if (!directory) throw new Error("IDA result archive unavailable (no task workspace found)")
+      if (!id) throw new Error("boom_ida_get requires an id argument")
       const entry = (await readManifestTail(directory, 500)).find((item) => item.id === id)
-      if (!entry) throw new Error(`找不到归档 ID：${id}（可用 boom_ida_list() 查看）`)
+      if (!entry) throw new Error(`archive ID not found: ${id} (use boom_ida_list() to view available IDs)`)
       const target = path.join(directory, entry.file)
       const info = await lstat(target)
-      if (!info.isFile()) throw new Error(`归档文件不是常规文件：${entry.file}`)
+      if (!info.isFile()) throw new Error(`archive file is not a regular file: ${entry.file}`)
       if (info.size > MAX_ARTIFACT_READ_BYTES)
-        throw new Error(`归档文件过大（${info.size} 字节），请用更小的范围读取`)
+        throw new Error(`archive file too large (${info.size} bytes); read a smaller range`)
       const text = await readFile(target, "utf8")
       const allLines = text.split("\n")
       const startLine = integerArg(args.start_line, 1)
@@ -498,9 +498,9 @@ async function handleLocalTool(state: ProxyState, message: Rpc) {
       const remaining = Math.max(0, allLines.length - end)
       const body = [
         `# work/ida/results/${entry.file}`,
-        `${entry.tool} · 第 ${start}-${end} 行 / 共 ${allLines.length} 行`,
+        `${entry.tool} · lines ${start}-${end} / ${allLines.length} total`,
         chunk.join("\n"),
-        remaining > 0 ? `\n… 还有 ${remaining} 行，用 start_line=${end + 1} 继续 …` : "",
+        remaining > 0 ? `\n… ${remaining} more lines; continue with start_line=${end + 1} …` : "",
       ].filter(Boolean).join("\n")
       sendDown({
         jsonrpc: "2.0",
@@ -514,14 +514,14 @@ async function handleLocalTool(state: ProxyState, message: Rpc) {
       const limit = Math.max(1, Math.min(500, integerArg(args.limit, 100)))
       const entries = directory ? await readManifestTail(directory, limit) : []
       const body = entries.length === 0
-        ? "暂无归档的 IDA 结果。"
+        ? "No archived IDA results."
         : [
-            `已归档 IDA 查询结果（最近 ${entries.length} 条）：`,
+            `Archived IDA query results (most recent ${entries.length}):`,
             ...entries.map((entry) =>
-              `- ${entry.id}  ${entry.at}  ${entry.tool}  ${entry.file}  ${entry.chars} 字符` +
-              `${entry.truncated ? " · 截断" : ""}` +
+              `- ${entry.id}  ${entry.at}  ${entry.tool}  ${entry.file}  ${entry.chars} chars` +
+              `${entry.truncated ? " · truncated" : ""}` +
               `${entry.functions?.length ? ` · ${entry.functions.join(", ")}` : ""}` +
-              `${entry.repeat ? " · 重复查询" : ""}`,
+              `${entry.repeat ? " · repeat query" : ""}`,
             ),
           ].join("\n")
       sendDown({
@@ -531,7 +531,7 @@ async function handleLocalTool(state: ProxyState, message: Rpc) {
       })
       return
     }
-    throw new Error(`未知的 Boom IDA 工具：${name}`)
+    throw new Error(`unknown Boom IDA tool: ${name}`)
   } catch (error) {
     sendDown({
       jsonrpc: "2.0",

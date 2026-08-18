@@ -54,7 +54,7 @@ export interface BoomToolHost {
   }): Promise<BoomToolResult>
 }
 
-const NOTE_HEADER = "# NOTES\n\n这是跨轮次、跨模型共享的任务记忆。由 ctf-note 工具维护。\n"
+const NOTE_HEADER = "# NOTES\n\nShared cross-turn, cross-model task memory. Maintained by the ctf-note tool.\n"
 
 function strings(value: unknown) {
   if (!Array.isArray(value) || !value.every((item) => typeof item === "string"))
@@ -69,7 +69,8 @@ function finite(value: unknown, fallback: number) {
 async function executeCommand(
   directory: string,
   input: Record<string, unknown>,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  networkAllowed: boolean,
 ): Promise<BoomToolResult> {
   if (typeof input.program !== "string" || !input.program.trim())
     throw new Error("boom-exec requires program")
@@ -90,7 +91,8 @@ async function executeCommand(
     mode,
     timeoutMs,
     maxOutputBytes,
-    network: input.network === true,
+    // The per-call flag and the host network switch must both allow network access.
+    network: input.network === true && networkAllowed,
     purpose,
   }
   const result = await executeControlledCommand({ directory, request, signal })
@@ -112,7 +114,8 @@ async function executeCommand(
 async function executeShell(
   directory: string,
   input: Record<string, unknown>,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  networkAllowed: boolean,
 ): Promise<BoomToolResult> {
   const result = await executeControlledShell({
     directory,
@@ -121,7 +124,7 @@ async function executeShell(
       command: typeof input.command === "string" ? input.command : "",
       ...(typeof input.workdir === "string" ? { workdir: input.workdir } : {}),
       ...(typeof input.timeout === "number" ? { timeout: input.timeout } : {}),
-      network: true,
+      network: networkAllowed,
     },
   })
   return {
@@ -210,15 +213,21 @@ async function executeConsultationRequest(
 
 export function createBoomToolHost(
   registry: BoomToolRegistry,
-  options: { skillRoot?: string; networkBroker?: BoomNetworkBroker } = {},
+  options: {
+    skillRoot?: string
+    networkBroker?: BoomNetworkBroker
+    /** Host-wide network switch; "deny" removes network from bash/boom-exec sandboxes too. */
+    network?: "allow" | "deny"
+  } = {},
 ): BoomToolHost {
+  const networkAllowed = options.network !== "deny"
   const executeStateTool = createBoomStateToolExecutor(
     options.skillRoot ?? path.join(import.meta.dir, "..", "resources", "runtime", "skills"),
   )
   const executeWebTool = createBoomWebToolExecutor(options.networkBroker ?? createBoomNetworkBroker())
   const handlers = {
     bash: (input: Parameters<BoomToolHost["execute"]>[0]) =>
-      executeShell(input.directory, input.arguments, input.signal),
+      executeShell(input.directory, input.arguments, input.signal, networkAllowed),
     read: (input: Parameters<BoomToolHost["execute"]>[0]) => executeBoomFileTool({ ...input, name: "read" }),
     list: (input: Parameters<BoomToolHost["execute"]>[0]) => executeBoomFileTool({ ...input, name: "list" }),
     glob: (input: Parameters<BoomToolHost["execute"]>[0]) => executeBoomFileTool({ ...input, name: "glob" }),
@@ -229,7 +238,7 @@ export function createBoomToolHost(
     websearch: (input: Parameters<BoomToolHost["execute"]>[0]) => executeWebTool({ ...input, name: "websearch" }),
     webfetch: (input: Parameters<BoomToolHost["execute"]>[0]) => executeWebTool({ ...input, name: "webfetch" }),
     "boom-exec": (input: Parameters<BoomToolHost["execute"]>[0]) =>
-      executeCommand(input.directory, input.arguments, input.signal),
+      executeCommand(input.directory, input.arguments, input.signal, networkAllowed),
     "ctf-note": (input: Parameters<BoomToolHost["execute"]>[0]) =>
       executeNote(input.directory, input.arguments),
     "ctf-consult": (input: Parameters<BoomToolHost["execute"]>[0]) =>

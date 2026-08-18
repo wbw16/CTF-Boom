@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { EnvironmentPool } from "../src/competition/environments.ts"
 import { GuiRunner } from "../src/runner.ts"
 import type { RuntimeHandle } from "../src/runtime-contract.ts"
 
@@ -103,6 +104,29 @@ async function challengeAt(root: string, category: string, slug: string, meta: R
 }
 
 describe("competition scheduling", () => {
+  test("bulk environment close recovers every held lease", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "boom-comp-close-all-"))
+    temporary.push(root)
+    const recovered: string[] = []
+    const runner = new GuiRunner(root, async () => gatedRuntime().handle)
+    const pool = new EnvironmentPool(3, async (exerciseId) => { recovered.push(exerciseId) })
+    ;(runner as unknown as { environments: EnvironmentPool }).environments = pool
+    pool.acquire("web-a", "101")
+    pool.acquire("web-b", "102")
+
+    try {
+      await expect(runner.closeAllEnvironments()).resolves.toEqual({
+        stopped: 0,
+        released: 2,
+        errors: [],
+      })
+      expect(recovered).toEqual(["101", "102"])
+      expect(runner.getCompetitionState().environments.used).toBe(0)
+    } finally {
+      await runner.close()
+    }
+  })
+
   test("admits no more than the configured number of remote-environment challenges", async () => {
     const interpreter = Bun.which("python3")
     if (!interpreter) return

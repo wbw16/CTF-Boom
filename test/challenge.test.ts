@@ -5,6 +5,24 @@ import path from "node:path"
 import { discoverChallenges, loadChallenge } from "../src/challenge.ts"
 
 describe("challenge discovery safety", () => {
+  test("keeps an empty synchronized placeholder from blocking challenge discovery", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "boom-empty-challenge-"))
+    try {
+      await mkdir(path.join(root, "challenges", "CRYPTO", "0_1_Game"), { recursive: true })
+
+      const challenges = await discoverChallenges(root)
+
+      expect(challenges).toEqual([expect.objectContaining({
+        slug: "0_1_Game",
+        category: "CRYPTO",
+        description: "",
+        files: [],
+      })])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("preserves an external-service prerequisite from meta.json", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "boom-service-challenge-"))
     try {

@@ -32,6 +32,7 @@ function state(...runs: RunHistory[]): GuiState {
       economyModel: "test/model",
       strongModel: "test/model",
       tokens: 10_000,
+      tokenBudgetEnabled: true,
       repeats: 3,
       minutes: 5,
       concurrency: 1,
@@ -51,6 +52,7 @@ function state(...runs: RunHistory[]): GuiState {
       category: "MISC",
       storagePath: "MISC/alpha",
       files: [],
+      serviceRequired: true,
       runs,
     }],
   }
@@ -79,10 +81,14 @@ describe("GUI task detail rendering", () => {
       menu: null,
       deleteTarget: null,
       now: 200,
+      notices: [],
+      unreadNoticeCount: 0,
       select: noop,
       setFilter: noop,
       toggleCollapsed: noop,
       refresh: async () => {},
+      refreshNotices: async () => {},
+      markNoticeRead: noop,
       loadDetail: async () => {},
       toast: noop,
       openDialog: noop,
@@ -99,6 +105,7 @@ describe("GUI task detail rendering", () => {
     expect(html).toContain("exploit.py")
     expect(html).toContain("Live writeup")
     expect(html).toContain("flag{live}")
+    expect(html.indexOf("service-endpoint")).toBeLessThan(html.indexOf("detail-flag"))
   })
 
   test("keeps a resumed historical run focused while it is live", () => {
@@ -128,10 +135,14 @@ describe("GUI task detail rendering", () => {
       menu: null,
       deleteTarget: null,
       now: 200,
+      notices: [],
+      unreadNoticeCount: 0,
       select: noop,
       setFilter: noop,
       toggleCollapsed: noop,
       refresh: async () => {},
+      refreshNotices: async () => {},
+      markNoticeRead: noop,
       loadDetail: async () => {},
       toast: noop,
       openDialog: noop,
@@ -165,9 +176,9 @@ describe("GUI task detail rendering", () => {
     const value: AppContextValue = {
       theme: "light", setTheme: noop, data: state(resumedSummary, newerFinished),
       selected: "alpha", detail: resumedDetail, filter: "", collapsed: new Set(),
-      toasts: [], dialog: null, menu: null, deleteTarget: null, now: 200,
+      toasts: [], dialog: null, menu: null, deleteTarget: null, now: 200, notices: [], unreadNoticeCount: 0,
       select: noop, setFilter: noop, toggleCollapsed: noop,
-      refresh: async () => {}, loadDetail: async () => {}, toast: noop,
+      refresh: async () => {}, refreshNotices: async () => {}, markNoticeRead: noop, loadDetail: async () => {}, toast: noop,
       openDialog: noop, closeDialog: noop, requestDelete: noop, setMenu: noop,
     }
 

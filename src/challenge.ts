@@ -211,8 +211,9 @@ export async function loadChallenge(
   const explicit = await lstat(path.join(directory, "files")).catch(() => undefined)
   const attachmentBase = explicit?.isDirectory() ? path.join(directory, "files") : directory
   const files = await collectFiles(attachmentBase)
-  if (files.length === 0 && description === "")
-    throw new Error(`${directory}: no attachments and no description — nothing for Boom to inspect`)
+  // A platform sync can be interrupted after creating its destination directory but before the
+  // title, description, or attachments are written. Keep that placeholder discoverable so it
+  // cannot prevent the rest of the catalog from loading; a later sync can safely fill it in.
 
   const answer = answers.get(slug)
   const meta = await readFile(path.join(directory, META_NAME), "utf8")

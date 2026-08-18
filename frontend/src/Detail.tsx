@@ -102,9 +102,11 @@ export function Detail() {
   const raiseBudget = async () => {
     const tokens = settings.tokens * 2
     try {
-      await postJSON("/api/settings", { ...settings, tokens })
-      await actions.runChallenges([challenge.slug], { hint, runID: run?.id })
-      toast("已提高上限并继续")
+      // Settings are updated through PATCH.  Using POST made this recovery action fail with a
+      // misleading 404 before the run could be queued.
+      await patchJSON("/api/settings", { ...settings, tokens, tokenBudgetEnabled: true })
+      const queued = await actions.runChallenges([challenge.slug], { hint, runID: run?.id })
+      if (queued) toast("已提高上限并继续")
     } catch (error) {
       toast((error as Error).message, "error")
     }
@@ -148,19 +150,6 @@ export function Detail() {
         <div className="detail-title">
           <h2>{categoryOf(challenge)} / {challenge.slug}</h2>
           <span className="tag">{challenge.files.length} 个附件{challenge.difficulty ? ` · ${challenge.difficulty}` : ""}</span>
-          {flag ? (
-            <button
-              type="button"
-              className="detail-flag"
-              title={`点击复制 ${flag}`}
-              aria-label={`复制 Flag ${flag}`}
-              onClick={() => void verdictAction("copy")}
-            >
-              <span className="detail-flag-label"><FlagIcon size={11} aria-hidden="true" /> 已找到 Flag</span>
-              <span className="detail-flag-value">{flag}</span>
-              <Copy size={12} aria-hidden="true" />
-            </button>
-          ) : null}
           <span className="spacer" />
           <span className="num detail-stats">
             {compactNumber(run?.tokens ?? 0)} tokens · {run ? mmss(durationMs(run, now)) : "00:00"} · $
@@ -217,6 +206,19 @@ export function Detail() {
           </form>
         ) : null}
         <div className="detail-actions">
+          {flag ? (
+            <button
+              type="button"
+              className="detail-flag"
+              title={`点击复制 ${flag}`}
+              aria-label={`复制 Flag ${flag}`}
+              onClick={() => void verdictAction("copy")}
+            >
+              <span className="detail-flag-label"><FlagIcon size={11} aria-hidden="true" /> 已找到 Flag</span>
+              <span className="detail-flag-value">{flag}</span>
+              <Copy size={12} aria-hidden="true" />
+            </button>
+          ) : null}
           {primaryKind === "run" ? (
             <input
               className="hint-input"
@@ -230,7 +232,7 @@ export function Detail() {
                 }
               }}
             />
-          ) : <span className="spacer" />}
+          ) : !flag ? <span className="spacer" /> : null}
           <button
             type="button"
             className={`btn ${primaryKind === "stop" ? "" : "btn-primary"}`}

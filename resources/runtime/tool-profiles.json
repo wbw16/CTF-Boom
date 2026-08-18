@@ -108,6 +108,20 @@
         }
       }
     },
+    "describe-image": {
+      "description": "Inspect one task-local image with Boom's configured vision model and answer a focused question about visible content.",
+      "implementation": "compatibility",
+      "sideEffect": "network",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "question"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "question": { "type": "string", "minLength": 1, "maxLength": 8192 }
+        }
+      }
+    },
     "skill": {
       "description": "Load one named Boom-owned skill resource and its bounded supporting-file inventory.",
       "implementation": "boom",
@@ -242,7 +256,7 @@
   },
   "profiles": {
     "solver": {
-      "tools": ["bash", "read", "edit", "write", "list", "glob", "grep", "task", "skill", "websearch", "webfetch", "todowrite", "boom-exec", "ctf-note", "ctf-consult", "ctf-submit"],
+      "tools": ["bash", "read", "edit", "write", "list", "glob", "grep", "task", "skill", "websearch", "webfetch", "boom-exec", "ctf-note", "ctf-consult", "ctf-submit"],
       "effects": { "write": "run", "process": "allow", "network": "allow", "memory": "allow", "submit": "allow", "delegate": "allow" }
     },
     "worker": {

@@ -150,5 +150,9 @@ export async function resolveTaskPath(
     if (segments[1] === ".boom" || relative === "work/RESULT.json")
       throw new Error(`Boom policy denied write to host-owned task state: ${requested}`)
   }
+  if (access === "read") {
+    if (zone === "work" && segments.length >= 2 && (segments[1] === ".boom" || relative === "work/RESULT.json"))
+      throw new Error(`Boom policy denied read of host-owned task state: ${requested}`)
+  }
   return { root, absolute, relative, zone }
 }

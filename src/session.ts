@@ -16,8 +16,8 @@ import { compilePromptText, createPromptBundle } from "./runtime/prompt.ts"
 import type { Workspace } from "./workspace.ts"
 
 export type Limits = {
-  /** Abort once total tokens across the session exceed this. */
-  tokens: number
+  /** Abort once total tokens across the session exceed this. Absent means no token ceiling. */
+  tokens?: number
   /** Abort after the same tool call is repeated this many times consecutively. */
   repeats: number
   /** Abort after this many milliseconds of wall-clock time. */
@@ -35,6 +35,20 @@ export type Limits = {
    * while no tool is running. Absent or non-positive disables it.
    */
   silenceMs?: number
+  /**
+   * Progress heartbeat thresholds. After `heartbeatTextSilenceMs` without model text while tool
+   * activity continues, emit a `status: "heartbeat"` event, throttled to once per
+   * `heartbeatMinIntervalMs`. Absent values fall back to the built-in defaults; injectable so tests
+   * can exercise the heartbeat without waiting minutes.
+   */
+  heartbeatTextSilenceMs?: number
+  heartbeatMinIntervalMs?: number
+  /**
+   * Note-gate threshold: how many consecutive tool calls without a durable `ctf-note`/`ctf-submit`
+   * force the turn to stop at the next boundary and record state first. Absent falls back to the
+   * built-in default; non-positive disables the gate.
+   */
+  noteGateToolCalls?: number
   /** Base delay for provider retries. Primarily injectable so conformance tests do not sleep. */
   retryBaseMs?: number
 }
@@ -148,6 +162,25 @@ const DEFAULT_OUTPUT_CHARS = 200_000
 const ARTIFACT_REPRIEVES = 3
 
 /**
+ * Progress heartbeat. A solver can run tools for minutes without emitting any text, which reads as
+ * "stuck" to a human watching the run. Once this much time passes since the last model text with
+ * tool activity continuing, Boom emits a `status: "heartbeat"` event so the UI can distinguish a
+ * working run from a dead one. The heartbeat repeats at most once per `HEARTBEAT_MIN_INTERVAL_MS`.
+ */
+const HEARTBEAT_TEXT_SILENCE_MS = 120_000
+const HEARTBEAT_MIN_INTERVAL_MS = 60_000
+
+/**
+ * Note-gate. A solve turn that runs this many tool calls in a row without a completed `ctf-note` or
+ * `ctf-submit` is forced to stop at the next turn boundary and record its state before continuing.
+ * The provider's tool loop is atomic, so the gate lands as an injected prompt at the round boundary
+ * rather than mid-round. The default is deliberately loose (a busy exploratory turn in this dataset
+ * runs ~130 tool calls): the gate exists to guarantee *some* durable memory exists before a switch or
+ * recovery, not to police every minute of work.
+ */
+const NOTE_GATE_TOOL_CALLS = 30
+
+/**
  * Default no-activity watchdog interval.
  *
  * Short enough to rescue a hung provider long before the wall-clock backstop, long enough that a slow
@@ -173,7 +206,7 @@ function boundedHeadAndTail(value: string, maximum: number) {
   const tail = maximum - head
   return [
     value.slice(0, head),
-    `\n\n[活动上下文过长，中间 ${value.length - maximum} 个字符未导出]\n\n`,
+    `\n\n[activity context too long; ${value.length - maximum} middle characters omitted]\n\n`,
     value.slice(-tail),
   ].join("")
 }
@@ -370,27 +403,33 @@ export function findCandidates(text: string, flagFormat: string) {
 
 // The task prompt is a contract, not a lesson. Domain strategies and tool sequences belong to the
 // model; Boom supplies only the input locations and required durable outputs.
-const PROMPT = [
-  "当前工作目录包含一道 CTF 题目：challenge/ 是只读输入，work/ 是工作目录，NOTES.md 是跨轮次持久记录。",
-  "目标是获得 flag。得到一个可信候选后立刻通过 ctf-submit 提交，不要等待 Writeup；宿主会立即结束本轮并判定候选。",
-  "只有宿主在后续轮次明确告知候选正确后，才生成可复现的 work/WRITEUP.md。候选被拒绝时继续解题，不要重复提交已否定值。",
-  "关键突破、已确认事实和有证据的排除结论需要保存在 NOTES.md。如何解题和使用工具完全由你决定。",
-  "长任务中不要只追加流水账；需要交接时用 ctf-note kind=checkpoint 把当前目标、事实、假设、排除方向和下一步压缩成一份紧凑摘要。",
-].join("")
+const PROMPT = `# Solve turn
+
+challenge/ is read-only input; work/ is your workspace; NOTES.md is cross-turn memory.
+
+- Act, don't narrate. Your first tool call must make concrete progress — open an attachment, connect to the service, or inspect a file. Do not plan at length before acting.
+- Use tools to verify, not prose. Keep iterating with tools until you have a credible flag; do not stop to summarize without having acted.
+- On a credible candidate, call ctf-submit immediately and stop. Never treat your own claim as host-confirmed, and never resubmit a value the host has rejected.
+- Only generate work/WRITEUP.md after a later turn explicitly tells you the candidate was accepted.
+- Cover maximum surface: hidden files, env vars, HTTP headers, alternate encodings, secondary services. Don't fixate on one path.
+- If a direction produces no verifiable new fact for several turns, record it as ruled-out in NOTES.md and switch direction instead of deepening it.
+- Delegate mechanical / brute-force / large-output work to boom-worker(-pro) via task; bring only conclusions back. If the whole direction looks wrong, request an independent consultation via ctf-consult.
+- Record breakthroughs, confirmed facts, and ruled-out directions in NOTES.md; checkpoint with ctf-note periodically rather than waiting until handoff.
+- bash runs at the task root by default; pass workdir= to work inside work/ instead of re-cd-ing.`
 
 const CATEGORY_GUIDANCE = {
-  WEB: "优先检查 HTTP 行为、路由、参数、会话与鉴权、前后端源码及 Web 输入边界；没有证据时不要先投入二进制利用。",
-  PWN: "优先确认架构、保护、输入输出协议、内存破坏面和可复现利用链。",
-  REVERSE: "优先确认架构与运行时，结合静态和动态分析还原校验逻辑或数据变换。",
-  CRYPTO: "优先区分编码与密码算法，整理参数、数学关系和实现缺陷，并用可复现实验验证推导。",
-  MISC: "优先做文件类型、元数据、编码、隐写、取证和协议流量分诊，再沿已有证据深入。",
-  MOBILE: "优先确认平台与包结构，检查清单、资源、存储、网络行为、原生库和运行时校验。",
-  FORENSICS: "优先保护证据完整性，梳理时间线、文件系统、内存或流量中的可验证痕迹。",
-  AI: "优先明确模型、数据、输入输出和评分边界，再检查提示注入、数据处理或模型实现缺陷。",
-  HARDWARE: "优先确认器件、固件、接口和信号协议，从可观测输入输出建立证据链。",
-  BLOCKCHAIN: "优先检查合约状态、权限、调用路径、数值边界和可复现交易序列。",
-  OSINT: "优先从题目给出的公开线索建立来源可靠、时间一致且可交叉验证的证据链。",
-  OTHER: "先完成题型分诊，再依据题目文件、服务和实验结果选择方向。",
+  WEB: "Prioritize HTTP behavior, routes, params, sessions, auth, frontend source, and web input boundaries; do not jump to binary exploitation without evidence.",
+  PWN: "Prioritize architecture, protections, I/O protocol, memory-corruption surface, and a reproducible exploit chain.",
+  REVERSE: "Prioritize architecture and runtime; combine static and dynamic analysis to recover validation logic or data transforms.",
+  CRYPTO: "Distinguish encoding from cryptography; lay out parameters, math relations, and implementation flaws, and verify derivations with reproducible experiments.",
+  MISC: "Triage file type, metadata, encoding, steganography, forensics, and protocol/traffic first, then follow the evidence deeper.",
+  MOBILE: "Prioritize platform and package structure; check manifests, resources, storage, network behavior, native libs, and runtime checks.",
+  FORENSICS: "Preserve evidence integrity; build a verifiable trail across timeline, filesystem, memory, or traffic.",
+  AI: "Clarify model, data, I/O, and scoring boundaries first; then check prompt injection, data handling, or model-implementation flaws.",
+  HARDWARE: "Confirm device, firmware, interfaces, and signal protocols; build an evidence chain from observable I/O.",
+  BLOCKCHAIN: "Check contract state, permissions, call paths, numeric boundaries, and reproducible transaction sequences.",
+  OSINT: "Build a source-reliable, time-consistent, cross-verifiable evidence chain from the public clues the challenge provides.",
+  OTHER: "Triage the challenge type first, then choose a direction from the challenge files, services, and experimental results.",
 } as const
 
 export type SolverPromptCapabilities = {
@@ -399,10 +438,10 @@ export type SolverPromptCapabilities = {
 }
 
 const HEADLESS_IDA_GUIDANCE = [
-  "本题可使用 headless IDA Pro MCP（idalib）。处理原生可执行文件时，优先将目标从 challenge/ 复制到 work/ida/，再使用 idb_open 的 force_headless 模式完成自动分析，并结合 survey_binary、list_funcs、decompile、xrefs_to、callees 和 callgraph 恢复程序逻辑；不要直接在 challenge/ 下生成 IDB。",
-  "若 IDA 打开、自动分析或反编译失败，记录具体错误，再回退到 objdump、LLDB、Python、angr 等工具；不要仅因 shell 工具可用就跳过 IDA。成功打开 IDB 后应围绕入口、校验路径、关键字符串及其交叉引用查询相关函数，避免无目的地反编译全部函数。",
-  "IDA 的大型查询结果会自动归档到 work/ida/results/，上下文里只保留摘要与文件指针：用 idalib_boom_ida_get 按行分段读取细节，用 idalib_boom_ida_list 查看已归档查询。归档属于持久产物，恢复回合应优先读取，不要重复查询同样的函数。",
-].join("")
+  "Headless IDA Pro MCP (idalib) is available. For native executables, copy the target from challenge/ to work/ida/ first, then use idb_open in force_headless mode to auto-analyze, and recover program logic with survey_binary, list_funcs, decompile, xrefs_to, callees, and callgraph; do not generate an IDB directly under challenge/.",
+  "If IDA open, auto-analysis, or decompilation fails, record the specific error and fall back to objdump, LLDB, Python, angr, etc.; do not skip IDA merely because shell tools are available. Once an IDB is open, query functions around entry points, validation paths, and key strings and their xrefs; avoid aimlessly decompiling every function.",
+  "Large IDA query results are auto-archived under work/ida/results/; the context keeps only a summary and a file pointer. Use idalib_boom_ida_get to read details line by line in segments, and idalib_boom_ida_list to view archived queries. Archives are durable artifacts — resume turns should read them first and not re-query the same functions.",
+].join(" ")
 
 /** Give the solver a bounded prior without overriding contrary evidence from the challenge. */
 export function challengeCategoryPrompt(
@@ -412,13 +451,14 @@ export function challengeCategoryPrompt(
   if (!category?.trim()) return ""
   const normalized = normalizeChallengeCategory(category)
   return [
-    `你现在正在解一道 CTF ${normalized} 类型题目。`,
+    `You are solving a CTF ${normalized} challenge.`,
     CATEGORY_GUIDANCE[normalized],
     capabilities.headlessIda && (normalized === "REVERSE" || normalized === "PWN")
       ? HEADLESS_IDA_GUIDANCE
       : "",
-    "分类只用于安排排查优先级；如果与题目文件、服务或实验结果冲突，以实际证据为准。",
-  ].filter(Boolean).join("")
+    "The category only orders your priorities; follow actual evidence if the files, services, or experimental results conflict.",
+    "If a direction produces no verifiable new fact for several turns, record it as ruled-out and switch direction instead of deepening it.",
+  ].filter(Boolean).join(" ")
 }
 
 function withCategoryPrompt(
@@ -427,7 +467,9 @@ function withCategoryPrompt(
   capabilities: SolverPromptCapabilities = {},
 ) {
   const context = challengeCategoryPrompt(category, capabilities)
-  return context ? `${context}\n\n${prompt}` : prompt
+  // Keep the cross-task turn contract at the front of the user message. Category guidance is
+  // stable only within one class of challenge, while the caller appends user/task state last.
+  return context ? `${prompt}\n\n${context}` : prompt
 }
 
 export function buildPrompt(
@@ -436,16 +478,25 @@ export function buildPrompt(
   capabilities: SolverPromptCapabilities = {},
 ) {
   const trimmed = hint?.trim()
-  const prompt = trimmed ? `${PROMPT}\n\n用户追加提示：${trimmed}` : PROMPT
-  return compileTurnPrompt("turn:solve", withCategoryPrompt(prompt, category, capabilities))
+  const prompt = withCategoryPrompt(PROMPT, category, capabilities)
+  return compileTurnPrompt(
+    "turn:solve",
+    trimmed ? `${prompt}\n\nUser-added hint: ${trimmed}` : prompt,
+  )
 }
 
-const CONTINUE_PROMPT = [
-  "继续完成同一道题。challenge/ 是只读输入，work/ 和 NOTES.md 包含此前工作。",
-  "目标仍是获得 flag；得到可信候选后立刻通过 ctf-submit 提交。候选正确前不要生成最终 Writeup。",
-  "保留关键进展和有证据的排除结论；如何继续完全由你决定。",
-  "本轮开始时已自动注入紧凑交接摘要，先按摘要恢复；若与工作区实际文件冲突，以实际文件为准。",
-].join("")
+const CONTINUE_PROMPT = `# Continue turn
+
+Same challenge. challenge/ is read-only input; work/ and NOTES.md hold prior work.
+
+- Act, don't narrate. Make a concrete tool call first; do not plan at length before acting.
+- Keep the goal: recover the flag. On a credible candidate, call ctf-submit immediately and stop; do not generate the final writeup until the candidate is confirmed.
+- Never treat your own claim as host-confirmed, and never resubmit a value the host has rejected.
+- Cover maximum surface; if a direction produces no verifiable new fact for several turns, record it as ruled-out in NOTES.md and switch direction instead of deepening it.
+- Delegate mechanical / brute-force / large-output work to boom-worker(-pro) via task; bring only conclusions back. If the whole direction looks wrong, request an independent consultation via ctf-consult.
+- Record breakthroughs, confirmed facts, and ruled-out directions in NOTES.md; checkpoint with ctf-note periodically rather than waiting until handoff.
+- bash runs at the task root by default; pass workdir= to work inside work/ instead of re-cd-ing.
+- A compact handoff summary was injected at the start of this turn; resume from it, but trust actual files if they conflict.`
 
 export function buildContinuationPrompt(
   hint?: string,
@@ -453,32 +504,29 @@ export function buildContinuationPrompt(
   capabilities: SolverPromptCapabilities = {},
 ) {
   const trimmed = hint?.trim()
+  const prompt = withCategoryPrompt(CONTINUE_PROMPT, category, capabilities)
   return compileTurnPrompt(
     "turn:continue",
-    withCategoryPrompt(
-      trimmed ? `${CONTINUE_PROMPT}\n\n用户追加提示：${trimmed}` : CONTINUE_PROMPT,
-      category,
-      capabilities,
-    ),
+    trimmed ? `${prompt}\n\nUser-added hint: ${trimmed}` : prompt,
   )
 }
 
-const WRITEUP_PROMPT = [
-  "平台或用户已经确认候选 flag 正确。现在停止继续猜测或提交 flag。",
-  "请根据 challenge/、work/ 与 NOTES.md 中已有证据生成最终 work/WRITEUP.md，包含正确 flag、完整推导和可复现步骤。",
-  "Writeup 必须使用中文撰写：标题、说明、推导和复现步骤均使用中文；命令、代码、文件路径与 flag 保持原样。",
-  "如果存在实际用于求解或验证 flag 的脚本，必须在 Writeup 中标明脚本路径和运行方式，并用代码块嵌入脚本的完整源码；不得只引用脚本文件，也不得省略、截断或用省略号代替任何代码。",
-  "不要调用 ctf-submit；完成 Writeup 后简短结束本轮。",
-].join("")
+const WRITEUP_PROMPT = `# Writeup turn
+
+The candidate flag is confirmed by the platform or user. Stop guessing or submitting flags.
+
+- Generate work/WRITEUP.md offline from challenge/, work/, and NOTES.md only. Include the confirmed flag, core idea, derivation, and reproducible steps.
+- Write the writeup in Chinese. Keep commands, code, file paths, and the literal flag unchanged.
+- If a PoC/script was actually used, include its path, invocation, and complete source in a fenced code block — no truncation, ellipsis, or file-reference substitutes.
+- If no script/PoC was actually used, do not invent one; write the verified reasoning and manual reproduction steps.
+- Do not call ctf-submit. Finish the turn shortly after the writeup.`
 
 export function buildWriteupPrompt(flag: string, hint?: string, category?: string) {
   const extra = hint?.trim()
+  const prompt = withCategoryPrompt(WRITEUP_PROMPT, category)
   return compileTurnPrompt(
     "turn:writeup",
-    withCategoryPrompt(
-      `${WRITEUP_PROMPT}\n\n已确认 flag：${flag}${extra ? `\n\n补充说明：${extra}` : ""}`,
-      category,
-    ),
+    `${prompt}\n\nConfirmed flag: ${flag}${extra ? `\n\nAdditional note: ${extra}` : ""}`,
   )
 }
 
@@ -490,49 +538,60 @@ function compileTurnPrompt(source: string, content: string) {
 
 // Sent when a transient provider failure interrupted the previous turn. The session is the same one,
 // so this resumes rather than restarts: work/ and NOTES.md still hold everything done so far.
-const RESUME = [
-  "上一轮因运行服务故障中断。work/ 和 NOTES.md 保留了已有工作，请继续完成原目标。",
-].join("")
+const RESUME = `# Resume turn
+
+The previous turn was interrupted by a runtime fault. work/ and NOTES.md hold all prior progress.
+
+- Continue the original goal from the last incomplete step; do not redo completed work.`
 
 // A `length` finish is a completed provider call, not a transport failure. Re-sending the original
 // prompt encourages a degenerated model to emit the same long sequence again, so recovery explicitly
 // redirects bulk data to disk and asks for a durable checkpoint before continuing.
-const LENGTH_RECOVERY = [
-  "上一回复因达到 Provider 单次输出长度上限而被截断。",
-  "请将需要保留的已有进展写入 work/ 和 NOTES.md，并继续完成原目标。",
-].join("")
+const LENGTH_RECOVERY = `# Resume turn
 
-const UNKNOWN_RECOVERY = [
-  "上一回复的 Provider 结束状态不明确，可能被中途截断。原始输出已保存在 work/.boom/recovery/。",
-  "不要重复大段输出；先核对 work/、NOTES.md 和已完成的工具结果，然后从中断处继续。若已有可信候选，立即调用 ctf-submit。",
-].join("")
+The previous reply hit the provider's single-turn output length cap and was truncated.
 
-const EMPTY_RECOVERY = [
-  "上一轮 Provider 没有返回可用内容。这是运行故障，不代表题目已经完成。",
-  "请基于 work/ 与 NOTES.md 中的现有状态继续原目标，不要重新执行已有证据表明无效的动作。",
-].join("")
+- Write anything you need to keep into work/ and NOTES.md, then continue the original goal.
+- Do not repeat the same long output; redirect bulk data to disk first.`
 
-const CONTENT_FILTER_RECOVERY = [
-  "上一回复因内容安全策略被拦截，没有任何可用输出。这是运行故障，不代表题目已经完成。",
-  "请换一种中性措辞，避免重复触发过滤；基于 work/ 与 NOTES.md 中的现有状态继续原目标。",
-].join("")
+const UNKNOWN_RECOVERY = `# Resume turn
 
-const CANCELLED_RECOVERY = [
-  "上一轮 Provider 在返回完整结果前主动取消了响应。这是运行故障，不代表题目已经完成。",
-  "请基于 work/ 与 NOTES.md 中的现有状态从中断处继续，不要重做已有证据表明无效的动作。",
-].join("")
+The previous reply's provider finish state was ambiguous and may have been truncated mid-stream. The raw output was saved under work/.boom/recovery/.
 
-const PROVIDER_HANDOFF = [
-  "用户刚刚切换了当前任务使用的模型或 Provider。",
-  "这是同一任务的受控交接：work/、NOTES.md、已完成的工具结果和下面的活动上下文都属于此前进展。",
-  "先从最后一个未完成步骤继续，不要重做已完成工作；如果兼容性提示指出某项能力不可用，请改用现有工具或文件状态完成目标。",
-].join("")
+- Do not repeat large outputs; check work/, NOTES.md, and existing tool results first, then continue from where it stopped.
+- If you already have a credible candidate, call ctf-submit immediately.`
+
+const EMPTY_RECOVERY = `# Resume turn
+
+The previous turn returned no usable content. This is a runtime fault, not a sign the challenge is done.
+
+- Continue the original goal from the current state in work/ and NOTES.md; do not redo actions the evidence already shows are dead ends.`
+
+const CONTENT_FILTER_RECOVERY = `# Resume turn
+
+The previous reply was blocked by a content-safety policy and produced no usable output. This is a runtime fault, not a sign the challenge is done.
+
+- Continue the original goal from the current state in work/ and NOTES.md.
+- Rephrase neutrally to avoid tripping the filter again.`
+
+const CANCELLED_RECOVERY = `# Resume turn
+
+The provider cancelled the previous turn's response before it completed. This is a runtime fault, not a sign the challenge is done.
+
+- Continue from where it stopped using the current state in work/ and NOTES.md; do not redo actions the evidence already shows are dead ends.`
+
+const PROVIDER_HANDOFF = `# Resume turn
+
+The user just switched the model or provider for this task. This is a controlled handoff of the same task: work/, NOTES.md, completed tool results, and the activity context below are all prior progress.
+
+- Continue from the last incomplete step; do not redo completed work.
+- If a compatibility note says some capability is unavailable, fall back to existing tools or file state to finish the goal.`
 
 // Sent when the provider rejected a file the agent attached. Naming the cause matters: otherwise it
 // retries the same read and loses the run to a failure it could have worked around.
-const REJECTED = [
-  "上一轮提交给 Provider 的文件附件被拒收。该附件无法按原方式传入模型，请继续完成原目标。",
-].join("")
+const REJECTED = `# Resume turn
+
+A file attachment submitted to the provider last turn was rejected. It cannot be passed to the model as-is; continue the original goal without it.`
 
 /** Drive one challenge while enforcing token and repeated-call limits from the live event stream. */
 export async function runChallenge(input: {
@@ -597,7 +656,7 @@ export async function runChallenge(input: {
       })
       resumed = true
     } catch (error) {
-      resumeWarning = `原会话无法由新 Runtime 恢复：${describe(error)}`
+      resumeWarning = `The previous session could not be resumed by the new runtime: ${describe(error)}`
       conversation = await input.runtime.createConversation({
         directory: input.workspace.directory,
         title: `Boom: ${input.challenge.slug}`,
@@ -605,7 +664,7 @@ export async function runChallenge(input: {
     }
   } else {
     if (input.resumeSessionID)
-      resumeWarning = "新 Runtime 不支持恢复原会话，已使用活动上下文建立同任务的新会话"
+      resumeWarning = "The new runtime cannot resume the previous session; a fresh session for the same task was started from the activity context"
     conversation = await input.runtime.createConversation({
       directory: input.workspace.directory,
       title: `Boom: ${input.challenge.slug}`,
@@ -636,6 +695,22 @@ export async function runChallenge(input: {
   let outputChars = 0
   const outputLimit = Math.max(8_000, Math.floor(input.limits.outputChars ?? DEFAULT_OUTPUT_CHARS))
   const runStarted = Date.now()
+  // Progress heartbeat state. `lastTextAt` moves on any model text; when tool activity outlives it by
+  // `heartbeatTextSilence`, the harness reports that the turn is alive and working.
+  const heartbeatTextSilence = Math.floor(input.limits.heartbeatTextSilenceMs ?? HEARTBEAT_TEXT_SILENCE_MS)
+  const heartbeatMinInterval = Math.floor(input.limits.heartbeatMinIntervalMs ?? HEARTBEAT_MIN_INTERVAL_MS)
+  let lastTextAt = runStarted
+  let lastHeartbeatAt = 0
+  let toolCallsThisTurn = 0
+  let lastToolLabel = "无"
+  // Note-gate state. The watcher counts tool calls since the last durable write; when the threshold
+  // is reached it flags `noteGatePending`, and the main flow injects a record-state prompt at the
+  // next turn boundary. `noteGateFiredThisTurn` bounds the gate to once per turn so a stubbornly
+  // silent model cannot be pinged in an infinite loop.
+  const noteGateToolCalls = Math.floor(input.limits.noteGateToolCalls ?? NOTE_GATE_TOOL_CALLS)
+  let toolsSinceDurable = 0
+  let noteGatePending = false
+  let noteGateFiredThisTurn = false
 
   // In-turn dead-end brake state. `billableAtDurable` moves only on a durable signal, never on a plain
   // tool call, so a solver that keeps calling tools while producing nothing still drifts away from it.
@@ -962,7 +1037,7 @@ export async function runChallenge(input: {
         tokens += messageTokens(event.usage)
         billable += budgetTokens(event.usage)
         cost = Math.max(cost, event.cost)
-        if (billable > input.limits.tokens)
+        if (input.limits.tokens !== undefined && billable > input.limits.tokens)
           await abort(
             "budget",
             `token budget exceeded: ${Math.round(billable)} > ${input.limits.tokens} ` +
@@ -996,6 +1071,7 @@ export async function runChallenge(input: {
 
       if (event.type === "text-delta") {
         outputChars += event.delta.length
+        lastTextAt = Date.now()
         await emit({ type: "text", text: event.delta })
         if (outputChars > outputLimit) {
           await abort("stalled", `Boom output ceiling exceeded: ${outputChars} > ${outputLimit} characters`)
@@ -1043,12 +1119,58 @@ export async function runChallenge(input: {
       if (
         (event.tool === "ctf-note" || event.tool === "ctf-consult" || event.tool === "ctf-submit") &&
         event.state.status === "completed"
-      ) markDurable()
+      ) {
+        markDurable()
+        toolsSinceDurable = 0
+      }
       if (
         event.state.status !== "running" &&
         event.state.status !== "pending" &&
         await handoffAtBoundary("tool")
       ) continue
+      // Progress heartbeat: tool activity continuing well past the last model text must not read as
+      // a hang. Only a finished tool counts as activity (a long-running brute force is its own
+      // story), and the heartbeat is throttled so a silent-but-working turn reports once a minute
+      // at most instead of spamming the event stream.
+      if (event.state.status === "completed" || event.state.status === "error") {
+        toolCallsThisTurn += 1
+        lastToolLabel = `${event.tool} · ${event.state.title ?? event.state.error ?? "完成"}`
+        // The durable-write tools reset the counter above and never count toward the gate gap
+        // themselves; only plain tools accumulate the gap the gate measures.
+        if (
+          input.purpose === "solve" &&
+          noteGateToolCalls > 0 &&
+          event.tool !== "ctf-note" &&
+          event.tool !== "ctf-consult" &&
+          event.tool !== "ctf-submit"
+        ) {
+          toolsSinceDurable += 1
+          if (toolsSinceDurable >= noteGateToolCalls && !noteGatePending) {
+            noteGatePending = true
+            await emit({
+              type: "status",
+              status: "note-gate",
+              text: `连续 ${noteGateToolCalls} 次工具调用未更新 NOTES.md；将在回合边界注入记录提醒`,
+            })
+          }
+        }
+        const now = Date.now()
+        if (
+          stop === undefined &&
+          now - lastTextAt >= heartbeatTextSilence &&
+          now - lastHeartbeatAt >= heartbeatMinInterval
+        ) {
+          lastHeartbeatAt = now
+          await emit({
+            type: "status",
+            status: "heartbeat",
+            text:
+              `仍在运行：距上次模型文字输出 ${Math.round((now - lastTextAt) / 1000)}s；` +
+              `本轮已执行 ${toolCallsThisTurn} 次工具调用，最近：${lastToolLabel}；` +
+              `已消耗 ${Math.round(billable)} billable / ${tokens} raw tokens。`,
+          })
+        }
+      }
       if (
         event.tool === "ctf-consult" &&
         event.state.status === "completed" &&
@@ -1144,7 +1266,7 @@ export async function runChallenge(input: {
       input.resumeSessionID ? PROVIDER_HANDOFF : "",
       resumeWarning,
       input.handoffWarning,
-      fallbackContext ? `以下是旧 Runtime 导出的活动上下文：\n\n${fallbackContext}` : "",
+      fallbackContext ? `Activity context exported by the previous runtime:\n\n${fallbackContext}` : "",
       input.hint,
     ].filter(Boolean).join("\n\n")
     const prompt = input.purpose === "writeup"
@@ -1159,6 +1281,32 @@ export async function runChallenge(input: {
   // is still a complete message boundary, so a pending switch must take precedence over classifying
   // the old model's natural finish.
   if (stop === undefined && handoffRequested) await handoffAtBoundary("message")
+
+  // Note-gate hard boundary. The provider's tool loop is atomic, so the gate lands at this round
+  // boundary: a solve turn that ran many tools without a single durable note is ended, and the next
+  // turn is required to open with a checkpoint. The message only asks for the current state
+  // (confirmed facts, ruled-out directions, hypotheses, next steps) — never for a self-assessment of
+  // whether there is "real progress", which would invite optimistic or evasive answers. It fires at
+  // most once per turn, and a fresh durable write mid-round cancels it via the watcher reset.
+  if (
+    stop === undefined &&
+    input.purpose === "solve" &&
+    noteGatePending &&
+    !noteGateFiredThisTurn &&
+    !result?.error
+  ) {
+    noteGateFiredThisTurn = true
+    noteGatePending = false
+    await emit({
+      type: "status",
+      status: "note-gate.hard",
+      text: `连续 ${noteGateToolCalls} 次工具调用未产生持久记录；本轮结束，下一轮必须以 checkpoint 开局`,
+    })
+    await abort(
+      "stalled",
+      `note-gate: 连续 ${noteGateToolCalls} 次工具调用没有持久增量，回合结束；下一轮必须先写 checkpoint`,
+    )
+  }
 
   for (
     let attempt = 1;
@@ -1194,7 +1342,7 @@ export async function runChallenge(input: {
     const finalUsage = result?.usage
     const estimatedBillable = billable + (steps === 0 && finalUsage ? budgetTokens(finalUsage) : 0)
     const remainingTime = input.limits.timeout - (Date.now() - runStarted)
-    if (estimatedBillable >= input.limits.tokens) {
+    if (input.limits.tokens !== undefined && estimatedBillable >= input.limits.tokens) {
       await abort("budget", `${finish} recovery skipped because no billable token budget remains`)
       break
     }

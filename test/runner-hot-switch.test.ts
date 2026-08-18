@@ -9,6 +9,7 @@ import type {
   RuntimeConversation,
   RuntimeEvent,
   RuntimeHandle,
+  RuntimeLauncherOptions,
   RuntimeProviderCatalog,
 } from "../src/runtime-contract.ts"
 
@@ -38,6 +39,7 @@ async function hotSwitchFixture() {
   const resumed: string[] = []
   const closed: number[] = []
   const launchModels: Array<{ economy: string; strong: string } | undefined> = []
+  const launchVisionModels: Array<string | undefined> = []
   let generation = 0
 
   const catalog = (): RuntimeProviderCatalog => ({
@@ -145,8 +147,9 @@ async function hotSwitchFixture() {
     async abort() {},
   })
 
-  const launcher = async (options?: { models?: { economy: string; strong: string } }): Promise<RuntimeHandle> => {
+  const launcher = async (options?: RuntimeLauncherOptions): Promise<RuntimeHandle> => {
     launchModels.push(options?.models)
+    launchVisionModels.push(options?.visionModel)
     const current = ++generation
     const agent: AgentRuntime = {
       async createConversation(input) {
@@ -215,6 +218,7 @@ async function hotSwitchFixture() {
     resumed,
     closed,
     launchModels,
+    launchVisionModels,
     get oldAborts() { return oldAborts },
     get generation() { return generation },
   }
@@ -235,9 +239,10 @@ test("hot-switches an active model only after its running tool completes", async
       consultModels: [],
       blindReview: false,
       consultOnCompaction: false,
+      network: "allow",
     })
     expect(result.active).toBe(1)
-    expect(result.warnings).toContain("新模型不支持图片附件；需要通过文件或命令行工具读取相关内容")
+    expect(result.warnings).toContain("The new model does not support image attachments; read relevant content via files or command-line tools")
     expect(fixture.oldAborts).toBe(0)
 
     fixture.releaseTool()
@@ -245,7 +250,8 @@ test("hot-switches an active model only after its running tool completes", async
 
     expect(fixture.oldAborts).toBe(1)
     expect(fixture.prompts.map((item) => item.model)).toEqual(["openai/old", "openai/next"])
-    expect(fixture.prompts[1]?.text).toContain("兼容性影响：新模型不支持图片附件")
+    expect(fixture.prompts[1]?.text).toContain("Compatibility impact: The new model does not support image attachments")
+    expect(fixture.prompts[1]?.text).not.toContain("Compact handoff")
     expect(fixture.resumed).toEqual(["session-hot"])
     const [runID] = await readdir(path.join(fixture.root, "runs", "sample"))
     const task = JSON.parse(await readFile(path.join(fixture.root, "runs", "sample", runID!, "task.json"), "utf8"))
@@ -272,6 +278,7 @@ test("relaunches the runtime with the tier policy when worker model tiers change
       consultModels: [],
       blindReview: false,
       consultOnCompaction: false,
+      network: "allow",
     })
     expect(result.active).toBe(1)
     expect(fixture.oldAborts).toBe(0)
@@ -284,7 +291,7 @@ test("relaunches the runtime with the tier policy when worker model tiers change
     expect(fixture.launchModels[1]).toEqual({ economy: "openai/next", strong: "openai/old" })
     // The solver model itself did not change; only the worker tier policy did.
     expect(fixture.prompts.map((item) => item.model)).toEqual(["openai/old", "openai/old"])
-    expect(fixture.prompts[1]?.text).toContain("Worker 模型档位已更新")
+    expect(fixture.prompts[1]?.text).toContain("Worker model tier updated")
     expect(fixture.resumed).toEqual(["session-hot"])
   } finally {
     await fixture.runner.close()
@@ -297,13 +304,37 @@ test("adopts an unchanged tier policy without relaunching the runtime", async ()
     const result = await fixture.runner.applyLiveModelSettings({
       economyModel: "openai/old",
       strongModel: "openai/old",
+      visionModel: "openai/old",
       consultModels: [],
       blindReview: false,
       consultOnCompaction: false,
+      network: "allow",
     })
     expect(result.active).toBe(0)
     expect(fixture.generation).toBe(1)
     expect(fixture.oldAborts).toBe(0)
+  } finally {
+    await fixture.runner.close()
+  }
+})
+
+test("configures on-demand vision only for a text-only solver model", async () => {
+  const fixture = await hotSwitchFixture()
+  try {
+    const result = await fixture.runner.applyLiveModelSettings({
+      economyModel: "openai/old",
+      strongModel: "openai/next",
+      visionModel: "openai/old",
+      consultModels: [],
+      blindReview: false,
+      consultOnCompaction: false,
+      network: "allow",
+    })
+    expect(result.active).toBe(1)
+    expect(fixture.launchVisionModels).toEqual([undefined, "openai/old"])
+
+    fixture.releaseTool()
+    await waitForIdle(fixture.runner)
   } finally {
     await fixture.runner.close()
   }
@@ -384,6 +415,32 @@ test("reloads an active Provider without closing the old runtime before handoff"
     expect(fixture.resumed).toEqual(["session-hot"])
     expect(fixture.prompts.map((item) => item.model)).toEqual(["openai/old", "openai/old"])
     expect(fixture.closed).toContain(1)
+  } finally {
+    await fixture.runner.close()
+    if (previousHome === undefined) delete process.env.BOOM_HOME
+    else process.env.BOOM_HOME = previousHome
+  }
+})
+
+test("saves Provider drafts without restarting until explicitly applied", async () => {
+  const previousHome = process.env.BOOM_HOME
+  const boomHome = await mkdtemp(path.join(os.tmpdir(), "boom-provider-save-home-"))
+  temporary.push(boomHome)
+  process.env.BOOM_HOME = boomHome
+  const fixture = await hotSwitchFixture()
+  try {
+    const saved = await fixture.runner.saveProvider({
+      id: "openai",
+      custom: false,
+      disabled: false,
+      name: "Saved but not applied",
+      models: [],
+      hiddenModels: [],
+    }, undefined, { apply: false })
+
+    expect(saved).toBeUndefined()
+    expect(fixture.generation).toBe(1)
+    expect(fixture.oldAborts).toBe(0)
   } finally {
     await fixture.runner.close()
     if (previousHome === undefined) delete process.env.BOOM_HOME

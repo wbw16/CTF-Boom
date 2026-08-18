@@ -8,6 +8,8 @@ export type ManagedProviderDriver = "openai-compatible" | "openai" | "anthropic"
 
 export type ManagedModelConfig = {
   id: string
+  /** Original runtime-catalog ID when an operator gives a catalog model a replacement ID. */
+  catalogID?: string
   name: string
   context: number
   output: number
@@ -103,11 +105,14 @@ function model(value: unknown): ManagedModelConfig | undefined {
   const input = object(value)
   const id = string(input?.id)
   if (!input || !id || /\s/.test(id)) return undefined
+  const catalogID = string(input.catalogID)
+  if (catalogID && /\s/.test(catalogID)) return undefined
   const armorPromptID = string(input.armorPrompt, 120)
   const modelPricing = pricing(input.pricing)
   if (input.pricing !== undefined && !modelPricing) return undefined
   return {
     id,
+    ...(catalogID ? { catalogID } : {}),
     name: string(input.name) ?? id,
     context: BOOM_CONTEXT_LIMIT,
     output: positiveInteger(input.output, 16_384),
@@ -375,9 +380,15 @@ export function mergeRuntimeProviderConfig(
       ...(Object.keys(configuredModels).length
         ? { models: { ...existingModels, ...configuredModels } }
         : {}),
-      ...(entry.hiddenModels.length
-        ? { blacklist: entry.hiddenModels }
-        : { blacklist: undefined }),
+      ...(() => {
+        const blacklist = new Set(entry.hiddenModels)
+        for (const model of entry.models) {
+          if (model.catalogID && model.catalogID !== model.id) blacklist.add(model.catalogID)
+        }
+        return blacklist.size
+          ? { blacklist: [...blacklist].sort() }
+          : { blacklist: undefined }
+      })(),
     }
   }
   // Packaged and runtime-provided model entries must follow the same boundary as GUI-managed ones.

@@ -2,26 +2,18 @@ import { afterEach, expect, test } from "bun:test"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { xihulunjianAdaptation } from "../src/platform-openapi.ts"
 import {
   innerFlagValue,
   selectEndpoint,
   XihulunjianPlatformAdapter,
 } from "../src/xihulunjian-platform-adapter.ts"
 
-const TOKEN_ENV = "BOOM_PLATFORM_XIHU_TOKEN"
-const HOST = "https://pro.example.com"
 const PREFIX = "/slab-match/api/v1/agent"
 const roots: string[] = []
 
 afterEach(async () => {
-  delete process.env[TOKEN_ENV]
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
-
-function manifest() {
-  return xihulunjianAdaptation({ id: "xihu", baseURL: HOST }).manifest
-}
 
 /** No-op sleep so throttling and backoff never slow the tests down. */
 const instant = async () => {}
@@ -52,57 +44,7 @@ const EXERCISE_LIST = [
   },
 ]
 
-test("flattens the nested category/corpus catalog and skips unreleased challenges", async () => {
-  process.env[TOKEN_ENV] = "ak_test"
-  const seen: string[] = []
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async (input) => {
-    const url = new URL(input instanceof Request ? input.url : String(input))
-    seen.push(url.pathname)
-    expect((input as Request).headers?.get?.("X-Agent-AccessKey") ?? "ak_test").toBe("ak_test")
-    if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(EXERCISE_LIST)
-    return Response.json({ code: "40400", message: "not found" }, { status: 404 })
-  }) as typeof fetch, instant)
-
-  const catalog = await adapter.listChallenges({ root: "/tmp" })
-  expect(catalog.total).toBe(2)
-  expect(catalog.categories).toEqual(["Web", "Pwn"])
-  expect(catalog.items.map((item) => item.id)).toEqual(["10661", "10662"])
-  expect(catalog.items[0]).toMatchObject({
-    challengeID: "10661",
-    title: "web-unserialize-1-3",
-    category: "Web",
-    solved: false,
-    group: { id: "3109", name: "Web" },
-  })
-  expect(seen).toEqual([`${PREFIX}/ctf/exercise-list`])
-})
-
-test("treats a non-zero business code as a failure even on HTTP 200", async () => {
-  process.env[TOKEN_ENV] = "ak_test"
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async () =>
-    // HTTP 200 with a business failure must not be mistaken for empty data.
-    envelope({}, "40003", "AccessKey 无效")) as unknown as typeof fetch, instant)
-  await expect(adapter.listChallenges({ root: "/tmp" })).rejects.toThrow(/40003.*AccessKey 无效/)
-})
-
-test("retries platform rate limiting and then succeeds", async () => {
-  process.env[TOKEN_ENV] = "ak_test"
-  let attempts = 0
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async () => {
-    attempts += 1
-    // Verified live: bursts return HTTP 429 with business code 40001.
-    if (attempts < 3)
-      return Response.json({ data: {}, code: "40001", message: "请求过于频繁，请稍后重试" }, { status: 429 })
-    return envelope(EXERCISE_LIST)
-  }) as unknown as typeof fetch, instant)
-
-  const catalog = await adapter.listChallenges({ root: "/tmp" })
-  expect(attempts).toBe(3)
-  expect(catalog.total).toBe(2)
-})
-
 test("accepts both attachment shapes and marks local-only challenges", async () => {
-  process.env[TOKEN_ENV] = "ak_test"
   const details: Record<string, unknown> = {
     // Real shape when a file exists: a single object, not the documented {files:[...]}.
     "10662": {
@@ -135,7 +77,7 @@ test("accepts both attachment shapes and marks local-only challenges", async () 
       isNeedCheck: false,
     },
   }
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async (input) => {
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise`)
       return envelope(details[url.searchParams.get("exerciseId")!])
@@ -156,13 +98,12 @@ test("accepts both attachment shapes and marks local-only challenges", async () 
 })
 
 test("materializes challenges without starting environments and never leaks the AccessKey to the CDN", async () => {
-  process.env[TOKEN_ENV] = "ak_secret"
   const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-"))
   roots.push(root)
   const calls: string[] = []
   let cdnAuthHeader: string | null = "unset"
 
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async (input, init) => {
+  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init)
     const url = new URL(request.url)
     calls.push(`${request.method} ${url.pathname}`)
@@ -191,7 +132,7 @@ test("materializes challenges without starting environments and never leaks the 
     return Response.json({ code: "40400" }, { status: 404 })
   }) as typeof fetch, instant)
 
-  const challenges = await adapter.acquireChallenges({ root, selection: { all: true } })
+  const challenges = await adapter.acquireChallenges({ root })
   expect(challenges.map((item) => item.slug).sort()).toEqual(["shopping", "web-unserialize-1-3"])
 
   // Acquisition must never start an environment: only three may exist at once and each has an
@@ -206,17 +147,55 @@ test("materializes challenges without starting environments and never leaks the 
   expect(meta).toMatchObject({
     category: "PWN",
     service_required: true,
-    platform: { adapter: "xihu", challenge_id: "10662", options: { exercise_id: "10662", score: 50 } },
+    platform: { adapter: "xihulunjian", challenge_id: "10662", options: { exercise_id: "10662", score: 50 } },
   })
   expect(await readFile(path.join(root, "challenges", "PWN", "shopping", "files", "a.zip")))
     .toEqual(Buffer.from([1, 2, 3]))
 })
 
+test("skips one malformed released challenge without blocking the rest of its release batch", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-"))
+  roots.push(root)
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === `${PREFIX}/ctf/exercise-list`) {
+      return envelope([{
+        id: 1,
+        name: "Misc",
+        corpus: [
+          { id: 1, name: "broken", isOpen: true, hasSolved: false },
+          { id: 2, name: "usable", isOpen: true, hasSolved: true },
+        ],
+      }])
+    }
+    if (url.pathname === `${PREFIX}/ctf/exercise`) {
+      if (url.searchParams.get("exerciseId") === "1")
+        return envelope({}, "40002", "题目暂不可用")
+      return envelope({
+        id: 2,
+        name: "usable",
+        description: "继续处理这一题",
+        attachment: [],
+        endpoints: [],
+        endpointType: "none",
+        isNeedInit: false,
+        isNeedCheck: false,
+        hasSolved: true,
+      })
+    }
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  const challenges = await adapter.acquireChallenges({ root })
+  expect(challenges.map((item) => item.slug)).toEqual(["usable"])
+  const meta = JSON.parse(await readFile(path.join(root, "challenges", "MISC", "usable", "meta.json"), "utf8"))
+  expect(meta.platform.options).toMatchObject({ exercise_id: "2", solved: true })
+})
+
 test("builds, polls, and reports a ready environment", async () => {
-  process.env[TOKEN_ENV] = "ak_test"
   const calls: string[] = []
   let polls = 0
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async (input, init) => {
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init)
     const url = new URL(request.url)
     calls.push(`${request.method} ${url.pathname}`)
@@ -255,9 +234,8 @@ test("builds, polls, and reports a ready environment", async () => {
 })
 
 test("submits only the value inside the flag wrapper", async () => {
-  process.env[TOKEN_ENV] = "ak_test"
   const bodies: unknown[] = []
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async (input, init) => {
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init)
     bodies.push(await request.json())
     return envelope({ isCorrect: true })
@@ -269,32 +247,29 @@ test("submits only the value inside the flag wrapper", async () => {
     description: "",
     files: [],
     flagFormat: "",
-    platform: { adapter: "xihu", challengeID: "10662" },
+    platform: { adapter: "xihulunjian", challengeID: "10662" },
   }
   const result = await adapter.submitFlag({
-    root: "/tmp",
     challenge,
     workspace: { directory: "/tmp/run", runID: "r1", extracted: [] },
     candidate: "DASCTF{p0p_cha1n}",
   })
-  expect(result).toMatchObject({ adapter: "xihu", verdict: "accepted" })
+  expect(result).toMatchObject({ adapter: "xihulunjian", verdict: "accepted" })
   // The rules require submitting only the contents of the braces.
   expect(bodies[0]).toEqual({ exerciseId: 10662, flag: "p0p_cha1n" })
 })
 
 test("maps an explicit incorrect verdict to rejected", async () => {
-  process.env[TOKEN_ENV] = "ak_test"
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async () =>
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () =>
     envelope({ isCorrect: false })) as unknown as typeof fetch, instant)
   const result = await adapter.submitFlag({
-    root: "/tmp",
     challenge: {
       slug: "shopping",
       directory: "/tmp/shopping",
       description: "",
       files: [],
       flagFormat: "",
-      platform: { adapter: "xihu", challengeID: "10662" },
+      platform: { adapter: "xihulunjian", challengeID: "10662" },
     },
     workspace: { directory: "/tmp/run", runID: "r1", extracted: [] },
     candidate: "flag{wrong}",
@@ -302,19 +277,43 @@ test("maps an explicit incorrect verdict to rejected", async () => {
   expect(result.verdict).toBe("rejected")
 })
 
+test("does not retry an incorrect flag reported with the overloaded 40001 code", async () => {
+  let calls = 0
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () => {
+    calls += 1
+    // The live answer endpoint sends this HTTP 200 business failure with code 40001, which is
+    // also used as the general rate-limit code on other endpoints.
+    return envelope(null, "40001", "提交flag错误，请重新提交（当前还有45次提交机会）")
+  }) as unknown as typeof fetch, instant)
+
+  const result = await adapter.submitFlag({
+    challenge: {
+      slug: "unzip",
+      directory: "/tmp/unzip",
+      description: "",
+      files: [],
+      flagFormat: "",
+      platform: { adapter: "xihulunjian", challengeID: "10663" },
+    },
+    workspace: { directory: "/tmp/run", runID: "r1", extracted: [] },
+    candidate: "DASCTF{ni_cai?}",
+  })
+
+  expect(result.verdict).toBe("rejected")
+  expect(calls).toBe(1)
+})
+
 test("never assumes success when the verdict field is missing", async () => {
-  process.env[TOKEN_ENV] = "ak_test"
-  const adapter = new XihulunjianPlatformAdapter(manifest(), (async () =>
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () =>
     envelope({ unexpected: true })) as unknown as typeof fetch, instant)
   const result = await adapter.submitFlag({
-    root: "/tmp",
     challenge: {
       slug: "shopping",
       directory: "/tmp/shopping",
       description: "",
       files: [],
       flagFormat: "",
-      platform: { adapter: "xihu", challengeID: "10662" },
+      platform: { adapter: "xihulunjian", challengeID: "10662" },
     },
     workspace: { directory: "/tmp/run", runID: "r1", extracted: [] },
     candidate: "flag{unknown}",
@@ -329,6 +328,63 @@ test("strips flag wrappers deterministically", () => {
   // A nested closing brace must not truncate the payload.
   expect(innerFlagValue("DASCTF{a{b}c}")).toBe("a{b}c")
   expect(innerFlagValue("DASCTF{}")).toBe("")
+})
+
+test("reads announcement summaries and their full content", async () => {
+  const calls: string[] = []
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    calls.push(`${url.pathname}${url.search}`)
+    if (url.pathname === `${PREFIX}/match/notice/now-list`) return envelope([{
+      id: 501,
+      title: "题目更新",
+      content: "新增一道 Web 题。",
+      createdAt: "2026-06-26T10:00:00.000+08:00",
+      createdTime: 1780000000000,
+      userName: "系统公告",
+    }])
+    if (url.pathname === `${PREFIX}/match/notice/detail`) return envelope({
+      id: 501,
+      title: "题目更新",
+      content: "新增一道 Web 题，附件见下方。",
+      isFile: true,
+      file: { files: [{ name: "notice.pdf", url: "https://example.com/notice.pdf", ext: "pdf" }] },
+      createdTime: 1780000000000,
+    })
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  await expect(adapter.notices()).resolves.toEqual([{
+    id: 501,
+    title: "题目更新",
+    content: "新增一道 Web 题。",
+    createdAt: "2026-06-26T10:00:00.000+08:00",
+    createdTime: 1780000000000,
+    userName: "系统公告",
+  }])
+  await expect(adapter.noticeDetail(501)).resolves.toEqual({
+    id: 501,
+    title: "题目更新",
+    content: "新增一道 Web 题，附件见下方。",
+    isFile: true,
+    files: [{ name: "notice.pdf", url: "https://example.com/notice.pdf", ext: "pdf" }],
+    createdTime: 1780000000000,
+  })
+  expect(calls).toEqual([
+    `${PREFIX}/match/notice/now-list`,
+    `${PREFIX}/match/notice/detail?id=501`,
+  ])
+})
+
+test("uses the configured platform root for read-only dashboard calls", async () => {
+  let requested = ""
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+    requested = input instanceof Request ? input.url : String(input)
+    return envelope({ stagePoint: 200, stageRank: 3 })
+  }) as typeof fetch, instant, "https://contest.example.test/agent/")
+
+  await expect(adapter.overview()).resolves.toEqual({ point: 200, rank: 3 })
+  expect(requested).toBe("https://contest.example.test/agent/slab-match/api/v1/agent/answer-panel/overview")
 })
 
 test("prefers a proxied endpoint and records the full connection matrix", () => {

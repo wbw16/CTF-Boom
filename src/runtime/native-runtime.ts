@@ -65,6 +65,8 @@ type NativeRuntimeOptions = {
   resourceRoot?: string
   version?: string
   limits?: Partial<NativeKernelLimits>
+  /** Host-wide network switch; "deny" makes the compiled registry and tool sandboxes offline. */
+  network?: "allow" | "deny"
 }
 
 type NativeManifest = {
@@ -980,6 +982,7 @@ class NativeAgentRuntime implements AgentRuntime {
     this.#registry = input.registry
     this.#toolHost = createBoomToolHost(input.registry.catalog, {
       ...(input.networkBroker ? { networkBroker: input.networkBroker } : {}),
+      network: input.registry.network,
     })
     this.#limits = input.limits
   }
@@ -1064,7 +1067,13 @@ class NativeAgentRuntime implements AgentRuntime {
 }
 
 export async function createNativeRuntime(options: NativeRuntimeOptions): Promise<RuntimeHandle> {
-  const registry = await compileBoomAgentRegistry(options.resourceRoot ?? DEFAULT_RESOURCE_ROOT)
+  const registry = await compileBoomAgentRegistry(
+    options.resourceRoot ?? DEFAULT_RESOURCE_ROOT,
+    undefined,
+    undefined,
+    undefined,
+    options.network ?? "allow",
+  )
   const limits = normalizeNativeKernelLimits(options.limits)
   const agent = new NativeAgentRuntime({
     provider: options.provider,

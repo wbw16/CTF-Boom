@@ -85,7 +85,7 @@ export async function neutralEvidence(input: {
     .replace(/^.*(?:confidence|自信|已验证|verified|确认是|就是 ?flag).*$/gim, "")
     .slice(0, MAX_EVIDENCE)
   const listing = artifacts.length
-    ? ["", "工作区产物（供独立复算）：", ...artifacts.map((file) => `- ${file.path} (${file.size} bytes)`)]
+    ? ["", "Workspace artifacts (for independent recomputation):", ...artifacts.map((file) => `- ${file.path} (${file.size} bytes)`)]
     : []
   return [redacted, ...listing].join("\n").trim()
 }
@@ -112,16 +112,20 @@ export async function reviewCandidateBlind(input: {
     agent: "boom-consultant",
     model: input.model,
     prompt: [
-      "独立复核以下候选。证据里已移除结论和自信表述，你的任务不是判断它看起来像不像 flag，",
-      "而是检查现有证据能否推导出它，并主动寻找反例。",
-      "如果证据不足以推出该候选，就返回 passed=false 并说明缺哪一步——“无法证伪”不等于通过。",
-      "可以读取工作区文件自行复算。",
-      `候选：${input.candidate}`,
-      "严格返回 JSON（放在 ```json 代码块中）：",
-      JSON.stringify({ passed: false, detail: "逐步复核或反证理由" }),
+      "# Blind candidate review",
       "",
-      "中性证据：",
-      evidence || "[没有可用的离线推导证据]",
+      "Review the candidate below independently. Conclusions and confident wording were stripped from the evidence; your job is not to judge whether it looks like a flag, but to check whether the evidence actually entails it — and to actively look for counterexamples.",
+      "",
+      "- If the evidence does not entail the candidate, return passed=false and state which step is missing. \"Cannot falsify\" is not a pass.",
+      "- You may read workspace files to recompute.",
+      "",
+      `Candidate: ${input.candidate}`,
+      "",
+      "Return strict JSON in a ```json block:",
+      JSON.stringify({ passed: false, detail: "step-by-step check or counterexample" }),
+      "",
+      "Neutral evidence:",
+      evidence || "(no offline derivation evidence available)",
     ].join("\n"),
     signal,
   })

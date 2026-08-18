@@ -7,9 +7,9 @@ import {
   Gauge,
   KeyRound,
   Plug,
-  Send,
   Shield,
   Terminal,
+  Timer,
 } from "lucide-react"
 import { useApp } from "../context"
 import { patchJSON, postJSON } from "../api"
@@ -44,6 +44,7 @@ export function SettingsDialog() {
     const current = new Set([
       data.settings.economyModel,
       data.settings.strongModel,
+      data.settings.visionModel,
       ...data.settings.consultModels,
     ])
     const models = [...source]
@@ -61,6 +62,23 @@ export function SettingsDialog() {
         tagKind: model.connected ? "ok" : "off",
       }),
     )
+  }, [data])
+
+  const visionOptions = useMemo((): SelectOption<string>[] => {
+    if (!data) return []
+    return [
+      { value: "", label: "不启用" },
+      ...data.models
+        .filter((model) => model.connected && model.attachment === true)
+        .map((model) => ({
+          value: model.id,
+          label: model.name || model.id,
+          group: model.id.split("/")[0],
+          dot: true,
+          tag: "图片",
+          tagKind: "ok" as const,
+        })),
+    ]
   }, [data])
 
   const envOptions = useMemo(() => {
@@ -101,6 +119,10 @@ export function SettingsDialog() {
       toast("Economy 与 Strong 模型都必须是 provider/model", "error")
       return
     }
+    if (draft.visionModel && !visionOptions.some((option) => option.value === draft.visionModel)) {
+      toast("Vision 模型必须是已连接且支持图片的模型", "error")
+      return
+    }
     if (
       draft.consultModels.length !== 0 &&
       (draft.consultModels.length < 2 || draft.consultModels.length > 4)
@@ -116,7 +138,7 @@ export function SettingsDialog() {
         return
       }
     }
-    if (!(draft.tokens > 0 && draft.repeats >= 2 && draft.minutes > 0 && draft.concurrency > 0)) {
+    if (!((!draft.tokenBudgetEnabled || draft.tokens > 0) && draft.repeats >= 2 && draft.minutes > 0 && draft.concurrency > 0)) {
       toast("运行参数必须为正数，repeats 至少为 2", "error")
       return
     }
@@ -267,6 +289,16 @@ export function SettingsDialog() {
           </div>
         </div>
         <div className="field">
+          <div className="field-label"><span>Vision 模型</span><span className="tag">按需看图</span></div>
+          <Select
+            value={draft.visionModel ?? ""}
+            options={visionOptions}
+            onChange={(value) => set("visionModel", value)}
+            ariaLabel="Vision 模型"
+          />
+          <p className="field-hint">仅当 Strong 模型不支持图片时，向求解 Agent 提供按需看图工具。</p>
+        </div>
+        <div className="field">
           <div className="field-label">
             <span className="req">多模型会诊池</span>
             <span className="tag">2–4 个</span>
@@ -370,6 +402,12 @@ export function SettingsDialog() {
             <button type="button" className="btn btn-ghost" onClick={() => void discoverConda()}>发现 Conda</button>
           </div>
         </div>
+        <Toggle
+          checked={draft.network === "deny"}
+          onChange={(checked) => set("network", checked ? "deny" : "allow")}
+          title="完全离线运行"
+          desc="关闭后拒绝 webfetch / websearch，并隔离 bash / boom-exec 的网络访问；开启后照常联网（查文档、下载工具、访问远程服务）。"
+        />
       </section>
 
       <section className={`modal-section${section === "budget" ? " active" : ""}`}>
@@ -378,7 +416,14 @@ export function SettingsDialog() {
           <div className="field">
             <div className="field-label"><span className="req">每轮 tokens</span></div>
             <div className="num-wrap">
-              <input type="number" value={draft.tokens} min={1000} step={10000} onChange={(event) => set("tokens", Number(event.target.value))} />
+              <input
+                type="number"
+                value={draft.tokens}
+                min={1000}
+                step={10000}
+                disabled={!draft.tokenBudgetEnabled}
+                onChange={(event) => set("tokens", Number(event.target.value))}
+              />
               <span className="unit">tokens</span>
             </div>
           </div>
@@ -404,7 +449,13 @@ export function SettingsDialog() {
             </div>
           </div>
         </div>
-        <div className="note">repeats 至少为 2；并发上限 32。预算只约束新开始的一轮。</div>
+        <Toggle
+          checked={draft.tokenBudgetEnabled}
+          onChange={(checked) => set("tokenBudgetEnabled", checked)}
+          title="启用 token 预算"
+          desc="关闭后不设 token 上限；每轮仍受分钟数、重复调用保护、无活动监测与输出上限约束。"
+        />
+        <div className="note">repeats 至少为 2；并发上限 32。预算设置只约束新开始的一轮。</div>
       </section>
 
       <section className={`modal-section${section === "flag" ? " active" : ""}`}>
@@ -434,7 +485,7 @@ export function SettingsDialog() {
             onClick={() => void migrateOpenCodeCredentials()}
           />
           <IntegrationCard icon={<Cable size={15} />} title="MCP Server" desc="Boom 保存独立配置并注入隔离的 Boom Runtime，不读取用户或项目 OpenCode 配置。" onClick={() => openDialog("mcp")} />
-          <IntegrationCard icon={<Send size={15} />} title="比赛接口与自动同步" desc="从 OpenAPI / Swagger 生成适配器，检查请求映射并下载题目。" onClick={() => openDialog("platforms")} />
+          <IntegrationCard icon={<Timer size={15} />} title="西湖论剑控制台" desc="专用接入、AccessKey、自动拉题、线上资源与赛方大模型网关。" onClick={() => openDialog("competition")} />
           <IntegrationCard icon={<Shield size={15} />} title="破甲提示词" desc="维护可复用的置顶系统提示词；然后在每个 Provider 模型上选择一项。" onClick={() => openDialog("armor")} />
         </div>
       </section>

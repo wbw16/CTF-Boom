@@ -8,10 +8,13 @@ import {
   saveRootGuiState,
 } from "../src/gui-state.ts"
 import {
+  activeCandidate,
   applyRunnerNotification,
   candidateValues,
   displayFlagRun,
   label,
+  latestFlagRun,
+  primary,
   resolveRunDetail,
   withRunDetail,
   why,
@@ -85,6 +88,27 @@ describe("GUI state", () => {
       await rm(home, { recursive: true, force: true })
     }
   })
+
+  test("persists an explicitly disabled token budget", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "boom-gui-time-only-"))
+    const previous = process.env.BOOM_HOME
+    process.env.BOOM_HOME = home
+    try {
+      const root = path.join(home, "contest")
+      await saveRootGuiState(root, {
+        settings: { ...DEFAULT_GUI_SETTINGS, tokenBudgetEnabled: false },
+        challenges: {},
+      })
+      expect((await loadRootGuiState(root)).settings).toMatchObject({
+        tokenBudgetEnabled: false,
+        tokens: DEFAULT_GUI_SETTINGS.tokens,
+      })
+    } finally {
+      if (previous === undefined) delete process.env.BOOM_HOME
+      else process.env.BOOM_HOME = previous
+      await rm(home, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("GUI challenge presentation", () => {
@@ -145,6 +169,7 @@ function liveState(...runs: RunHistory[]): GuiState {
       economyModel: "test/model",
       strongModel: "test/model",
       tokens: 10_000,
+      tokenBudgetEnabled: true,
       repeats: 3,
       minutes: 5,
       concurrency: 1,
@@ -349,6 +374,23 @@ describe("GUI live task detail", () => {
     }))[0]).toBe("flag{right}")
     expect(candidateValues(runFixture({ confirmedFlag: "flag{archive}" }))[0])
       .toBe("flag{archive}")
+  })
+
+  test("keeps a platform-rejected flag in history but never presents it as current", () => {
+    const rejected = runFixture({
+      stop: "completed",
+      candidates: ["DASCTF{ni_cai?}"],
+      primaryCandidate: "DASCTF{ni_cai?}",
+      candidateHistory: ["DASCTF{ni_cai?}"],
+      rejectedFlags: ["DASCTF{ni_cai?}"],
+    })
+    const challenge = liveState(rejected).challenges[0]!
+
+    expect(candidateValues(rejected)).toContain("DASCTF{ni_cai?}")
+    expect(activeCandidate(rejected)).toBe("")
+    expect(primary(rejected)).toBe("")
+    expect(latestFlagRun(challenge)).toBeUndefined()
+    expect(displayFlagRun(challenge, rejected)).toBeUndefined()
   })
 
   test("prefers a confirmed flag across runs over a newer pending candidate", () => {

@@ -5,6 +5,7 @@ import {
   isExactEndpoint,
   providerEndpoint,
 } from "../src/runtime/provider-http.ts"
+import { startExactEndpointProxy } from "../src/runtime/exact-endpoint-proxy.ts"
 import { assertProviderBaseURL, normalizeManagedProvider } from "../src/provider-config.ts"
 
 const servers: Array<ReturnType<typeof Bun.serve>> = []
@@ -34,6 +35,13 @@ test("uses a marked Base URL verbatim instead of appending a path", () => {
   expect(exactEndpointURL(`${GATEWAY}!`)).toBe(GATEWAY)
   // Without this the request would go to <gateway>/chat/completions, which the gateway rejects.
   expect(providerEndpoint(`${GATEWAY}!`, "chat/completions")).toBe(GATEWAY)
+})
+
+test("recognizes the 西湖论剑 gateway root as a complete endpoint without a marker", () => {
+  const gateway = "https://llm-gateway.dasctf.com/llm-gateway/proxy/e/token123"
+  expect(isExactEndpoint(gateway)).toBe(true)
+  expect(exactEndpointURL(gateway)).toBe(gateway)
+  expect(providerEndpoint(gateway, "chat/completions")).toBe(gateway)
 })
 
 test("accepts a marked Base URL in provider configuration", () => {
@@ -129,4 +137,60 @@ test("streams tool calls and usage from a gateway that only answers at its root"
   expect(usage).toEqual({ input: 292, output: 43 })
   // The driver must never have tried a sub-path.
   expect(paths).toEqual(["/llm-gateway/proxy/e/token123"])
+})
+
+test("adapts OpenCode's compatibility path to a marked gateway root without buffering its SSE stream", async () => {
+  const paths: string[] = []
+  let authorization: string | null = null
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url)
+      paths.push(url.pathname)
+      authorization = request.headers.get("authorization")
+      if (request.method !== "POST" || url.pathname !== "/llm-gateway/proxy/e/token123")
+        return new Response("not found", { status: 404 })
+      return new Response(
+        [
+          `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { name: "bash", arguments: "{}" } }] }, finish_reason: null }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 4, completion_tokens: 2 } })}\n\n`,
+          "data: [DONE]\n\n",
+        ].join(""),
+        { headers: { "content-type": "text/event-stream" } },
+      )
+    },
+  })
+  servers.push(server)
+  const proxy = startExactEndpointProxy({
+    gateway: `http://127.0.0.1:${server.port}/llm-gateway/proxy/e/token123!`,
+  })!
+  try {
+    const driver = new OpenAICompatibleProviderDriver({
+      baseURL: `${proxy.baseURL}/providers/gateway/v1`,
+      apiKey: "gateway-test-key",
+    })
+    const events = await Array.fromAsync(driver.stream({
+      model: "deepseek-chat",
+      conversationID: "proxy-test",
+      step: 1,
+      agent: "boom",
+      system: "solve",
+      signal: new AbortController().signal,
+      messages: [{ role: "user", content: "test" }],
+      tools: [],
+    }))
+
+    expect(paths).toEqual(["/llm-gateway/proxy/e/token123"])
+    expect(authorization as string | null).toBe("Bearer gateway-test-key")
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "tool-call-delta", name: "bash" }),
+      expect.objectContaining({ type: "usage", usage: expect.objectContaining({ input: 4, output: 2 }) }),
+      expect.objectContaining({ type: "finish", reason: "tool-calls" }),
+    ]))
+    const rejected = await fetch(`${proxy.baseURL}/providers/gateway/v1/models`)
+    expect(rejected.status).toBe(404)
+  } finally {
+    proxy.close()
+  }
 })

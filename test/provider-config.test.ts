@@ -157,6 +157,43 @@ describe("provider configuration", () => {
     ).toThrow("at least one model")
   })
 
+  test("keeps a renamed catalog model while blacklisting its original ID", () => {
+    const merged = mergeRuntimeProviderConfig(
+      {
+        provider: {
+          openai: {
+            models: { "catalog-model": { id: "catalog-model", name: "Catalog model" } },
+          },
+        },
+      },
+      {
+        version: 1,
+        armorPrompts: [],
+        providers: {
+          openai: {
+            id: "openai",
+            custom: false,
+            disabled: false,
+            models: [{
+              id: "gateway-model",
+              catalogID: "catalog-model",
+              name: "Gateway model",
+              context: 128_000,
+              output: 16_384,
+              reasoning: true,
+              attachment: false,
+            }],
+            hiddenModels: [],
+          },
+        },
+      },
+    )
+    expect(merged.provider?.openai).toMatchObject({
+      blacklist: ["catalog-model"],
+      models: { "gateway-model": { name: "Gateway model" } },
+    })
+  })
+
   test("normalizes armor prompts and clears deleted model assignments", () => {
     const prompts = normalizeArmorPromptPresets([
       { id: "general", name: "General", prompt: "  pinned first  " },

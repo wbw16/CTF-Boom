@@ -4,7 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { submitCandidate } from "../src/candidate-submission.ts"
 import { loadConsultationRequest, requestConsultation } from "../src/consultation-request.ts"
-import { PlatformAdapterRegistry } from "../src/platform-adapter.ts"
+import { MockSubmissionGateway } from "./fixtures/mock-submission.ts"
 import { GuiRunner } from "../src/runner.ts"
 import type { RuntimeHandle } from "../src/runtime-contract.ts"
 import { saveTaskRecord } from "../src/task.ts"
@@ -15,7 +15,7 @@ afterEach(async () => Promise.all(
   temporary.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
 ))
 
-test("an accepted platform verdict ends the main flow without an automatic writeup turn", async () => {
+test("an accepted platform verdict automatically archives an offline writeup", async () => {
   const interpreter = Bun.which("python3")
   if (!interpreter) return
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-runner-autonomy-"))
@@ -27,6 +27,7 @@ test("an accepted platform verdict ends the main flow without an automatic write
   await writeFile(path.join(source, "flag.txt"), "flag{l0}")
 
   const agents: string[] = []
+  const prompts: string[] = []
   const handle: RuntimeHandle = {
     backend: "fake",
     version: "test",
@@ -52,8 +53,9 @@ test("an accepted platform verdict ends the main flow without an automatic write
           },
           async prompt(prompt) {
             agents.push(prompt.agent)
+            prompts.push(prompt.text)
             if (prompt.agent === "boom") {
-              if (prompt.text.includes("已确认 flag")) {
+              if (prompt.text.includes("Confirmed flag")) {
                 await writeFile(
                   path.join(input.directory, "work", "WRITEUP.md"),
                   "# Writeup\n\nRead challenge/flag.txt, reproduced the supplied value, and verified each step.\n\nFlag: flag{l0}\n",
@@ -85,7 +87,7 @@ test("an accepted platform verdict ends the main flow without an automatic write
     },
     close() {},
   }
-  const adapters = new PlatformAdapterRegistry([{
+  const adapters = new MockSubmissionGateway([{
     id: "test-platform",
     async submitFlag() {
       return {
@@ -109,27 +111,29 @@ test("an accepted platform verdict ends the main flow without an automatic write
       }],
       model: "test/strong",
       modelPolicy: { economy: "test/economy", strong: "test/strong" },
-      limits: { tokens: 100_000, repeats: 5, timeout: 60_000 },
+      // The solve consumes this budget; the automatic writeup must still get its own bounded
+      // allowance instead of being dropped as an exhausted solve continuation.
+      limits: { tokens: 15, repeats: 5, timeout: 60_000 },
       flagFormat: "flag\\{[^}]+\\}",
       pythonInterpreter: interpreter,
     })
     for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1)
       await Bun.sleep(10)
     expect(runner.hasWork()).toBe(false)
-    expect(agents).toEqual(["boom"])
+    expect(agents).toEqual(["boom", "boom"])
+    expect(prompts[1]).toContain("Generate work/WRITEUP.md offline")
     const [runID] = await readdir(path.join(root, "runs", "simple"))
     const run = path.join(root, "runs", "simple", runID!)
     const result = JSON.parse(await readFile(path.join(run, "result.json"), "utf8"))
     expect(result).toMatchObject({
       orchestration_variant: "autonomy-l0",
-      candidates: ["flag{l0}"],
-      task_status: "solved",
-      platform_submission: { adapter: "test-platform", verdict: "accepted" },
+      task_status: "archived",
     })
     expect(JSON.parse(await readFile(path.join(run, "task.json"), "utf8"))).toMatchObject({
-      status: "solved",
+      status: "archived",
       acceptedFlag: { value: "flag{l0}", source: "test-platform" },
     })
+    expect(await readFile(path.join(run, "work", "WRITEUP.md"), "utf8")).toContain("flag{l0}")
     expect(result.baseline).toBeUndefined()
     expect(result.checkpoint).toBeUndefined()
     expect(await Bun.file(path.join(run, "work", ".boom", "autonomy.json")).exists()).toBe(true)
@@ -210,7 +214,7 @@ test("a model-requested consultation uses the new continuation budget and resume
           reason: "The current path is exhausted and needs independent hypotheses.",
         })
       } else {
-        expect(prompt.text).toContain("多模型会诊综合出的下一阶段计划")
+        expect(prompt.text).toContain("next-phase plan synthesized by the multi-model consultation")
         await submitCandidate({
           directory: input.directory,
           sessionID: id,
@@ -262,7 +266,7 @@ test("a model-requested consultation uses the new continuation budget and resume
     },
     close() {},
   }
-  const adapters = new PlatformAdapterRegistry([{
+  const adapters = new MockSubmissionGateway([{
     id: "test-platform",
     async submitFlag() {
       return {
@@ -388,7 +392,7 @@ test("continues the solver when the stagnation second opinion fails", async () =
     },
     close() {},
   }
-  const adapters = new PlatformAdapterRegistry([{
+  const adapters = new MockSubmissionGateway([{
     id: "test-platform",
     async submitFlag() {
       return {
@@ -489,7 +493,7 @@ test("a compaction consultation receives active history and resumes the original
           parts: Array<{ type: string; text: string }>
         }>((resolve) => { resolveFirstPrompt = resolve })
       }
-      expect(prompt.text).toContain("多模型会诊综合出的下一阶段计划")
+      expect(prompt.text).toContain("next-phase plan synthesized by the multi-model consultation")
       await submitCandidate({
         directory: path.join(root, "runs", "compact-me", (await readdir(path.join(root, "runs", "compact-me")))[0]!),
         sessionID: originalSessionID,
@@ -567,7 +571,7 @@ test("a compaction consultation receives active history and resumes the original
     },
     close() {},
   }
-  const adapters = new PlatformAdapterRegistry([{
+  const adapters = new MockSubmissionGateway([{
     id: "test-platform",
     async submitFlag() {
       return {
@@ -660,7 +664,7 @@ test("a manual consultation with no successful experts falls back to a new solve
               throw new Error("consultation provider unavailable")
             }
             solverCalls += 1
-            if (solverCalls === 1) expect(prompt.text).toContain("启动新的 solver turn")
+            if (solverCalls === 1) expect(prompt.text).toContain("Start a fresh solver turn")
             await submitCandidate({
               directory: input.directory,
               sessionID,
@@ -682,7 +686,7 @@ test("a manual consultation with no successful experts falls back to a new solve
   const runner = new GuiRunner(
     root,
     async () => handle,
-    new PlatformAdapterRegistry([{
+    new MockSubmissionGateway([{
       id: "test-platform",
       async submitFlag() {
         return {

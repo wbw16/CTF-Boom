@@ -336,6 +336,10 @@ export interface RuntimeHandle {
 export type RuntimeLauncherOptions = {
   /** Current economy/strong model policy, resolved into tier-declared agent resources. */
   models?: ModelPolicy
+  /** Image-capable model exposed through the on-demand vision tool. */
+  visionModel?: string
+  /** Host-wide network switch; "deny" isolates bash/boom-exec and refuses web tools. */
+  network?: "allow" | "deny"
 }
 
 export type RuntimeLauncher = (options?: RuntimeLauncherOptions) => Promise<RuntimeHandle>

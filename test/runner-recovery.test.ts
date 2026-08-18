@@ -144,7 +144,7 @@ describe("host-level run recovery", () => {
 
       expect(conversations).toBeGreaterThanOrEqual(2)
       expect(prompts.length).toBeGreaterThanOrEqual(2)
-      expect(prompts[1]).toContain("活动上下文快照")
+      expect(prompts[1]).toContain("Activity-context snapshot")
       expect(prompts[1]).toContain("关键结论：校验逻辑在 sub_A780")
     } finally {
       await runner.close()
@@ -227,8 +227,8 @@ describe("host-level run recovery", () => {
       expect(conversations).toBe(1)
       // Competition build: a challenge waiting for one of the three environments still does real
       // offline work (reversing, exploit development) rather than idling for a human-supplied URL.
-      expect(prompts[0]).toContain("完成一切不依赖靶机的工作")
-      expect(prompts[0]).toContain("不要因为缺少地址而等待")
+      expect(prompts[0]).toContain("do everything that does not need the target")
+      expect(prompts[0]).toContain("just because the address is missing")
       expect(runner.getRuntimeState().concurrency).toBe(8)
       const [runID] = await readdir(path.join(root, "runs", "service-only"))
       const result = JSON.parse(await readFile(

@@ -1,13 +1,13 @@
 import { createContext, useContext, type ReactNode } from "react"
-import type { GuiState, RunHistory } from "./types"
+import type { GuiState, RunHistory, XihulunjianNotice } from "./types"
 import type { ToastItem } from "./ui"
 
 export type DialogName =
   | "settings"
   | "providers"
   | "mcp"
-  | "platforms"
   | "competition"
+  | "notices"
   | "armor"
   | "delete"
   | null
@@ -31,10 +31,14 @@ export type AppContextValue = {
   menu: MenuState
   deleteTarget: string | null
   now: number
+  notices: XihulunjianNotice[]
+  unreadNoticeCount: number
   select: (slug: string) => void
   setFilter: (value: string) => void
   toggleCollapsed: (category: string) => void
   refresh: () => Promise<void>
+  refreshNotices: () => Promise<void>
+  markNoticeRead: (id: number) => void
   loadDetail: (slug?: string) => Promise<void>
   toast: (message: string, kind?: "error" | "success") => void
   openDialog: (name: Exclude<DialogName, null>) => void

@@ -59,13 +59,29 @@ export const candidateValues = (run?: RunHistory | null) =>
     ...(run?.candidateHistory ?? []),
   ].filter((value): value is string => typeof value === "string" && value.trim() !== ""))]
 
-export const primary = (run?: RunHistory | null) => candidateValues(run)[0] ?? ""
-export const alternatives = (run?: RunHistory | null) => candidateValues(run).slice(1)
+/**
+ * Values that may still drive the UI's current-flag presentation. `candidateHistory` deliberately
+ * remains excluded: it is an immutable audit trail and can contain flags the platform rejected.
+ */
+export const activeCandidateValues = (run?: RunHistory | null) => {
+  const rejected = new Set(run?.rejectedFlags ?? [])
+  return [...new Set([
+    run?.confirmedFlag,
+    run?.acceptedFlag,
+    run?.primaryCandidate,
+    ...(run?.candidates ?? []),
+    ...(run?.alternatives ?? []),
+  ].filter((value): value is string =>
+    typeof value === "string" && value.trim() !== "" && !rejected.has(value)))]
+}
 
-export const activeCandidate = (run?: RunHistory | null) => run?.primaryCandidate || run?.candidates?.[0] || ""
+export const primary = (run?: RunHistory | null) => activeCandidateValues(run)[0] ?? ""
+export const alternatives = (run?: RunHistory | null) => activeCandidateValues(run).slice(1)
+
+export const activeCandidate = (run?: RunHistory | null) => activeCandidateValues(run)[0] ?? ""
 
 export const latestFlagRun = (challenge: ChallengeGui) =>
-  [...challenge.runs].reverse().find((run) => candidateValues(run).length > 0)
+  [...challenge.runs].reverse().find((run) => activeCandidateValues(run).length > 0)
 
 export const displayFlagRun = (challenge: ChallengeGui, preferred = currentRun(challenge)) => {
   const confirmed = confirmedRun(challenge)
@@ -73,7 +89,7 @@ export const displayFlagRun = (challenge: ChallengeGui, preferred = currentRun(c
   const accepted = [...challenge.runs].reverse().find((run) => !!run.acceptedFlag)
   if (accepted) return accepted
   const run = preferred
-  return candidateValues(run).length ? run : latestFlagRun(challenge)
+  return activeCandidateValues(run).length ? run : latestFlagRun(challenge)
 }
 
 export const flagEntries = (challenge: ChallengeGui, preferred = currentRun(challenge)) => {

@@ -21,3 +21,11 @@ ctf/
 claude-code-source-code/
 benchmarks/
 docs/
+
+# start-gui.sh 的默认本地比赛工作区；其中会包含下载附件、运行记录与提交台账。
+/xihulunjian-ctf/
+
+# 本地数据备份与一次性解题中间产物。
+/ctf-bak/
+/tmp-solve/
+prototype/

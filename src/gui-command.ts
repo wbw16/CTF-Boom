@@ -8,6 +8,8 @@ export type GuiCommandOptions = {
   port: number
   mode: GuiMode
   help: boolean
+  /** Host-wide network switch; "deny" isolates bash/boom-exec and refuses web tools. */
+  network: "allow" | "deny"
 }
 
 export type NativeClientProcess = {
@@ -45,6 +47,7 @@ export function parseGuiArgs(
   let port = 0
   let explicitMode: GuiMode | undefined
   let help = false
+  let network: "allow" | "deny" = "allow"
 
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]!
@@ -59,6 +62,7 @@ export function parseGuiArgs(
     else if (arg === "--browser") explicitMode = setMode(explicitMode, "browser")
     else if (arg === "--headless" || arg === "--no-open")
       explicitMode = setMode(explicitMode, "headless")
+    else if (arg === "--no-network") network = "deny"
     else if (arg === "-h" || arg === "--help") help = true
     else throw new GuiArgumentError(`Unknown GUI option: ${arg}`)
   }
@@ -68,7 +72,7 @@ export function parseGuiArgs(
   const mode = explicitMode ?? (platform === "darwin" ? "native" : "browser")
   if (mode === "native" && platform !== "darwin")
     throw new GuiArgumentError("The Boom native client currently requires macOS; use --browser or --headless")
-  return { root, port, mode, help }
+  return { root, port, mode, help, network }
 }
 
 export async function startGuiLifecycle(
@@ -79,6 +83,7 @@ export async function startGuiLifecycle(
       hostname: string
       port: number
       open: boolean
+      network: "allow" | "deny"
     }) => Promise<GuiServer>
     launchNative?: (url: string) => Promise<NativeClientProcess>
   } = {},
@@ -89,6 +94,7 @@ export async function startGuiLifecycle(
     hostname: "127.0.0.1",
     port: options.port,
     open: options.mode === "browser",
+    network: options.network,
   })
   let client: NativeClientProcess | undefined
   let closePromise: Promise<void> | undefined

@@ -61,8 +61,8 @@ test("defaults encode the platform rules and resist silent drift", () => {
   // Garbage falls back rather than disabling the cap.
   expect(normalizeCompetitionSettings({ remoteSlots: 0 }).remoteSlots).toBe(3)
   expect(normalizeCompetitionSettings({ remoteSlots: "many" }).remoteSlots).toBe(3)
-  // A deliberate raise is honored but bounded.
-  expect(normalizeCompetitionSettings({ remoteSlots: 4 }).remoteSlots).toBe(4)
+  // Operators may use fewer containers, but a higher value is rejected by the contest platform.
+  expect(normalizeCompetitionSettings({ remoteSlots: 4 }).remoteSlots).toBe(3)
   expect(normalizeCompetitionSettings({ localSlots: 9_999 }).localSlots).toBe(32)
 })
 

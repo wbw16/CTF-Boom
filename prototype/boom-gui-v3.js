@@ -215,6 +215,7 @@ function modelOptions() {
   const current = new Set([
     snapshot.settings.economyModel,
     snapshot.settings.strongModel,
+    snapshot.settings.visionModel,
     ...(snapshot.settings.consultModels || []),
   ]);
   const connected = snapshot.models.filter(model => model.connected);
@@ -231,6 +232,7 @@ function syncModelSelects() {
   const models = modelOptions();
   const currentEconomy = $("#economyModel").value || snapshot.settings.economyModel;
   const currentStrong = $("#strongModel").value || snapshot.settings.strongModel;
+  const currentVision = $("#visionModel").value || snapshot.settings.visionModel || "";
   const selectedConsult = new Set(
     $("#consultModels").selectedOptions.length
       ? [...$("#consultModels").selectedOptions].map(option => option.value)
@@ -241,10 +243,16 @@ function syncModelSelects() {
   $("#economyModel").innerHTML = options;
   $("#strongModel").innerHTML = options;
   $("#consultModels").innerHTML = options;
+  const visionModels = models.filter(model => model.connected && model.attachment === true);
+  $("#visionModel").innerHTML = [
+    `<option value="">— 不启用 —</option>`,
+    ...visionModels.map(model => `<option value="${esc(model.id)}">● ${esc(model.name || model.id)}</option>`),
+  ].join("");
   $("#economyModel").value = models.some(model => model.id === currentEconomy)
     ? currentEconomy : (models[0]?.id || snapshot.settings.economyModel);
   $("#strongModel").value = models.some(model => model.id === currentStrong)
     ? currentStrong : (models[0]?.id || snapshot.settings.strongModel);
+  $("#visionModel").value = visionModels.some(model => model.id === currentVision) ? currentVision : "";
   [...$("#consultModels").options].forEach(option => {
     option.selected = selectedConsult.has(option.value);
   });
@@ -291,6 +299,7 @@ async function loadState({replaceSettings = false} = {}) {
     if (applySettings) {
       $("#economyModel").value = snapshot.settings.economyModel;
       $("#strongModel").value = snapshot.settings.strongModel;
+      $("#visionModel").value = snapshot.settings.visionModel || "";
       const configured = new Set(snapshot.settings.consultModels || []);
       [...$("#consultModels").options].forEach(option => option.selected = configured.has(option.value));
     }
@@ -1005,6 +1014,7 @@ function readSettings() {
   const settings = {
     economyModel: $("#economyModel").value,
     strongModel: $("#strongModel").value,
+    visionModel: $("#visionModel").value,
     tokens: Number($("#tokens").value),
     repeats: Number($("#repeats").value),
     minutes: Number($("#minutes").value),
@@ -2231,6 +2241,7 @@ $("#fmt").oninput = event => {
 };
 $("#economyModel").onchange = () => render();
 $("#strongModel").onchange = () => render();
+$("#visionModel").onchange = () => render();
 $("#pythonEnvironment").onchange = () => syncEnvironmentSelect();
 $("#condaDiscover").onclick = async () => {
   try {

@@ -1,16 +1,8 @@
 import { lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { loadChallenge, normalizeChallengeCategory, type Challenge } from "./challenge.ts"
-import type {
-  ChallengeAcquisitionInput,
-  CtfPlatformAdapter,
-  FlagSubmissionInput,
-  FlagSubmissionResult,
-  PlatformChallengeCatalog,
-  PlatformChallengeCatalogInput,
-  PlatformChallengePreview,
-} from "./platform-adapter.ts"
-import type { PlatformAdapterManifest } from "./platform-manifest.ts"
+import type { Workspace } from "./workspace.ts"
+import { XIHULUNJIAN_DEFAULT_SERVER_HOST } from "./xihulunjian-config.ts"
 
 /**
  * 西湖论剑 "AI Agent API" adapter.
@@ -35,6 +27,38 @@ const API_PREFIX = "/slab-match/api/v1/agent"
 const SUCCESS_CODE = "00000"
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 const MAX_ATTACHMENT_BYTES = 128 * 1024 * 1024
+
+/** A fixed identity makes mixed-platform challenge roots impossible in this competition build. */
+export const XIHULUNJIAN_ADAPTER_ID = "xihulunjian"
+
+export type XihulunjianSubmissionResult = {
+  adapter: typeof XIHULUNJIAN_ADAPTER_ID
+  verdict: "accepted" | "rejected" | "pending"
+  detail: string
+  submittedAt: string
+}
+
+export type XihulunjianSubmissionInput = {
+  challenge: Challenge
+  workspace: Workspace
+  candidate: string
+  signal?: AbortSignal
+}
+
+export type XihulunjianNotice = {
+  id: number
+  title: string
+  content?: string
+  createdAt?: string
+  createdTime?: number
+  userName?: string
+}
+
+export type XihulunjianNoticeDetail = XihulunjianNotice & {
+  isFile: boolean
+  files: Array<{ name: string; url: string; ext?: string }>
+  url?: string
+}
 
 /**
  * Boom's own guard, deliberately far below the platform's hard limit of 50 attempts per challenge.
@@ -78,6 +102,37 @@ function numeric(value: unknown) {
   return undefined
 }
 
+function noticeID(value: unknown) {
+  const found = numeric(value)
+  return found !== undefined && Number.isSafeInteger(found) && found > 0 ? found : undefined
+}
+
+function noticeFiles(value: unknown) {
+  const file = object(value)
+  const values = Array.isArray(file?.files) ? file.files : []
+  return values.flatMap((item) => {
+    const found = object(item)
+    const name = text(found?.name)
+    const url = text(found?.url)
+    if (!name || !url) return []
+    return [{ name, url, ...(text(found?.ext) ? { ext: text(found?.ext) } : {}) }]
+  })
+}
+
+function notice(value: unknown): XihulunjianNotice | undefined {
+  const data = object(value)
+  const id = noticeID(data?.id)
+  if (!id) return undefined
+  return {
+    id,
+    title: text(data?.title) ?? "未命名公告",
+    ...(text(data?.content) ? { content: text(data?.content) } : {}),
+    ...(text(data?.createdAt) ? { createdAt: text(data?.createdAt) } : {}),
+    ...(numeric(data?.createdTime) !== undefined ? { createdTime: numeric(data?.createdTime) } : {}),
+    ...(text(data?.userName) ? { userName: text(data?.userName) } : {}),
+  }
+}
+
 function identifier(value: unknown, label: string) {
   if ((typeof value !== "string" && typeof value !== "number") || !String(value).trim())
     throw new Error(`西湖论剑接口返回的${label}为空`)
@@ -89,6 +144,13 @@ function identifier(value: unknown, label: string) {
 
 function safeErrorBody(value: string) {
   return value.replace(/[\0\r\n]+/g, " ").slice(0, 2_000)
+}
+
+/** Transport failures may clear on the next paced attempt; API/business validation errors will not. */
+function retryablePlatformError(error: unknown) {
+  if (error instanceof DOMException && error.name === "AbortError") return false
+  const message = error instanceof Error ? error.message : String(error)
+  return /\b(?:408|425|429|5\d\d)\b|\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT)\b|\b(?:fetch failed|network|socket|timeout|timed out|temporar(?:y|ily))\b|限流|请求过于频繁/i.test(message)
 }
 
 async function boundedBytes(response: Response, maximum: number) {
@@ -192,23 +254,23 @@ export function selectEndpoint(endpoints: unknown): XihulunjianEndpoint | undefi
 
     if (exposeIps.length)
       lines.push(
-        `- 直连地址：${exposeIps.join(", ")}` +
-          (ports.length ? `（开放端口：${ports.join(", ")}）` : ""),
+        `- Direct address: ${exposeIps.join(", ")}` +
+          (ports.length ? ` (open ports: ${ports.join(", ")})` : ""),
       )
-    if (proxyIps.length) lines.push(`- 代理 IP：${proxyIps.join(", ")}${proxied ? "（平台建议优先使用代理）" : ""}`)
+    if (proxyIps.length) lines.push(`- Proxy IP: ${proxyIps.join(", ")}${proxied ? " (platform recommends the proxy)" : ""}`)
     for (const mapping of mappings)
-      lines.push(`- 端口映射：${mapping.type} 容器 ${mapping.port} -> 代理 ${mapping.proxy}`)
+      lines.push(`- Port mapping: ${mapping.type} container ${mapping.port} -> proxy ${mapping.proxy}`)
     if (Array.isArray(found.users)) {
       for (const item of found.users) {
         const user = object(item)
         const username = text(user?.username)
         if (!username) continue
         const password = text(user?.password)
-        lines.push(`- 账号：${username}${password ? ` / 密码：${password}` : ""}`)
+        lines.push(`- Account: ${username}${password ? ` / password: ${password}` : ""}`)
       }
     }
     if (expires !== undefined)
-      lines.push(`- 环境过期时间：${new Date(expires).toISOString()}`)
+      lines.push(`- Environment expires: ${new Date(expires).toISOString()}`)
   }
   if (!remote && lines.length === 0) return undefined
   return {
@@ -264,32 +326,35 @@ function attachmentsOf(value: unknown): Array<{ name: string; url: string }> {
 /** Raised only for platform rate limiting, which is retryable; every other failure is not. */
 export class XihulunjianRateLimitError extends Error {}
 
-export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
-  readonly id: string
-  readonly name?: string
+/**
+ * The answer endpoint overloads business code 40001: on a normal incorrect answer it returns
+ * `提交flag错误，请重新提交` with HTTP 200, rather than the usual rate-limit message. Retrying that
+ * response would resubmit the same wrong flag and consume the platform quota each time.
+ */
+function isIncorrectFlagResponse(endpoint: string, message: string) {
+  return endpoint === "/answer-panel/answer"
+    && /(?:flag|答案).*(?:错误|不正确|incorrect)|(?:错误|不正确|incorrect).*(?:flag|答案)/i.test(message)
+}
+
+export class XihulunjianPlatformAdapter {
+  readonly id = XIHULUNJIAN_ADAPTER_ID
+  readonly name = "西湖论剑"
   /** Tail of the serialized request chain; every call waits for the previous one. */
   private pending: Promise<void> = Promise.resolve()
   private lastRequestAt = 0
 
   constructor(
-    private readonly manifest: PlatformAdapterManifest,
+    private readonly accessKey: string,
     private readonly fetcher: typeof fetch = fetch,
     private readonly sleep: (ms: number) => Promise<void> =
       (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    private readonly serverHost = XIHULUNJIAN_DEFAULT_SERVER_HOST,
   ) {
-    if (manifest.status !== "ready")
-      throw new Error(`Platform adapter ${manifest.id} is still a draft; review it and set status to ready`)
-    this.id = manifest.id
-    this.name = manifest.name
+    if (!accessKey.trim()) throw new Error("西湖论剑未配置 AccessKey")
   }
 
   private credential() {
-    const auth = this.manifest.auth
-    if (!auth) throw new Error(`西湖论剑适配器 ${this.id} 缺少 AccessKey 配置`)
-    const value = process.env[auth.env]?.trim()
-    if (!value)
-      throw new Error(`西湖论剑适配器 ${this.id} 需要环境变量 ${auth.env} 提供 AccessKey`)
-    return value
+    return this.accessKey
   }
 
   /**
@@ -330,7 +395,7 @@ export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
         return await this.throttle(() => this.attempt(method, endpoint, options))
       } catch (error) {
         lastError = error
-        if (!(error instanceof XihulunjianRateLimitError)) throw error
+        if (!(error instanceof XihulunjianRateLimitError) && !retryablePlatformError(error)) throw error
       }
     }
     throw lastError
@@ -341,18 +406,14 @@ export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
     endpoint: string,
     options: { query?: Record<string, string>; body?: JsonObject; signal?: AbortSignal } = {},
   ) {
-    const base = new URL(this.manifest.baseURL)
+    const base = new URL(this.serverHost)
     const url = new URL(`${base.pathname.replace(/\/$/, "")}${API_PREFIX}${endpoint}`, base.origin)
     if (url.origin !== base.origin)
       throw new Error(`西湖论剑请求越出配置的源: ${url.origin}`)
     for (const [key, value] of Object.entries(options.query ?? {})) url.searchParams.set(key, value)
 
     const headers = new Headers({ Accept: "application/json" })
-    const auth = this.manifest.auth!
-    const credential = `${auth.prefix ?? ""}${this.credential()}`
-    if (auth.location === "header") headers.set(auth.name, credential)
-    else if (auth.location === "query") url.searchParams.set(auth.name, credential)
-    else headers.append("Cookie", `${auth.name}=${encodeURIComponent(credential)}`)
+    headers.set("X-Agent-AccessKey", this.credential())
 
     const body = options.body === undefined ? undefined : JSON.stringify(options.body)
     if (body !== undefined) headers.set("Content-Type", "application/json")
@@ -375,8 +436,9 @@ export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
     const envelope = object(payload)
     const code = text(envelope?.code)
     const message = text(envelope?.message) ?? "无描述"
-    // Rate limiting arrives as HTTP 429 and/or business code 40001; both are retryable.
-    if (response.status === 429 || code === RATE_LIMIT_CODE)
+    // Most endpoints use 40001 for rate limits. The answer endpoint also uses it for an
+    // incorrect flag (with HTTP 200), which is a definitive verdict and must never be retried.
+    if (response.status === 429 || (code === RATE_LIMIT_CODE && !isIncorrectFlagResponse(endpoint, message)))
       throw new XihulunjianRateLimitError(
         `西湖论剑接口 ${method} ${endpoint} 触发限流 (${response.status}/${code ?? "-"}): ${message}`,
       )
@@ -394,7 +456,14 @@ export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
   private async exerciseList(signal?: AbortSignal) {
     const data = await this.call("GET", "/ctf/exercise-list", { signal })
     if (!Array.isArray(data)) throw new Error("西湖论剑题目列表结构异常")
-    const previews: PlatformChallengePreview[] = []
+    const previews: Array<{
+      id: string
+      challengeID: string
+      title: string
+      category?: string
+      solved?: boolean
+      group?: { id: string; name: string }
+    }> = []
     for (const raw of data) {
       const group = object(raw)
       if (!group) continue
@@ -419,29 +488,6 @@ export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
       }
     }
     return previews
-  }
-
-  async listChallenges(input: PlatformChallengeCatalogInput): Promise<PlatformChallengeCatalog> {
-    const all = await this.exerciseList(input.signal)
-    const query = input.query ?? {}
-    const search = query.search?.trim().toLocaleLowerCase()
-    const category = query.category?.trim()
-    const filtered = all.filter((item) => {
-      if (category && item.category !== category) return false
-      if (!search) return true
-      return [item.id, item.title, item.category]
-        .some((value) => value?.toLocaleLowerCase().includes(search))
-    })
-    const pageSize = Math.max(1, Math.min(100, Math.floor(query.pageSize ?? 50)))
-    const pages = Math.max(1, Math.ceil(filtered.length / pageSize))
-    const page = Math.max(1, Math.min(pages, Math.floor(query.page ?? 1)))
-    return {
-      items: filtered.slice((page - 1) * pageSize, page * pageSize),
-      page,
-      pageSize,
-      total: filtered.length,
-      categories: [...new Set(all.map((item) => item.category).filter((value): value is string => Boolean(value)))],
-    }
   }
 
   /** Read one challenge's detail. Never starts an environment; that is an explicit separate step. */
@@ -571,78 +617,72 @@ export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
    * catalog, while only three environments may exist at a time; starting them at download would burn
    * all three slots on challenges nobody is solving yet and start their expiry clocks.
    */
-  async acquireChallenges(input: ChallengeAcquisitionInput): Promise<Challenge[]> {
-    const previews = await this.exerciseList(input.signal)
-    const selection = input.selection
-    const excluded = new Set(selection?.exclude ?? [])
-    const wanted = new Set(selection?.ids ?? [])
-    const search = selection?.query?.search?.trim().toLocaleLowerCase()
-    const selected = previews.filter((item) => {
-      if (excluded.has(item.id)) return false
-      if (selection?.all) {
-        if (!search) return true
-        return [item.id, item.title, item.category]
-          .some((value) => value?.toLocaleLowerCase().includes(search))
-      }
-      if (!selection) return true
-      return wanted.has(item.id)
-    })
+  async acquireChallenges(input: { root: string; signal?: AbortSignal }): Promise<Challenge[]> {
+    const selected = await this.exerciseList(input.signal)
 
     const materialized: Challenge[] = []
     const used = new Set<string>()
     for (const item of selected) {
-      const detail = await this.exerciseDetail(item.challengeID, input.signal)
-      let slug = this.slug(detail.name || item.title || detail.id)
-      if (used.has(slug)) slug = this.slug(`${slug}-${detail.id}`)
-      used.add(slug)
+      try {
+        const detail = await this.exerciseDetail(item.challengeID, input.signal)
+        let slug = this.slug(detail.name || item.title || detail.id)
+        if (used.has(slug)) slug = this.slug(`${slug}-${detail.id}`)
+        used.add(slug)
 
-      const category = normalizeChallengeCategory(detail.category ?? item.category)
-      const directory = path.join(path.resolve(input.root), "challenges", category, slug)
-      await this.assertOwned(directory, detail.id)
+        const category = normalizeChallengeCategory(detail.category ?? item.category)
+        const directory = path.join(path.resolve(input.root), "challenges", category, slug)
+        await this.assertOwned(directory, detail.id)
 
-      const names = new Set<string>()
-      for (const attachment of detail.attachments) {
-        let name = this.slug(attachment.name)
-        if (names.has(name)) name = this.slug(`${detail.id}-${name}`)
-        names.add(name)
-        const bytes = await this.download(new URL(attachment.url), input.signal)
-        await this.atomicWrite(path.join(directory, "files", name), bytes)
-      }
+        const names = new Set<string>()
+        for (const attachment of detail.attachments) {
+          let name = this.slug(attachment.name)
+          if (names.has(name)) name = this.slug(`${detail.id}-${name}`)
+          names.add(name)
+          const bytes = await this.download(new URL(attachment.url), input.signal)
+          await this.atomicWrite(path.join(directory, "files", name), bytes)
+        }
 
-      const readme = [
-        `# ${detail.name}`,
-        "",
-        detail.description || "（平台未提供题目描述）",
-        ...(detail.endpoint?.detail
-          ? ["", "## 环境连接信息", "", detail.endpoint.detail]
-          : detail.serviceRequired
-            ? ["", "## 环境连接信息", "", "该题需要靶机环境，尚未启动。解题调度会在获得环境槽位后启动并写入地址。"]
-            : []),
-      ].join("\n")
-      await this.atomicWrite(path.join(directory, "README.md"), `${readme}\n`)
+        const readme = [
+          `# ${detail.name}`,
+          "",
+          detail.description || "(no challenge description provided by the platform)",
+          ...(detail.endpoint?.detail
+            ? ["", "## Environment connection info", "", detail.endpoint.detail]
+            : detail.serviceRequired
+              ? ["", "## Environment connection info", "", "This challenge needs a target environment that has not been started yet. The solving scheduler will start it once an environment slot is available and write the address here."]
+              : []),
+        ].join("\n")
+        await this.atomicWrite(path.join(directory, "README.md"), `${readme}\n`)
 
-      await this.atomicWrite(
-        path.join(directory, "meta.json"),
-        `${JSON.stringify({
-          category,
-          ...(detail.difficulty ? { difficulty: detail.difficulty } : {}),
-          ...(detail.endpoint?.remote ? { remote: detail.endpoint.remote } : {}),
-          ...(detail.serviceRequired ? { service_required: true } : {}),
-          platform: {
-            adapter: this.id,
-            challenge_id: detail.id,
-            options: {
-              exercise_id: detail.id,
-              ...(detail.score === undefined ? {} : { score: detail.score }),
-              ...(detail.difficulty ? { difficulty: detail.difficulty } : {}),
-              ...(detail.endpoint?.expireTime === undefined
-                ? {}
-                : { expire_time: detail.endpoint.expireTime }),
+        await this.atomicWrite(
+          path.join(directory, "meta.json"),
+          `${JSON.stringify({
+            category,
+            ...(detail.difficulty ? { difficulty: detail.difficulty } : {}),
+            ...(detail.endpoint?.remote ? { remote: detail.endpoint.remote } : {}),
+            ...(detail.serviceRequired ? { service_required: true } : {}),
+            platform: {
+              adapter: this.id,
+              challenge_id: detail.id,
+              options: {
+                exercise_id: detail.id,
+                ...(detail.solved || item.solved ? { solved: true } : {}),
+                ...(detail.score === undefined ? {} : { score: detail.score }),
+                ...(detail.difficulty ? { difficulty: detail.difficulty } : {}),
+                ...(detail.endpoint?.expireTime === undefined
+                  ? {}
+                  : { expire_time: detail.endpoint.expireTime }),
+              },
             },
-          },
-        }, undefined, 2)}\n`,
-      )
-      materialized.push(await loadChallenge(directory, new Map()))
+          }, undefined, 2)}\n`,
+        )
+        materialized.push(await loadChallenge(directory, new Map()))
+      } catch (error) {
+        // A malformed or access-restricted individual challenge must not hide all other challenges
+        // in the same release batch. A transport failure is different: propagate it so the outer
+        // unattended cycle can retry the whole catalog coherently.
+        if (input.signal?.aborted || retryablePlatformError(error)) throw error
+      }
     }
     return materialized
   }
@@ -654,7 +694,7 @@ export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
    * the competition applies no penalty for a wrong flag, which is why Boom submits promptly instead
    * of spending model budget on self-verification first.
    */
-  async submitFlag(input: FlagSubmissionInput): Promise<FlagSubmissionResult> {
+  async submitFlag(input: XihulunjianSubmissionInput): Promise<XihulunjianSubmissionResult> {
     const exerciseId = input.challenge.platform?.challengeID
     if (!exerciseId) throw new Error(`题目 ${input.challenge.slug} 缺少平台题目 ID`)
     const flag = innerFlagValue(input.candidate)
@@ -693,6 +733,33 @@ export class XihulunjianPlatformAdapter implements CtfPlatformAdapter {
     return {
       point: numeric(data?.stagePoint) ?? 0,
       rank: numeric(data?.stageRank),
+    }
+  }
+
+  /** Announcement summaries, intentionally kept separate from challenge acquisition. */
+  async notices(signal?: AbortSignal): Promise<XihulunjianNotice[]> {
+    const data = await this.call("GET", "/match/notice/now-list", { signal })
+    if (!Array.isArray(data)) throw new Error("西湖论剑公告列表结构异常")
+    return data.flatMap((item) => {
+      const found = notice(item)
+      return found ? [found] : []
+    })
+  }
+
+  /** Full announcement content and any platform-provided attachments. */
+  async noticeDetail(id: number, signal?: AbortSignal): Promise<XihulunjianNoticeDetail> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error("西湖论剑公告 ID 非法")
+    const data = object(await this.call("GET", "/match/notice/detail", {
+      query: { id: String(id) },
+      signal,
+    }))
+    const base = notice(data)
+    if (!base) throw new Error("西湖论剑公告详情结构异常")
+    return {
+      ...base,
+      isFile: data?.isFile === true,
+      files: noticeFiles(data?.file),
+      ...(text(data?.url) ? { url: text(data?.url) } : {}),
     }
   }
 }

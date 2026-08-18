@@ -18,8 +18,9 @@ import {
 import type { ModelPolicy } from "./model-policy.ts"
 import { installOpenCodeAgentResources } from "./runtime/agent.ts"
 import { startBoomToolBridge } from "./runtime/tool-bridge.ts"
+import { startExactEndpointProxy, type ExactEndpointProxy } from "./runtime/exact-endpoint-proxy.ts"
 import { createNativeRuntime, type NativeRuntimeOptions } from "./runtime/native-runtime.ts"
-import { anthropicProviderBaseURL } from "./runtime/provider-http.ts"
+import { anthropicProviderBaseURL, isExactEndpoint } from "./runtime/provider-http.ts"
 import {
   createManagedNativeRuntime,
   inspectManagedNativeProviders,
@@ -56,6 +57,7 @@ const RUNTIME_FILES = [
   { source: "plugin/armor-prompt.ts", target: "plugin/armor-prompt.ts" },
   { source: "plugin/boom-bridge.ts", target: "plugin/boom-bridge.ts" },
 ]
+const VISION_PLUGIN = { source: "plugin/vision.ts", target: "plugin/vision.ts" }
 const LEGACY_TOOL_PLUGINS = ["plugin/boom-exec.ts", "plugin/ctf-note.ts", "plugin/ctf-submit.ts"]
 
 /** Translate Boom's public model aliases only at the runtime boundary. */
@@ -613,11 +615,50 @@ function compatibilityEnvironment() {
   return environment
 }
 
+/**
+ * OpenCode's OpenAI-compatible provider always appends `/chat/completions`. Rewrite only marked
+ * complete endpoints to a loopback prefix, then let the proxy forward that request to the original
+ * root endpoint. Unmarked providers keep OpenCode's normal URL handling untouched.
+ */
+async function installExactEndpointProxy(directory: string): Promise<ExactEndpointProxy | undefined> {
+  const target = path.join(directory, "boom.json")
+  const config = JSON.parse(await Bun.file(target).text()) as Record<string, unknown>
+  const providers = object(config.provider)
+  if (!providers) return undefined
+
+  const endpoints: Record<string, string> = {}
+  for (const [providerID, value] of Object.entries(providers)) {
+    const provider = object(value)
+    const options = object(provider?.options)
+    if (typeof options?.baseURL === "string" && isExactEndpoint(options.baseURL))
+      endpoints[providerID] = options.baseURL
+  }
+  const proxy = startExactEndpointProxy(endpoints)
+  if (!proxy) return undefined
+
+  try {
+    for (const providerID of Object.keys(endpoints)) {
+      const provider = object(providers[providerID])!
+      const options = object(provider.options) ?? {}
+      provider.options = {
+        ...options,
+        baseURL: `${proxy.baseURL}/providers/${encodeURIComponent(providerID)}/v1`,
+      }
+    }
+    await Bun.write(target, JSON.stringify(config, undefined, 2) + "\n")
+    return proxy
+  } catch (error) {
+    proxy.close()
+    throw error
+  }
+}
+
 async function startOpenCodeCompatibility(runtime: {
   directory: string
   executable: string
   providerIDs: string[]
   agentRegistry: Awaited<ReturnType<typeof installOpenCodeAgentResources>>
+  visionModel?: string
 }) {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "boom-runtime-"))
   const isolatedConfigHome = path.join(temporaryRoot, "config")
@@ -640,6 +681,7 @@ async function startOpenCodeCompatibility(runtime: {
   const modelCatalog = reusableModelsInfo?.isFile() && !reusableModelsInfo.isSymbolicLink()
     ? reusableModels
     : undefined
+  const exactEndpointProxy = await installExactEndpointProxy(runtime.directory)
   const bridge = startBoomToolBridge(runtime.agentRegistry)
   const child = Bun.spawn(
     [runtime.executable, "serve", "--hostname=127.0.0.1", "--port=0"],
@@ -668,6 +710,7 @@ async function startOpenCodeCompatibility(runtime: {
         OPENCODE_DISABLE_CHANNEL_DB: "1",
         BOOM_TOOL_BRIDGE_URL: bridge.url,
         BOOM_TOOL_BRIDGE_TOKEN: bridge.token,
+        ...(runtime.visionModel ? { BOOM_VISION_MODEL: resolveRuntimeModel(runtime.visionModel) } : {}),
       },
       stdin: "ignore",
       stdout: "pipe",
@@ -718,6 +761,7 @@ async function startOpenCodeCompatibility(runtime: {
   const close = () => closePromise ??= (async () => {
     child.kill()
     bridge.close()
+    exactEndpointProxy?.close()
     await child.exited.catch(() => undefined)
     await rm(temporaryRoot, { recursive: true, force: true })
   })()
@@ -774,7 +818,11 @@ async function installProviders(directory: string, mcpStore: McpStore) {
   return Object.keys(config.provider)
 }
 
-async function installRuntime(models?: ModelPolicy) {
+async function installRuntime(
+  models?: ModelPolicy,
+  visionModel?: string,
+  network: "allow" | "deny" = "allow",
+) {
   const directory = path.resolve(
     process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"),
     "runtime",
@@ -788,18 +836,21 @@ async function installRuntime(models?: ModelPolicy) {
     rm(path.join(directory, "bin"), { recursive: true, force: true }),
   ])
   const mcpStore = await loadMcpStore()
-  for (const file of RUNTIME_FILES) {
+  for (const file of [...RUNTIME_FILES, ...(visionModel ? [VISION_PLUGIN] : [])]) {
     const source = Bun.file(path.join(RESOURCE_ROOT, file.source))
     if (!(await source.exists())) throw new Error(`Boom installation is missing runtime resource: ${file.source}`)
     await mkdir(path.dirname(path.join(directory, file.target)), { recursive: true })
     await Bun.write(path.join(directory, file.target), source)
   }
+  if (!visionModel) await unlink(path.join(directory, VISION_PLUGIN.target)).catch(() => {})
   await Promise.all(LEGACY_TOOL_PLUGINS.map((target) => unlink(path.join(directory, target)).catch(() => {})))
   const agents = await installOpenCodeAgentResources(
     RESOURCE_ROOT,
     directory,
     Object.values(mcpStore.servers),
     models,
+    visionModel,
+    network,
   )
   const providerIDs = await installProviders(directory, mcpStore)
 
@@ -814,15 +865,24 @@ async function installRuntime(models?: ModelPolicy) {
     providerIDs,
     promptVersion: agents.promptVersion,
     agentRegistry: agents,
+    ...(visionModel ? { visionModel } : {}),
   }
 }
 
-export async function configureRuntime(models?: ModelPolicy) {
-  return installRuntime(models)
+export async function configureRuntime(
+  models?: ModelPolicy,
+  visionModel?: string,
+  network: "allow" | "deny" = "allow",
+) {
+  return installRuntime(models, visionModel, network)
 }
 
-export async function startOpenCodeRuntime(options?: { models?: ModelPolicy }) {
-  const configured = await configureRuntime(options?.models)
+export async function startOpenCodeRuntime(options?: {
+  models?: ModelPolicy
+  visionModel?: string
+  network?: "allow" | "deny"
+}) {
+  const configured = await configureRuntime(options?.models, options?.visionModel, options?.network)
   const started = await startOpenCodeCompatibility(configured)
   const runtimePackage = await Bun.file(
     path.join(path.dirname(Bun.resolveSync("opencode-ai/package.json", PACKAGE_ROOT)), "package.json"),
@@ -965,6 +1025,8 @@ export type RuntimeStartOptions = {
   backend?: RuntimeBackendSelection
   native?: NativeRuntimeOptions
   managedNative?: ManagedNativeRuntimeOptions
+  /** Host-wide network switch for the selected backend; "deny" also isolates bash/boom-exec. */
+  network?: "allow" | "deny"
 }
 
 export function selectRuntimeBackend(value = process.env.BOOM_RUNTIME_BACKEND): RuntimeBackendSelection {
@@ -1040,8 +1102,8 @@ export async function inspectNativeProviders() {
 /** Start the selected Boom Runtime while retaining OpenCode as the product default during migration. */
 export async function startRuntime(options: RuntimeStartOptions = {}) {
   const backend = options.backend ?? selectRuntimeBackend()
-  if (backend === "opencode") return startOpenCodeRuntime()
-  if (options.native) return createNativeRuntime(options.native)
+  if (backend === "opencode") return startOpenCodeRuntime({ network: options.network })
+  if (options.native) return createNativeRuntime({ ...options.native, network: options.network })
   return createManagedNativeRuntime(managedNativeOptions(options.managedNative))
 }
 

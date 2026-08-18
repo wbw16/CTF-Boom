@@ -105,6 +105,24 @@ describe("M2 neutral agent registry", () => {
     expect(registry.promptVersion).not.toBe(unstamped.promptVersion)
   })
 
+  test("adds the on-demand vision tool and prompt only when configured", async () => {
+    const plain = await compileBoomAgentRegistry(RESOURCE_ROOT)
+    const enabled = await compileBoomAgentRegistry(
+      RESOURCE_ROOT,
+      [],
+      { economy: "test/economy", strong: "test/text" },
+      "test/vision",
+    )
+    const plainSolver = plain.agents.find((agent) => agent.resource.id === "boom")!
+    const enabledSolver = enabled.agents.find((agent) => agent.resource.id === "boom")!
+    expect(plainSolver.profile.tools).not.toContain("describe-image")
+    expect(plainSolver.openCodeMarkdown).not.toContain("current model cannot inspect images")
+    expect(enabledSolver.profile.tools).toContain("describe-image")
+    expect(enabledSolver.openCodeMarkdown).toContain("current model cannot inspect images")
+    for (const agent of enabled.agents.filter((agent) => agent.resource.id !== "boom"))
+      expect(agent.profile.tools).not.toContain("describe-image")
+  })
+
   test("keeps the C19 tool catalog and Boom-owned schemas snapshot-stable", async () => {
     const { catalog } = await compileBoomAgentRegistry(RESOURCE_ROOT)
     expect(Object.entries(catalog.tools).map(([id, tool]) => [id, tool.implementation, tool.sideEffect])).toEqual([
@@ -116,6 +134,7 @@ describe("M2 neutral agent registry", () => {
       ["glob", "boom", "read"],
       ["grep", "boom", "read"],
       ["task", "runtime", "process"],
+      ["describe-image", "compatibility", "network"],
       ["skill", "boom", "read"],
       ["websearch", "boom", "network"],
       ["webfetch", "boom", "network"],

@@ -27,13 +27,15 @@ current candidate in `ready` state for Boom's optional automatic-submission or m
 The final writeup must contain:
 
 - the selected flag;
-- the reproducible derivation from the supplied challenge input;
+- the core idea, evidence, and reproducible derivation from the supplied challenge input;
 - the commands, programs, and artifact paths needed to reproduce that derivation.
 
 Write the final writeup in Chinese. Keep commands, code, file paths, and the literal flag unchanged.
 If a script was used to solve the challenge or verify the flag, include its path, invocation, and
 complete source code in a fenced code block. Do not replace any part of the script with a path,
 summary, truncation, or ellipsis.
+If no script or PoC was actually used, do not create or invent one just for the writeup; explain the
+verified reasoning and manual reproduction steps instead.
 
 Call `ctf-submit` as soon as a credible candidate is available. Boom ends that solve turn and obtains
 a platform or user verdict. Only after a later turn explicitly reports acceptance should you complete

@@ -43,8 +43,8 @@ export const AUTONOMY_THRESHOLDS = {
 } as const
 
 /** Attach the in-turn dead-end brake to a solve turn's limits. */
-export function withStallBrake(limits: Limits, challengeBudget: number): Limits {
-  if (!Number.isFinite(challengeBudget) || challengeBudget <= 0) return limits
+export function withStallBrake(limits: Limits, challengeBudget: number | undefined): Limits {
+  if (typeof challengeBudget !== "number" || !Number.isFinite(challengeBudget) || challengeBudget <= 0) return limits
   return {
     ...limits,
     stalledInTurnTokens: Math.floor(
@@ -88,7 +88,7 @@ export function decideAutonomy(input: {
   outcome: { stop: string; candidates: string[]; reply: string }
   activeSolveMs: number
   cumulativeBillable: number
-  challengeTokenBudget: number
+  challengeTokenBudget?: number
   productiveLongRunningTool?: boolean
   now?: number
   manual?: boolean
@@ -103,13 +103,17 @@ export function decideAutonomy(input: {
   ) return { action: "continue", reason: "first normal yield without a candidate" }
 
   const early = explicitlyRequested || input.state.consecutiveNormalYieldsWithoutDurableProgress >= 2
+  const hasTokenBudget =
+    input.challengeTokenBudget !== undefined &&
+    Number.isFinite(input.challengeTokenBudget) &&
+    input.challengeTokenBudget > 0
   const eligible =
     input.activeSolveMs >= AUTONOMY_THRESHOLDS.eligibleActiveMs ||
-    input.cumulativeBillable >= input.challengeTokenBudget * AUTONOMY_THRESHOLDS.eligibleBudgetRatio
+    (hasTokenBudget && input.cumulativeBillable >= input.challengeTokenBudget! * AUTONOMY_THRESHOLDS.eligibleBudgetRatio)
   const stalledByTime = now - validTime(input.state.lastProgressAt) >= AUTONOMY_THRESHOLDS.stalledMs
-  const stalledByUsage =
+  const stalledByUsage = hasTokenBudget &&
     input.cumulativeBillable - input.state.billableAtLastProgress >=
-      input.challengeTokenBudget * AUTONOMY_THRESHOLDS.stalledBudgetRatio
+      input.challengeTokenBudget! * AUTONOMY_THRESHOLDS.stalledBudgetRatio
   if (!early && (!eligible || (!stalledByTime && !stalledByUsage))) {
     return {
       action: "none",
@@ -210,7 +214,9 @@ export async function runAutonomyEscalation(input: {
       model: input.policy.economy,
       prompt: await secondOpinionPrompt(input),
       signal: input.signal,
-      tokenBudget: Math.max(1_000, Math.min(input.limits.tokens, Math.floor(input.limits.tokens * 0.4))),
+      tokenBudget: input.limits.tokens === undefined
+        ? undefined
+        : Math.max(1_000, Math.min(input.limits.tokens, Math.floor(input.limits.tokens * 0.4))),
     })
     const text = runtimeReplyText(completed.parts)
     const allowedFinishes =

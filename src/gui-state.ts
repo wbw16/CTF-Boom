@@ -2,11 +2,20 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { CONSULT_EXPERTS } from "./consultation.ts"
+import {
+  DEFAULT_COMPETITION_SETTINGS,
+  normalizeCompetitionSettings,
+  type CompetitionSettings,
+} from "./competition/policy.ts"
 
 export type GuiSettings = {
   economyModel: string
   strongModel: string
+  /** Optional image-capable model used by the on-demand vision tool. */
+  visionModel: string
   tokens: number
+  /** When false, a run has no token ceiling and is bounded by time and other safeguards instead. */
+  tokenBudgetEnabled: boolean
   repeats: number
   minutes: number
   concurrency: number
@@ -26,6 +35,10 @@ export type GuiSettings = {
   blindReview: boolean
   /** Context experiment switch; true preserves the repaired-Boom baseline. */
   consultOnCompaction: boolean
+  /** Host-wide network switch; "deny" refuses web tools and isolates bash/boom-exec sandboxes. */
+  network: "allow" | "deny"
+  /** Competition scheduling: environment/local slots, match length, and the endgame window. */
+  competition: CompetitionSettings
 }
 
 export type ChallengeGuiState = {
@@ -50,7 +63,9 @@ type StateFile = {
 export const DEFAULT_GUI_SETTINGS: GuiSettings = {
   economyModel: "free/deepseek-v4-flash-free",
   strongModel: "free/deepseek-v4-flash-free",
+  visionModel: "",
   tokens: 1_000_000,
+  tokenBudgetEnabled: true,
   repeats: 5,
   minutes: 60,
   concurrency: 1,
@@ -59,6 +74,9 @@ export const DEFAULT_GUI_SETTINGS: GuiSettings = {
   consultModels: [],
   blindReview: true,
   consultOnCompaction: true,
+  network: "allow",
+  // The runtime's ordinary concurrency control is the sole local-task knob in this build.
+  competition: { ...DEFAULT_COMPETITION_SETTINGS, localSlots: 1 },
 }
 
 function statePath() {
@@ -79,6 +97,7 @@ function normalizeSettings(value: unknown): GuiSettings {
         .filter((model): model is string => typeof model === "string" && model.includes("/"))
         .slice(0, CONSULT_EXPERTS.maximum)
     : DEFAULT_GUI_SETTINGS.consultModels
+  const concurrency = Math.min(32, Math.floor(positive(input.concurrency, DEFAULT_GUI_SETTINGS.concurrency)))
   return {
     economyModel:
       typeof input.economyModel === "string" && input.economyModel.includes("/")
@@ -88,10 +107,19 @@ function normalizeSettings(value: unknown): GuiSettings {
       typeof input.strongModel === "string" && input.strongModel.includes("/")
         ? input.strongModel
         : legacyModel ?? DEFAULT_GUI_SETTINGS.strongModel,
+    visionModel:
+      typeof input.visionModel === "string" && (input.visionModel === "" || input.visionModel.includes("/"))
+        ? input.visionModel
+        : DEFAULT_GUI_SETTINGS.visionModel,
     tokens: positive(input.tokens, DEFAULT_GUI_SETTINGS.tokens),
+    // Existing saved settings predate this flag and therefore retain the historical bounded mode.
+    tokenBudgetEnabled:
+      typeof input.tokenBudgetEnabled === "boolean"
+        ? input.tokenBudgetEnabled
+        : DEFAULT_GUI_SETTINGS.tokenBudgetEnabled,
     repeats: positive(input.repeats, DEFAULT_GUI_SETTINGS.repeats, 2),
     minutes: positive(input.minutes, DEFAULT_GUI_SETTINGS.minutes),
-    concurrency: Math.min(32, Math.floor(positive(input.concurrency, DEFAULT_GUI_SETTINGS.concurrency))),
+    concurrency,
     flagFormat: typeof input.flagFormat === "string" ? input.flagFormat : DEFAULT_GUI_SETTINGS.flagFormat,
     executionMode:
       input.executionMode === "isolated" || input.executionMode === "static-only"
@@ -108,6 +136,12 @@ function normalizeSettings(value: unknown): GuiSettings {
       typeof input.consultOnCompaction === "boolean"
         ? input.consultOnCompaction
         : DEFAULT_GUI_SETTINGS.consultOnCompaction,
+    network:
+      input.network === "deny" ? "deny" : "allow",
+    competition: {
+      ...normalizeCompetitionSettings(input.competition),
+      localSlots: concurrency,
+    },
   }
 }
 

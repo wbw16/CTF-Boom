@@ -95,6 +95,8 @@ async function walk(root: string, signal?: AbortSignal): Promise<WalkEntry[]> {
     entries.sort((left, right) => left.name.localeCompare(right.name))
     for (const entry of entries) {
       signal?.throwIfAborted()
+      if (entry.name === ".boom") continue
+      if (entry.name === "RESULT.json" && (prefix === "work" || path.basename(directory) === "work")) continue
       if (found.length >= MAX_WALK_ENTRIES)
         throw new Error(`Task tree exceeds Boom's ${MAX_WALK_ENTRIES}-entry scan limit`)
       const absolute = path.join(directory, entry.name)
@@ -160,7 +162,11 @@ async function executeList(input: Record<string, unknown>, directory: string): P
   if (!(await lstat(target.absolute)).isDirectory()) throw new Error(`list requires a directory: ${requested}`)
   const offset = integer(input, "offset", 1)
   const limit = integer(input, "limit", 200)
-  const entries = await readdir(target.absolute, { withFileTypes: true })
+  const entries = (await readdir(target.absolute, { withFileTypes: true }))
+    .filter((entry) =>
+      entry.name !== ".boom" &&
+      !(entry.name === "RESULT.json" && (target.relative === "work" || target.relative === "."))
+    )
   entries.sort((left, right) => left.name.localeCompare(right.name))
   const selected = entries.slice(offset - 1, offset - 1 + limit)
   const lines: string[] = []
