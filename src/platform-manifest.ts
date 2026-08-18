@@ -65,7 +65,7 @@ export type PlatformAdapterManifest = {
   version: 1
   id: string
   name?: string
-  profile?: "dasctf-practice-v1"
+  profile?: "dasctf-practice-v1" | "xihulunjian-agent-v1"
   status: "draft" | "ready"
   baseURL: string
   auth?: PlatformAuthManifest
@@ -245,7 +245,7 @@ export function normalizePlatformManifest(value: unknown): PlatformAdapterManife
   const name = optionalText(input.name, "name", 240)
   if (name) manifest.name = name
   if (input.profile !== undefined) {
-    if (input.profile !== "dasctf-practice-v1")
+    if (input.profile !== "dasctf-practice-v1" && input.profile !== "xihulunjian-agent-v1")
       throw new Error(`Unsupported platform adapter profile: ${String(input.profile)}`)
     manifest.profile = input.profile
   }

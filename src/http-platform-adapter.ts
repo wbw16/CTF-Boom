@@ -538,6 +538,10 @@ export async function loadConfiguredPlatformAdapter(root: string, adapterID: str
     const { DasctfPracticePlatformAdapter } = await import("./dasctf-platform-adapter.ts")
     return new DasctfPracticePlatformAdapter(manifest)
   }
+  if (manifest.profile === "xihulunjian-agent-v1") {
+    const { XihulunjianPlatformAdapter } = await import("./xihulunjian-platform-adapter.ts")
+    return new XihulunjianPlatformAdapter(manifest)
+  }
   return new DeclarativeHttpPlatformAdapter(manifest)
 }
 

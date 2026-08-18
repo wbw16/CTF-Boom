@@ -2,12 +2,13 @@ import { lstat } from "node:fs/promises"
 import path from "node:path"
 import { configuredPlatformAdapterRegistry } from "./http-platform-adapter.ts"
 import { loadPlatformManifest, platformManifestPath, savePlatformManifest } from "./platform-manifest.ts"
-import { adaptOpenApiDocument, readApiDocument } from "./platform-openapi.ts"
+import { adaptOpenApiDocument, readApiDocument, xihulunjianAdaptation } from "./platform-openapi.ts"
 
 function platformUsage(): never {
   throw new Error([
     "Usage:",
     "  boom platform adapt --id <id> --document <file-or-url> [--base-url <url>] [--root <dir>] [--force]",
+    "  boom platform adapt --id <id> --profile xihulunjian --base-url <url> [--root <dir>] [--force]",
     "  boom platform inspect --id <id> [--root <dir>]",
     "  boom platform sync --id <id> [--root <dir>] [--var <name=value>]...",
   ].join("\n"))
@@ -18,6 +19,8 @@ type Parsed = {
   id: string
   root: string
   document?: string
+  /** Built-in profile for a platform that publishes no machine-readable API document. */
+  profile?: "xihulunjian"
   baseURL?: string
   name?: string
   force: boolean
@@ -44,6 +47,11 @@ function parse(argv: string[]): Parsed {
     if (arg === "--id") parsed.id = value()
     else if (arg === "--root") parsed.root = path.resolve(value())
     else if (arg === "--document") parsed.document = value()
+    else if (arg === "--profile") {
+      const found = value()
+      if (found !== "xihulunjian") throw new Error(`Unsupported --profile: ${found}`)
+      parsed.profile = found
+    }
     else if (arg === "--base-url") parsed.baseURL = value()
     else if (arg === "--name") parsed.name = value()
     else if (arg === "--force") parsed.force = true
@@ -55,7 +63,14 @@ function parse(argv: string[]): Parsed {
     } else platformUsage()
   }
   if (!parsed.id) throw new Error("--id is required")
-  if (action === "adapt" && !parsed.document) throw new Error("--document is required for platform adapt")
+  if (action === "adapt") {
+    if (parsed.profile) {
+      if (!parsed.baseURL) throw new Error("--base-url is required with --profile")
+      if (parsed.document) throw new Error("--document cannot be combined with --profile")
+    } else if (!parsed.document) {
+      throw new Error("--document or --profile is required for platform adapt")
+    }
+  }
   return parsed
 }
 
@@ -65,12 +80,17 @@ export async function platformCommand(argv: string[]) {
     const target = platformManifestPath(args.root, args.id)
     if (!args.force && await lstat(target).catch(() => undefined))
       throw new Error(`Platform manifest already exists: ${target}; pass --force to replace it`)
-    const document = await readApiDocument(args.document!)
-    const adapted = adaptOpenApiDocument(document, {
-      id: args.id,
-      ...(args.baseURL ? { baseURL: args.baseURL } : {}),
-      ...(args.name ? { name: args.name } : {}),
-    })
+    const adapted = args.profile === "xihulunjian"
+      ? xihulunjianAdaptation({
+          id: args.id,
+          baseURL: args.baseURL!,
+          ...(args.name ? { name: args.name } : {}),
+        })
+      : adaptOpenApiDocument(await readApiDocument(args.document!), {
+          id: args.id,
+          ...(args.baseURL ? { baseURL: args.baseURL } : {}),
+          ...(args.name ? { name: args.name } : {}),
+        })
     await savePlatformManifest(args.root, adapted.manifest)
     process.stdout.write([
       `Platform adapter ${adapted.manifest.id}: ${adapted.manifest.status}`,

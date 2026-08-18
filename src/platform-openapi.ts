@@ -435,6 +435,73 @@ function selectOperations(document: JsonObject) {
   return { list, detail, submit }
 }
 
+/** Credential environment variable for a given adapter ID, matching the OpenAPI importer's scheme. */
+export function platformCredentialEnv(adapterID: string) {
+  return `BOOM_PLATFORM_${adapterID.replace(/[^A-Za-z0-9]+/g, "_").toUpperCase()}_TOKEN`
+}
+
+/**
+ * Build the 西湖论剑 profile without an API document.
+ *
+ * The competition publishes only prose documentation, so there is nothing to infer from. The request
+ * logic lives in XihulunjianPlatformAdapter; the declarative `operations` block below is required by
+ * the manifest schema but never executed for this profile, so it records the real endpoints for
+ * auditability rather than driving them.
+ */
+export function xihulunjianAdaptation(
+  options: { id: string; baseURL: string; name?: string },
+): OpenApiAdaptation {
+  const prefix = "/slab-match/api/v1/agent"
+  const manifest = normalizePlatformManifest({
+    version: 1,
+    id: options.id,
+    name: options.name ?? "西湖论剑",
+    profile: "xihulunjian-agent-v1",
+    status: "ready",
+    baseURL: options.baseURL,
+    auth: {
+      env: platformCredentialEnv(options.id),
+      location: "header",
+      name: "X-Agent-AccessKey",
+    },
+    variables: {},
+    operations: {
+      listChallenges: {
+        request: { method: "GET", path: `${prefix}/ctf/exercise-list` },
+        response: { items: "data", fields: { id: "id", title: "name" } },
+      },
+      getChallenge: {
+        request: { method: "GET", path: `${prefix}/ctf/exercise` },
+        response: { item: "data", fields: { id: "id", title: "name", description: "description" } },
+      },
+      submitFlag: {
+        request: {
+          method: "POST",
+          path: `${prefix}/answer-panel/answer`,
+          body: { exerciseId: "{{challenge.id}}", flag: "{{flag}}" },
+        },
+        response: {
+          verdict: "data.isCorrect",
+          accepted: [true],
+          rejected: [false],
+        },
+      },
+    },
+  })
+  return {
+    manifest,
+    warnings: [
+      "西湖论剑接口由专用 profile 实现：统一响应包裹（code=00000）、两层嵌套题目列表、双形态 attachment 字段和靶机环境生命周期均在代码中处理，清单中的 operations 仅作留档。",
+      "提交时只发送 flag 花括号内的内容；每题提交次数上限低于平台的 50 次硬限制，以避免被判定为爆破。",
+    ],
+    selected: {
+      listChallenges: `GET ${prefix}/ctf/exercise-list`,
+      getChallenge: `GET ${prefix}/ctf/exercise`,
+      submitFlag: `POST ${prefix}/answer-panel/answer`,
+    },
+  }
+}
+
 export function adaptOpenApiDocument(
   value: unknown,
   options: { id: string; baseURL?: string; name?: string },
