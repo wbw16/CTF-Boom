@@ -120,7 +120,29 @@ export function anthropicProviderBaseURL(value: string) {
   return url.toString().replace(/\/+$/, "")
 }
 
+/**
+ * Marker for a Base URL that is already a complete endpoint rather than a prefix.
+ *
+ * Some gateways expose one fixed URL that accepts the chat-completions body directly and reject any
+ * sub-path. A competition LLM gateway is the motivating case: POST to its root returns 200 while
+ * `<root>/chat/completions` returns 404, so no prefix value can work. Appending `!` opts that URL out
+ * of path joining; the marker is stripped before the request is made.
+ */
+export const EXACT_ENDPOINT_MARKER = "!"
+
+export function isExactEndpoint(baseURL: string) {
+  return baseURL.trimEnd().endsWith(EXACT_ENDPOINT_MARKER)
+}
+
+/** The URL to call, with the exact-endpoint marker removed. */
+export function exactEndpointURL(baseURL: string) {
+  return baseURL.trimEnd().slice(0, -EXACT_ENDPOINT_MARKER.length)
+}
+
 export function providerEndpoint(baseURL: string, endpoint: string) {
+  // An exact endpoint is used verbatim: the caller's path would otherwise be appended to a URL that
+  // only answers at its own address.
+  if (isExactEndpoint(baseURL)) return safeBaseURL(exactEndpointURL(baseURL)).toString().replace(/\/+$/, "")
   const base = safeBaseURL(baseURL)
   return new URL(endpoint.replace(/^\/+/, ""), base).toString()
 }

@@ -2,6 +2,7 @@ import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import type { RuntimeModelPricing } from "./runtime-contract.ts"
+import { exactEndpointURL, isExactEndpoint } from "./runtime/provider-http.ts"
 
 export type ManagedProviderDriver = "openai-compatible" | "openai" | "anthropic"
 
@@ -243,15 +244,7 @@ export function normalizeManagedProvider(value: unknown) {
     )
   const parsed = provider(value)
   if (!parsed) throw new Error("Invalid provider configuration")
-  if (parsed.baseURL) {
-    try {
-      const url = new URL(parsed.baseURL)
-      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash)
-        throw new Error("unsupported protocol")
-    } catch {
-      throw new Error("Provider Base URL must be a credential-free HTTP(S) URL without query or fragment")
-    }
-  }
+  if (parsed.baseURL) assertProviderBaseURL(parsed.baseURL)
   if (parsed.custom) {
     if (!parsed.name) throw new Error("Custom provider requires a name")
     if (!parsed.driver && !parsed.npm)
@@ -267,15 +260,7 @@ export function normalizeManagedProvider(value: unknown) {
 export function normalizeProviderDiscovery(value: unknown): ProviderDiscoveryConfig {
   const parsed = provider(value)
   if (!parsed) throw new Error("Invalid provider configuration")
-  if (parsed.baseURL) {
-    try {
-      const url = new URL(parsed.baseURL)
-      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash)
-        throw new Error("unsupported protocol")
-    } catch {
-      throw new Error("Provider Base URL must be a credential-free HTTP(S) URL without query or fragment")
-    }
-  }
+  if (parsed.baseURL) assertProviderBaseURL(parsed.baseURL)
   if (parsed.custom && (!parsed.driver || !parsed.baseURL))
     throw new Error("Custom provider requires a Native protocol Driver and Base URL to fetch models")
   return {
@@ -284,6 +269,27 @@ export function normalizeProviderDiscovery(value: unknown): ProviderDiscoveryCon
     ...(parsed.driver ? { driver: parsed.driver } : {}),
     ...(parsed.baseURL ? { baseURL: parsed.baseURL } : {}),
   }
+}
+
+/**
+ * Validate a Provider Base URL.
+ *
+ * A trailing `!` marks a URL that is already a complete endpoint instead of a prefix, for gateways
+ * that answer only at one fixed address. The marker is stripped before validation and before any
+ * request; see EXACT_ENDPOINT_MARKER in runtime/provider-http.ts.
+ */
+export function assertProviderBaseURL(value: string) {
+  const candidate = isExactEndpoint(value) ? exactEndpointURL(value) : value
+  if (!candidate.trim())
+    throw new Error("Provider Base URL must not be empty")
+  try {
+    const url = new URL(candidate)
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash)
+      throw new Error("unsupported protocol")
+  } catch {
+    throw new Error("Provider Base URL must be a credential-free HTTP(S) URL without query or fragment")
+  }
+  return value
 }
 
 export function providerStorePath() {

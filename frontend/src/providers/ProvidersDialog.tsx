@@ -341,6 +341,9 @@ export function ProvidersDialog() {
             <div className="field">
               <div className="field-label"><span>Base URL</span></div>
               <input className="input mono" value={draft.baseURL ?? ""} onChange={(event) => setDraft({ ...draft, baseURL: event.target.value })} />
+              <span className="field-hint">
+                默认在 URL 后拼接 /chat/completions；若网关本身已是完整端点（如赛方大模型网关，直接 POST 根地址），在末尾加 `!` 表示原样使用。
+              </span>
             </div>
             <div className="field" style={{ gridColumn: "1 / -1" }}>
               <div className="field-label"><span>API Key（留空不修改）</span></div>

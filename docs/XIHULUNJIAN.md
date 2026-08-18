@@ -164,6 +164,33 @@ GUI 对应接口：
 本地优先轮次预算也从 25k tokens / 5 分钟提高到 120k / 12 分钟：
 在比赛版里这一轮是真正的逆向与 exp 开发，而不再是等人填 URL 前的粗筛。
 
+## 大模型网关接入（实测确认）
+
+规则 6 要求所有 LLM 流量必须经赛方网关，否则取消成绩。实测结论：
+
+- 网关 URL（形如 `https://llm-gateway.dasctf.com/llm-gateway/proxy/e/<token>`）
+  **本身就是完整的 chat-completions 端点**：
+  - `POST <网关>` 直接返回 200（含 SSE 流式、tool_calls、usage）
+  - `POST <网关>/chat/completions` 与 `/v1/chat/completions` 均返回 404
+  - `GET <网关>` 返回 405，没有模型列表接口
+- 网关把请求模型映射到 `deepseek-v4-flash`（以响应里的 `model` 字段为准）。
+
+Boom 的 `openai-compatible` driver 会在 Base URL 后面拼接 `chat/completions`，
+与这种"根即端点"的网关冲突。为此新增**精确端点标记**：
+
+> Base URL 末尾追加 `!` 表示"这就是完整端点，不要再拼路径"。
+
+配置（Providers → 新建自定义 provider）：
+
+- Driver：`openai-compatible`
+- Base URL：`https://llm-gateway.dasctf.com/llm-gateway/proxy/e/<token>` **末尾加 `!`**
+- API Key：自己的 DeepSeek Key（以 `Authorization: Bearer` 发送）
+- Model ID：`deepseek-chat`
+
+验证方式：设置里选中该 provider/model 后运行一道题，事件流里应出现
+`model: deepseek-v4-flash`。开赛前必须确认 economy/strong 两档都指向网关 provider，
+默认的 `free/deepseek-v4-flash-free` 不经过网关。
+
 ## 已验证行为（对照真实平台）
 
 - 题目列表两层结构展开、`isOpen=false` 的未放题被跳过
