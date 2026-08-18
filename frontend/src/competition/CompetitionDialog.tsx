@@ -3,9 +3,10 @@ import { Timer } from "lucide-react"
 import { useApp } from "../context"
 import { api, patchJSON, postJSON, putJSON } from "../api"
 import { Modal } from "../ui"
-import type { CompetitionState, GuiState, PlatformSummary } from "../types"
+import type { CompetitionState, GuiSettings, GuiState, PlatformSummary } from "../types"
 
 const DEFAULT_HOST = "https://pro.dasctf.com"
+const GATEWAY_PROVIDER_ID = "competition-gateway"
 
 /**
  * Competition control panel.
@@ -26,6 +27,11 @@ export function CompetitionDialog() {
   const [remoteSlots, setRemoteSlots] = useState(3)
   const [localSlots, setLocalSlots] = useState(5)
   const [busy, setBusy] = useState(false)
+  const [gwURL, setGwURL] = useState("")
+  const [gwKey, setGwKey] = useState("")
+  const [gwModel, setGwModel] = useState("deepseek-chat")
+  const gwConfigured = data?.settings.economyModel?.startsWith(`${GATEWAY_PROVIDER_ID}/`) &&
+    data?.settings.strongModel?.startsWith(`${GATEWAY_PROVIDER_ID}/`)
 
   const load = useCallback(async () => {
     try {
@@ -162,6 +168,60 @@ export function CompetitionDialog() {
     }
   }
 
+  const configureGateway = async () => {
+    if (!gwURL.trim()) {
+      toast("请填写大模型网关地址", "error")
+      return
+    }
+    if (!gwKey.trim()) {
+      toast("请填写 API Key", "error")
+      return
+    }
+    if (!gwModel.trim()) {
+      toast("请填写 Model ID", "error")
+      return
+    }
+    setBusy(true)
+    try {
+      // Create or replace the competition gateway provider.
+      await putJSON(`/api/providers/${encodeURIComponent(GATEWAY_PROVIDER_ID)}`, {
+        provider: {
+          id: GATEWAY_PROVIDER_ID,
+          custom: true,
+          disabled: false,
+          name: "比赛大模型网关",
+          driver: "openai-compatible",
+          // The gateway only answers at its root, so the marker prevents /chat/completions being appended.
+          // Appended here so the operator does not need to know about it.
+          baseURL: `${gwURL.trim().replace(/\/+$/, "")}!`,
+          models: [{
+            id: gwModel.trim(),
+            name: gwModel.trim(),
+          }],
+          hiddenModels: [],
+        },
+        apiKey: gwKey.trim(),
+      })
+      // Make both model tiers use the gateway, and also set the vision model to empty so it doesn't
+      // accidentally fall back to a non-gateway provider.
+      const modelID = `${GATEWAY_PROVIDER_ID}/${gwModel.trim()}`
+      const settings = data!.settings
+      await patchJSON<{ settings: GuiSettings }>("/api/settings", {
+        ...settings,
+        economyModel: modelID,
+        strongModel: modelID,
+        visionModel: "",
+      })
+      setGwKey("")
+      toast("大模型网关已配置，economy/strong 均指向比赛网关")
+      await refresh()
+    } catch (error) {
+      toast((error as Error).message, "error")
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <Modal
       title="比赛控制台"
@@ -286,6 +346,53 @@ export function CompetitionDialog() {
               : ""}
           </div>
         ) : null}
+      </section>
+
+      <section className="field-group">
+        <h3>大模型网关</h3>
+        <div className="hint" style={{ marginBottom: 8 }}>
+          规则要求所有 LLM 流量必须经赛方提供的网关，否则成绩无效。
+          配置后 economy / strong 两档均自动指向该网关。
+        </div>
+        <label className="field">
+          <span>网关地址（Base URL）</span>
+          <input
+            value={gwURL}
+            onChange={(event) => setGwURL(event.target.value)}
+            placeholder="https://llm-gateway.dasctf.com/llm-gateway/proxy/e/..."
+            spellCheck={false}
+          />
+          <span className="field-hint">
+            赛方网关只需填根地址（如 https://llm-gateway.dasctf.com/llm-gateway/proxy/e/&lt;token&gt;）；Boom 自动处理路径格式。
+          </span>
+        </label>
+        <label className="field">
+          <span>DeepSeek API Key</span>
+          <input
+            type="password"
+            value={gwKey}
+            onChange={(event) => setGwKey(event.target.value)}
+            placeholder="sk-..."
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </label>
+        <label className="field">
+          <span>Model ID</span>
+          <input
+            value={gwModel}
+            onChange={(event) => setGwModel(event.target.value)}
+            spellCheck={false}
+          />
+        </label>
+        <div className="row">
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void configureGateway()}>
+            配置网关并设为默认模型
+          </button>
+          <span className="hint">
+            {gwConfigured ? "economy / strong 已指向比赛网关 ✓" : "尚未配置：当前模型不经赛方网关"}
+          </span>
+        </div>
       </section>
     </Modal>
   )
