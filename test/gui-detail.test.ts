@@ -40,6 +40,8 @@ function state(...runs: RunHistory[]): GuiState {
       consultModels: [],
       blindReview: true,
       consultOnCompaction: true,
+      network: "allow",
+      competition: { remoteSlots: 3, localSlots: 5, matchMinutes: 180, endgameMinutes: 20 },
     },
     models: [{ id: "test/model", name: "Test", connected: true }],
     runtime: { status: "ready", active: 1, queued: 0, concurrency: 1 },

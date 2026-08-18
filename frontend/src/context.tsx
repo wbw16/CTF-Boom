@@ -7,6 +7,7 @@ export type DialogName =
   | "providers"
   | "mcp"
   | "platforms"
+  | "competition"
   | "armor"
   | "delete"
   | null

@@ -44,6 +44,7 @@ describe("GUI state", () => {
           economyModel: "openai/gpt-b-mini",
           strongModel: "openai/gpt-b",
           repeats: 9,
+          network: "deny",
         },
         challenges: {
           beta: { state: "removed" },
@@ -54,8 +55,10 @@ describe("GUI state", () => {
         settings: {
           economyModel: "openai/gpt-a-mini",
           strongModel: "openai/gpt-a",
+          visionModel: "",
           tokens: 123_000,
           flagFormat: "A\\{[^}]*\\}",
+          network: "allow",
         },
         challenges: {
           alpha: { state: "given-up" },
@@ -67,6 +70,7 @@ describe("GUI state", () => {
           economyModel: "openai/gpt-b-mini",
           strongModel: "openai/gpt-b",
           repeats: 9,
+          network: "deny",
         },
         challenges: { beta: { state: "removed" } },
       })
@@ -149,6 +153,8 @@ function liveState(...runs: RunHistory[]): GuiState {
       consultModels: [],
       blindReview: true,
       consultOnCompaction: true,
+      network: "allow",
+      competition: { remoteSlots: 3, localSlots: 5, matchMinutes: 180, endgameMinutes: 20 },
     },
     models: [{ id: "test/model", name: "Test", connected: true }],
     runtime: { status: "ready", active: 1, queued: 0, concurrency: 1 },

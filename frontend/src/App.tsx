@@ -21,6 +21,7 @@ import { SettingsDialog } from "./settings/SettingsDialog"
 import { ProvidersDialog } from "./providers/ProvidersDialog"
 import { McpDialog } from "./mcp/McpDialog"
 import { PlatformsDialog } from "./platforms/PlatformsDialog"
+import { CompetitionDialog } from "./competition/CompetitionDialog"
 import { ArmorPromptsDialog } from "./armor/ArmorPromptsDialog"
 import { DeleteDialog } from "./delete/DeleteDialog"
 
@@ -518,6 +519,7 @@ export default function App() {
       {dialog === "providers" ? <ProvidersDialog /> : null}
       {dialog === "mcp" ? <McpDialog /> : null}
       {dialog === "platforms" ? <PlatformsDialog /> : null}
+      {dialog === "competition" ? <CompetitionDialog /> : null}
       {dialog === "armor" ? <ArmorPromptsDialog /> : null}
       {dialog === "delete" ? <DeleteDialog /> : null}
       {menu ? (
