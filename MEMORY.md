@@ -1,6 +1,6 @@
 # Boom project memory
 
-Last updated: 2026-08-13.
+Last updated: 2026-08-18.
 
 Read this first when resuming work. It records what is built, what is proven, and what is not — not
 how the code is structured (read the code for that).
@@ -512,26 +512,18 @@ assertion failure.
 
 ## Next, in order
 
-1. **Render NOTES.md/writeup CSS check and GUI regression sweep.** The markdown renderer landed and its
-   escaping is verified, but two checks were interrupted: whether every tag it emits has matching CSS,
-   and a full regression review of the seven GUI fixes (see the GUI section below).
-2. **Confirm the legacy candidate-found runs.** The 14 old candidate-found tasks need manual or
-   platform verdicts before their solve rate can be counted; update this file with the real numbers
-   afterwards.
-3. **Add a `boom writeup` CLI command** so the separate writeup flow is usable outside the GUI;
-   today only the GUI button exists.
-4. **Build a small real-challenge benchmark** (20–30 representative CRYPTO/MISC/REVERSE/WEB/PWN
-   challenges) measuring solve rate, wrong-candidate rate, tokens, time and failure category. Include
-   per-dispatch worker-tier outcomes (boom-worker vs boom-worker-pro: success / cheap-failed-then-pro-retried)
-   so the cheap-by-default decision is measured, not assumed. Let those measurements choose the next
-   solver improvement; do not add another runtime subsystem by default.
-5. **Confirm the 2026-08-13 candidate.** Verify or reject `CTF{upDN_B_a_im_ur_pRoOf_0f_p1y}` for
-   `task-ef2417cb55`, then fold the verdict into the measured numbers.
-6. **Upstream ida-pro-mcp PR.** Expose `get_cached_output` in stdio mode or make the 50K-char
-   structured-output limit configurable, then simplify the proxy's per-function re-query path.
-7. **Guarantee note-taking.** If another run burns many tokens without `ctf-note`, add a hard prompt
-   rule (note after key findings) or a soft host check that reminds after `idb_open`/N steps with no
-   note yet.
+1. **Merge工作区改动。** `src/runner.ts`、`src/gui.ts`、`src/gui-state.ts`、`frontend/src/types.ts`、
+   `frontend/src/TopBar.tsx`、`frontend/src/settings/SettingsDialog.tsx`、
+   `frontend/src/providers/ProvidersDialog.tsx` 的改动仍在工作区，
+   混有 visionModel / network 开关等其他预存工作。需要决定是分拆提交还是一并归入比赛分支。
+2. **赛事实战验证。** 拿 `xihulunjian-ctf/` 目录跑一遍完整流程：拉题 → 配网关 → 开计时 →
+   选题运行 → 自动提交 → 验证得分。确认解题报告的提交入口（赛方 API 文档未给，
+   可能需要人工在平台网页提交）。
+3. **批量放题拉取。** 比赛中分批放题，需要周期性回到比赛控制台重新拉取。考虑是否加
+   自动轮询。
+4. **多机分布式（赛后）。** 本机 CPU/内存是瓶颈，但比赛规则只允许一台 Agent 接入。
+   赛后可做"接入机 + 纯计算 worker"的分布式，需要任务分发协议和 workspace 共享。
+   当前优先级接口已预留位置。
 
 ## 2026-08-14 接口层文档与修复(本轮)
 
@@ -545,3 +537,82 @@ assertion failure.
   token 估算保守化(CJK/hex 密度)。
 - 全套件剩余 6 个失败为既有环境问题:environment/runtime-shell 的 EPERM 进程组(DSH 文件沙箱),
   runtime-conformance 的 boom-exec(工作区未完成的 resources 改动),与上述修复无关。
+
+## 2026-08-18 西湖论剑比赛专用构建（`codex/xihulunjian-adaptation`）
+
+分支 `codex/xihulunjian-adaptation`，基于 `codex/public-release`。比赛专用，不保留通用模式行为。
+六个提交（`357248a1` .. `e246f2ed`），324 个测试通过，typecheck 干净。
+
+### 已实现
+
+**适配器层**（`src/xihulunjian-platform-adapter.ts`，~700 行）：
+- 处理 `{code,message,data}` 统一包裹（code 非 00000 视为失败，即使 HTTP 200）
+- 两层嵌套题目列表展开（分类 → corpus[]）
+- 双形态 attachment（有附件是对象，无附件是空数组，文档写的 `{files:[...]}` 不存在）
+- 靶机环境生命周期：build → poll → ready → recover
+- 提交只发花括号内内容；`isCorrect` 缺失时判 `pending`，绝不假定成功
+- 同步阶段**不启动环境**（槽位在 solve 时按需申请）
+- 附件在独立 CDN 域，下载时不携带 AccessKey（凭证隔离）
+- 全平台限流：串行化 + 700ms 间隔 + 指数退避（实测 3 次连续请求即触发 429/40001）
+
+**调度层**（`src/competition/` 四个模块）：
+- `policy.ts`：纯决策函数——优先级排序、槽位准入、时间预算、放弃判断
+- `environments.ts`：三个环境租约池，释放幂等，即使 recover 失败也释放本地槽
+- `submissions.ts`：持久化提交台账（每题 ~15 次上限，远低于平台 50 次红线），防爆破 + 去重
+- `adapter.ts`：定位已配置的 xihulunjian 适配器实例（单例缓存，保证限流链不中断）
+- `runner.ts` 的 `pump()` 从 FIFO 改为优先级 + 槽位准入，跳过而非堵住队列
+- 环境租约释放挂在 `pump()` 的 `.finally()`，覆盖所有终止路径
+- `AUTONOMY_THRESHOLDS` 按 3 小时赛重标定（eligible 5min，stalled 2min，cooldown 90s）
+- 本地优先轮预算从 25k/5min 提高到 120k/12min（真正的逆向和 exp 开发）
+
+**前端**（`frontend/src/competition/CompetitionDialog.tsx`）：
+- 比赛控制台：平台接入（Server Host + AccessKey）、大模型网关、赛时计时、资源并发
+- 顶栏赛况芯片：倒计时 + 环境占用，5s 轮询
+- AccessKey 写入后从组件状态清除，只显示"已配置/未配置"
+- 设置 → 比赛控制台入口（Timer 图标）
+
+**LLM 网关**（`src/runtime/provider-http.ts`）：
+- 赛方网关根即端点（POST 返回 200，`/chat/completions` 返回 404）
+- 新增精确端点标记 `!`：Base URL 末尾加 `!` 跳过路径拼接
+- Provider 对话框加 hint 提示
+- 比赛控制台自动追加 `!`，用户无需知道
+
+### 真实平台验证结果（2026-08-18）
+
+凭证 `https://pro.dasctf.com`，AccessKey `ak_live_vK3...`，网关 `https://llm-gateway.dasctf.com/llm-gateway/proxy/e/yxzdl_QrHvw1OUov`。
+
+- 题目列表：3 道 → 4 道（分批放题，新增 WEB `UploadKing` 200 分 MEDIUM）
+- 分类名英文（Web/Pwn/Misc），命中 `CATEGORY_ALIASES`
+- `corpus[].id` 即 `exerciseId`，与分类 ID 不同层级
+- `difficulty` 有 `VERY_EASY`（文档只有 EASY）
+- `score` 是字符串 `"50.0"`
+- 环境生命周期完整验证：build → poll → `remote=1.14.76.59:27629` → recover 回收
+- `exposeIps` 已含端口（`1.14.76.59:27629`），`ports` 是 `http/80`
+- 网关：POST 根返回 200（SSE 流式 + tool_calls + usage），POST `/chat/completions` 返回 404
+- GET 网关返回 405，没有模型列表接口
+- 网关映射到 `deepseek-v4-flash`
+
+### 赛制参数
+
+3 小时，错误不罚时，无冷却，先交得分高，每题最多 50 次提交（禁止爆破），
+flag 格式 `DASCTF{}`/`flag{}`（提交花括号内容），最多 3 个线上环境，
+分批放题，递减计分（每多一人解出降 1%，最低 80%），必须走大模型网关（否则取消成绩），
+必须提交解题报告（否则取消获奖资格）。
+
+### 未提交的工作区改动
+
+`src/runner.ts`、`src/gui.ts`、`src/gui-state.ts`、`frontend/src/types.ts`、
+`frontend/src/TopBar.tsx`、`frontend/src/settings/SettingsDialog.tsx`、
+`frontend/src/providers/ProvidersDialog.tsx` 的改动仍在工作区，
+混有 visionModel / network 开关等其他预存工作。
+
+### 运行比赛版本
+
+```bash
+cd /Volumes/Storage/Code/boom-v3
+bun run build:web
+bun src/index.ts gui --root ./xihulunjian-ctf
+# 设置 → 比赛控制台 → 平台接入 → 大模型网关 → 赛时计时
+```
+
+目录 `xihulunjian-ctf/` 是比赛用的干净目录（只有 `challenges/`）。
