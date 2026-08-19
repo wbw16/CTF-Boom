@@ -18,6 +18,7 @@ import {
 import { DEFAULT_SILENCE_MS, type Limits } from "./session.ts"
 import { aggregateEvaluation, collectEvaluationSamples, evaluationMarkdown } from "./evaluation.ts"
 import { mcpCommand } from "./mcp-command.ts"
+import { relayCommand } from "./relay/command.ts"
 import { GuiRunner } from "./runner.ts"
 import { readChallengeRuns, readRunHistory, type RunHistory } from "./history.ts"
 
@@ -57,6 +58,7 @@ function usage(code = 1): never {
     "  run [options] [slug...]  solve one or more challenges",
     "  gui [options]            open the local Boom workbench",
     "  mcp <action>             manage Boom MCP servers through Boom Runtime",
+    "  relay serve [options]    run the standalone Boom Relay for distributed solving",
     "  doctor                   verify the local installation",
     "  evaluate [--root <dir>]  summarize existing run results",
     "  version                  print the installed version",
@@ -383,6 +385,7 @@ async function main() {
   }
   if (command === "gui") return gui(argv)
   if (command === "mcp") return mcpCommand(argv)
+  if (command === "relay") return relayCommand(argv)
   if (command === "version" || command === "--version" || command === "-v") {
     process.stdout.write(`${await packageVersion()}\n`)
     return

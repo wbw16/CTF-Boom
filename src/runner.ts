@@ -246,6 +246,17 @@ type FlagSubmissionResult = {
   submittedAt: string
 }
 
+/**
+ * Optional host-owned candidate route. Distributed workers use this to persist a candidate in their
+ * local outbox and hand it to Relay; only the master connector ever talks to the competition API.
+ */
+export type CandidateSubmitter = (input: {
+  challenge: Challenge
+  workspace: Workspace
+  candidate: string
+  signal?: AbortSignal
+}) => Promise<FlagSubmissionResult>
+
 type TestPlatformAdapters = {
   submitFlagWithRetry(
     input: {
@@ -727,6 +738,8 @@ export class GuiRunner {
   private runtimeVisionModel?: string
   /** Optional legacy injection retained for isolated runner tests; the product has no generic adapter path. */
   private testPlatformAdapters?: TestPlatformAdapters
+  private candidateSubmitter?: CandidateSubmitter
+  private manageCompetitionEnvironments: boolean
   private runtimeStatus: RuntimeState["status"] = "starting"
   private runtimeError?: string
   private models: ModelInfo[] = FALLBACK_MODELS
@@ -757,13 +770,21 @@ export class GuiRunner {
     // model catalog. Native remains available only through an injected launcher in protocol tests.
     launchRuntime: RuntimeLauncher = startOpenCodeRuntime,
     platformAdapters?: TestPlatformAdapters,
-    options: { platformSubmissionRetryDelayMs?: number; network?: "allow" | "deny" } = {},
+    options: {
+      platformSubmissionRetryDelayMs?: number
+      network?: "allow" | "deny"
+      candidateSubmitter?: CandidateSubmitter
+      /** Relay workers receive a master-provisioned URL and must never create platform environments. */
+      manageCompetitionEnvironments?: boolean
+    } = {},
   ) {
     this.root = root
     this.launchRuntime = launchRuntime
     this.testPlatformAdapters = platformAdapters
     this.platformSubmissionRetryDelayMs = options.platformSubmissionRetryDelayMs ?? 5_000
     this.network = options.network ?? "allow"
+    this.candidateSubmitter = options.candidateSubmitter
+    this.manageCompetitionEnvironments = options.manageCompetitionEnvironments !== false
   }
 
   getRoot() {
@@ -841,6 +862,7 @@ export class GuiRunner {
     candidate: string
     signal?: AbortSignal
   }): Promise<FlagSubmissionResult> {
+    if (this.candidateSubmitter) return this.candidateSubmitter(input)
     if (input.challenge.platform?.adapter === XIHULUNJIAN_ADAPTER_ID) {
       const adapter = await this.competitionAdapter().catch(() => undefined)
       if (!adapter) {
@@ -921,6 +943,7 @@ export class GuiRunner {
    */
   private async provisionEnvironment(job: Job): Promise<{ remote?: string; detail?: string }> {
     if (job.purpose !== "solve") return {}
+    if (!this.manageCompetitionEnvironments) return { remote: job.challenge.remote }
     if (slotKindFor(job.challenge) !== "remote") return {}
     const exerciseId = job.challenge.platform?.challengeID
     if (!exerciseId) return {}

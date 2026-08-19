@@ -26,6 +26,20 @@ CTF-Boom 是一个以证据为中心的自动化 CTF 解题系统。它把题目
 
 与一次性聊天不同，Boom 会为每道题创建独立工作区，持续保存关键发现和分析产物；当主模型陷入停滞时，可以发起受限的第二意见或多模型会诊，并在原任务上下文中继续推进。
 
+## 分布式 Relay
+
+`boom relay serve` 是分布式解题的公网持久化信箱。它只保存题目 bundle、任务租约、成果包、候选 flag 和 writeup；不会运行 Boom、访问比赛平台或保存比赛 AccessKey。完整协议和工作流见 [distributed-solving-plan.md](./docs/distributed-solving-plan.md)。
+
+Relay 应部署在 HTTPS 反向代理之后，默认只监听回环地址：
+
+```sh
+export BOOM_RELAY_JOIN_TOKEN="$(openssl rand -base64 32)"
+export BOOM_RELAY_MASTER_TOKEN="$(openssl rand -base64 32)"
+bun src/index.ts relay serve --data /var/lib/boom-relay --host 127.0.0.1 --port 7332
+```
+
+将两个环境变量放在服务管理器的私有环境文件中，不要写进 Relay 数据目录、题目 bundle 或运行工作区。`BOOM_RELAY_MASTER_TOKEN` 仅供主机 connector 使用；普通设备通过一次性加入令牌换取自己的设备令牌。Relay 目录包含 SQLite WAL 数据库和不可替代的 bundle 文件，应定期备份并以单进程方式运行。
+
 ## 核心能力
 
 - **自主解题**：面向 `WEB`、`PWN`、`REVERSE`、`CRYPTO`、`MISC`、`MOBILE`、`FORENSICS`、`AI`、`HARDWARE`、`BLOCKCHAIN`、`OSINT` 等题型进行分类与分析。

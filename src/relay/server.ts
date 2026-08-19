@@ -1,0 +1,423 @@
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
+import { createWriteStream } from "node:fs"
+import { lstat, mkdir, rename, unlink } from "node:fs/promises"
+import path from "node:path"
+import { pipeline } from "node:stream/promises"
+import { Readable, Transform } from "node:stream"
+import {
+  asEpoch,
+  asOptionalText,
+  asPositiveInteger,
+  isChallengeKind,
+  isChallengePhase,
+  isDeviceRole,
+  isFlagStatus,
+  isRelayId,
+  isSha256,
+  MAX_BUNDLE_BYTES,
+  MAX_FLAG_LENGTH,
+  MAX_JSON_BYTES,
+  type FlagStatus,
+  type PublishChallengeRequest,
+} from "./protocol.ts"
+import { RelayError, RelayStore } from "./store.ts"
+
+export type RelayServerOptions = {
+  dataDirectory: string
+  hostname?: string
+  port?: number
+  /** Enrollment secret used only to exchange a new device token. Keep it outside the Relay data dir. */
+  joinToken: string
+  /** Connector-only token. It is never accepted by worker endpoints. */
+  masterToken: string
+  leaseMs?: number
+  now?: () => number
+}
+
+export type RunningRelayServer = {
+  url: string
+  close(): Promise<void>
+}
+
+const SECURITY_HEADERS = {
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+}
+
+function tokenHash(token: string) {
+  return createHash("sha256").update("boom-relay-device-token\0").update(token).digest("hex")
+}
+
+function newDeviceToken() {
+  return randomBytes(32).toString("base64url")
+}
+
+function json(value: unknown, status = 200, headers: HeadersInit = {}) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { ...SECURITY_HEADERS, "Content-Type": "application/json; charset=utf-8", ...headers },
+  })
+}
+
+function noContent(status = 204) {
+  return new Response(null, { status, headers: SECURITY_HEADERS })
+}
+
+function errorResponse(error: unknown) {
+  if (error instanceof RelayError)
+    return json({ error: { code: error.status, message: error.message } }, error.status)
+  if (error instanceof SyntaxError)
+    return json({ error: { code: 400, message: "Invalid JSON request body" } }, 400)
+  return json({ error: { code: 500, message: "Boom Relay internal error" } }, 500)
+}
+
+function fail(status: number, message: string): never {
+  throw new RelayError(status, message)
+}
+
+function bearer(request: Request) {
+  const value = request.headers.get("authorization")
+  const match = /^Bearer ([A-Za-z0-9_-]{16,512})$/.exec(value ?? "")
+  return match?.[1]
+}
+
+function sameToken(actual: string | undefined, expected: string) {
+  if (!actual) return false
+  const actualBytes = Buffer.from(actual)
+  const expectedBytes = Buffer.from(expected)
+  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes)
+}
+
+function object(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(400, "Request body must be a JSON object")
+  return value as Record<string, unknown>
+}
+
+async function readJSON(request: Request) {
+  const contentLength = request.headers.get("content-length")
+  if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_JSON_BYTES))
+    fail(413, "JSON request body is too large")
+  const bytes = await request.arrayBuffer()
+  if (bytes.byteLength > MAX_JSON_BYTES) fail(413, "JSON request body is too large")
+  return object(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)))
+}
+
+function requiredID(value: unknown, field: string) {
+  if (!isRelayId(value)) fail(400, `${field} is invalid`)
+  return value
+}
+
+function optionalDetail(value: unknown) {
+  if (value === undefined) return undefined
+  try {
+    return asOptionalText(value, 4_096)
+  } catch {
+    fail(400, "detail is invalid")
+  }
+}
+
+function parseRegister(body: Record<string, unknown>) {
+  const id = requiredID(body.id, "id")
+  if (!isDeviceRole(body.role)) fail(400, "role must be worker or master-worker")
+  let name: string
+  try {
+    name = asOptionalText(body.name, 128)!
+  } catch {
+    fail(400, "name is invalid")
+  }
+  let maxSlots: number | undefined
+  if (body.maxSlots !== undefined) {
+    try {
+      maxSlots = asPositiveInteger(body.maxSlots, "maxSlots", 5)
+    } catch (error) {
+      fail(400, error instanceof Error ? error.message : "maxSlots is invalid")
+    }
+  }
+  return { id, role: body.role, name, ...(maxSlots === undefined ? {} : { maxSlots }) }
+}
+
+function parsePublish(id: string, body: Record<string, unknown>): PublishChallengeRequest {
+  if (body.id !== undefined && body.id !== id) fail(400, "Challenge id must match the URL")
+  let slug: string
+  let category: string | undefined
+  try {
+    slug = asOptionalText(body.slug, 192)!
+    category = asOptionalText(body.category, 128)
+  } catch {
+    fail(400, "slug or category is invalid")
+  }
+  if (!isChallengeKind(body.kind)) fail(400, "kind must be offline or remote")
+  if (!isChallengePhase(body.phase)) fail(400, "phase must be offline or online")
+  let revision: number
+  try {
+    revision = asPositiveInteger(body.revision, "revision", 2_147_483_647)
+  } catch (error) {
+    fail(400, error instanceof Error ? error.message : "revision is invalid")
+  }
+  if (!isSha256(body.bundleSha256)) fail(400, "bundleSha256 must be a lowercase SHA-256")
+  if (body.phase === "offline") {
+    return { slug, ...(category ? { category } : {}), kind: body.kind, phase: body.phase, revision, bundleSha256: body.bundleSha256 }
+  }
+  let remoteUrl: string
+  let remoteExpiresAt: number
+  try {
+    remoteUrl = asOptionalText(body.remoteUrl, 2_000)!
+    const url = new URL(remoteUrl)
+    if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new Error("invalid URL")
+    remoteExpiresAt = asEpoch(body.remoteExpiresAt, "remoteExpiresAt")
+  } catch {
+    fail(400, "Online publication requires a valid remoteUrl and remoteExpiresAt")
+  }
+  return {
+    slug,
+    ...(category ? { category } : {}),
+    kind: body.kind,
+    phase: body.phase,
+    revision,
+    bundleSha256: body.bundleSha256,
+    remoteUrl,
+    remoteExpiresAt,
+  }
+}
+
+function parsePoll(body: Record<string, unknown>) {
+  if (typeof body.freeSlots !== "number" || !Number.isSafeInteger(body.freeSlots) || body.freeSlots < 0 || body.freeSlots > 5)
+    fail(400, "freeSlots must be an integer from 0 to 5")
+  if (body.activeAssignmentIds === undefined) return { freeSlots: body.freeSlots, activeAssignmentIds: [] as string[] }
+  if (!Array.isArray(body.activeAssignmentIds) || body.activeAssignmentIds.length > 64)
+    fail(400, "activeAssignmentIds must contain at most 64 IDs")
+  const activeAssignmentIds = body.activeAssignmentIds.map((value) => requiredID(value, "assignment id"))
+  if (new Set(activeAssignmentIds).size !== activeAssignmentIds.length) fail(400, "activeAssignmentIds contains duplicates")
+  return { freeSlots: body.freeSlots, activeAssignmentIds }
+}
+
+function parseResult(body: Record<string, unknown>) {
+  const assignmentID = requiredID(body.assignmentId, "assignmentId")
+  if (body.bundleSha256 === undefined) return { assignmentID }
+  if (!isSha256(body.bundleSha256)) fail(400, "bundleSha256 must be a lowercase SHA-256")
+  return { assignmentID, bundleSha256: body.bundleSha256 }
+}
+
+function parseFlag(body: Record<string, unknown>) {
+  const id = requiredID(body.id, "id")
+  const assignmentID = requiredID(body.assignmentId, "assignmentId")
+  let value: string
+  try {
+    value = asOptionalText(body.value, MAX_FLAG_LENGTH)!
+  } catch {
+    fail(400, "flag value is invalid")
+  }
+  return { id, assignmentID, value }
+}
+
+function parseWriteup(body: Record<string, unknown>) {
+  const assignmentID = requiredID(body.assignmentId, "assignmentId")
+  if (!isSha256(body.bundleSha256)) fail(400, "bundleSha256 must be a lowercase SHA-256")
+  return { assignmentID, bundleSha256: body.bundleSha256 }
+}
+
+function parseFlagUpdate(body: Record<string, unknown>) {
+  if (!isFlagStatus(body.status)) fail(400, "status must be pending, accepted, or rejected")
+  return { status: body.status as FlagStatus, detail: optionalDetail(body.detail) }
+}
+
+class BundleStore {
+  readonly #directory: string
+
+  private constructor(directory: string) {
+    this.#directory = directory
+  }
+
+  static async open(dataDirectory: string) {
+    const directory = path.join(path.resolve(dataDirectory), "bundles")
+    await mkdir(directory, { recursive: true, mode: 0o700 })
+    return new BundleStore(directory)
+  }
+
+  #path(sha256: string) {
+    return path.join(this.#directory, sha256)
+  }
+
+  async has(sha256: string) {
+    const info = await lstat(this.#path(sha256)).catch(() => undefined)
+    if (!info) return false
+    if (!info.isFile() || info.isSymbolicLink()) fail(500, "Boom Relay bundle store is invalid")
+    return true
+  }
+
+  async upload(sha256: string, body: ReadableStream<Uint8Array> | null, declaredLength: string | null) {
+    if (!body) fail(400, "Bundle request body is required")
+    if (declaredLength && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > MAX_BUNDLE_BYTES))
+      fail(413, "Bundle is too large")
+    const temporary = path.join(this.#directory, `.${sha256}.${process.pid}.${crypto.randomUUID()}.tmp`)
+    let bytes = 0
+    const hash = createHash("sha256")
+    const limiter = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        bytes += chunk.length
+        if (bytes > MAX_BUNDLE_BYTES) {
+          callback(new RelayError(413, "Bundle is too large"))
+          return
+        }
+        hash.update(chunk)
+        callback(null, chunk)
+      },
+    })
+    try {
+      await pipeline(
+        Readable.fromWeb(body as unknown as import("node:stream/web").ReadableStream),
+        limiter,
+        createWriteStream(temporary, { flags: "wx", mode: 0o600 }),
+      )
+      if (hash.digest("hex") !== sha256) fail(400, "Bundle SHA-256 does not match the URL")
+      if (await this.has(sha256)) {
+        await unlink(temporary)
+        return { created: false, bytes }
+      }
+      await rename(temporary, this.#path(sha256))
+      return { created: true, bytes }
+    } catch (error) {
+      await unlink(temporary).catch(() => {})
+      throw error
+    }
+  }
+
+  async download(sha256: string) {
+    const target = this.#path(sha256)
+    const info = await lstat(target).catch(() => undefined)
+    if (!info) fail(404, "Bundle not found")
+    if (!info.isFile() || info.isSymbolicLink()) fail(500, "Boom Relay bundle store is invalid")
+    return new Response(Bun.file(target), {
+      headers: {
+        ...SECURITY_HEADERS,
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(info.size),
+        "Content-Disposition": `attachment; filename=${sha256}`,
+      },
+    })
+  }
+}
+
+/** Start the standalone public Relay. It never imports competition code and never sees an AccessKey. */
+export async function startRelayServer(options: RelayServerOptions): Promise<RunningRelayServer> {
+  const dataDirectory = path.resolve(options.dataDirectory)
+  if (options.joinToken.length < 16 || options.masterToken.length < 16)
+    throw new Error("Boom Relay join and master tokens must each be at least 16 characters")
+  if (sameToken(options.joinToken, options.masterToken))
+    throw new Error("Boom Relay join and master tokens must be different")
+  const [store, bundles] = await Promise.all([
+    RelayStore.open(dataDirectory, { leaseMs: options.leaseMs, now: options.now }),
+    BundleStore.open(dataDirectory),
+  ])
+  const device = (request: Request) => {
+    const token = bearer(request)
+    const authenticated = token ? store.authenticateDevice(tokenHash(token)) : undefined
+    if (!authenticated) fail(401, "Boom Relay device authentication is required")
+    return authenticated
+  }
+  const master = (request: Request) => {
+    if (!sameToken(bearer(request), options.masterToken)) fail(401, "Boom Relay master authentication is required")
+  }
+  const enrolled = (request: Request) => {
+    if (!sameToken(bearer(request), options.joinToken)) fail(401, "Boom Relay enrollment authentication is required")
+  }
+
+  let closed = false
+  const server = Bun.serve({
+    hostname: options.hostname ?? "127.0.0.1",
+    port: options.port ?? 7332,
+    async fetch(request) {
+      try {
+        if (closed) return json({ error: { code: 503, message: "Boom Relay is shutting down" } }, 503)
+        const url = new URL(request.url)
+        const pathname = url.pathname
+        if (request.method === "GET" && pathname === "/health") return json({ name: "Boom Relay", version: 1 })
+
+        if (request.method === "POST" && pathname === "/v1/devices/register") {
+          enrolled(request)
+          const body = parseRegister(await readJSON(request))
+          const rawToken = newDeviceToken()
+          const registered = store.registerDevice({ ...body, tokenHash: tokenHash(rawToken) })
+          return json({ ...registered, token: rawToken }, registered.created ? 201 : 200)
+        }
+
+        const bundleMatch = /^\/v1\/bundles\/([a-f0-9]{64})$/.exec(pathname)
+        if (bundleMatch) {
+          const sha256 = bundleMatch[1]!
+          if (request.method === "PUT") {
+            if (sameToken(bearer(request), options.masterToken)) {
+              // Master uploads challenge bundles; workers upload result and writeup bundles.
+            } else {
+              device(request)
+            }
+            const result = await bundles.upload(sha256, request.body, request.headers.get("content-length"))
+            return json(result, result.created ? 201 : 200)
+          }
+          if (request.method === "GET") {
+            if (!sameToken(bearer(request), options.masterToken)) device(request)
+            return bundles.download(sha256)
+          }
+        }
+
+        const challengeMatch = /^\/v1\/challenges\/([A-Za-z0-9][A-Za-z0-9._:-]{0,191})$/.exec(pathname)
+        if (request.method === "PUT" && challengeMatch) {
+          master(request)
+          const id = challengeMatch[1]!
+          const input = parsePublish(id, await readJSON(request))
+          if (!await bundles.has(input.bundleSha256)) fail(409, "Challenge bundle has not been uploaded")
+          return json({ challenge: store.publishChallenge(id, input) })
+        }
+
+        if (request.method === "POST" && pathname === "/v1/worker/poll") {
+          const current = device(request)
+          const input = parsePoll(await readJSON(request))
+          return json(store.poll(current.id, input.freeSlots, input.activeAssignmentIds))
+        }
+
+        if (request.method === "POST" && pathname === "/v1/results") {
+          const current = device(request)
+          const input = parseResult(await readJSON(request))
+          if (input.bundleSha256 && !await bundles.has(input.bundleSha256)) fail(409, "Result bundle has not been uploaded")
+          return json(store.submitResult(current.id, input))
+        }
+
+        if (request.method === "POST" && pathname === "/v1/flags") {
+          const current = device(request)
+          return json(store.submitFlag(current.id, parseFlag(await readJSON(request))), 202)
+        }
+
+        if (request.method === "POST" && pathname === "/v1/writeups") {
+          const current = device(request)
+          const input = parseWriteup(await readJSON(request))
+          if (!await bundles.has(input.bundleSha256)) fail(409, "Writeup bundle has not been uploaded")
+          return json(store.submitWriteup(current.id, input))
+        }
+
+        if (request.method === "GET" && pathname === "/v1/master/state") {
+          master(request)
+          return json(store.masterState())
+        }
+
+        const flagMatch = /^\/v1\/flags\/([A-Za-z0-9][A-Za-z0-9._:-]{0,191})$/.exec(pathname)
+        if (request.method === "PATCH" && flagMatch) {
+          master(request)
+          return json({ flag: store.updateFlag(flagMatch[1]!, parseFlagUpdate(await readJSON(request))) })
+        }
+        return json({ error: { code: 404, message: "Boom Relay endpoint not found" } }, 404)
+      } catch (error) {
+        return errorResponse(error)
+      }
+    },
+  })
+  const hostname = options.hostname ?? "127.0.0.1"
+  return {
+    url: `http://${hostname}:${server.port}`,
+    async close() {
+      if (closed) return
+      closed = true
+      server.stop(true)
+      store.close()
+    },
+  }
+}
