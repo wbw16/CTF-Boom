@@ -59,6 +59,7 @@ function usage(code = 1): never {
     "  gui [options]            open the local Boom workbench",
     "  mcp <action>             manage Boom MCP servers through Boom Runtime",
     "  relay serve [options]    run the standalone Boom Relay for distributed solving",
+    "  relay tokens [options]    show a Relay's stored join and master tokens",
     "  doctor                   verify the local installation",
     "  evaluate [--root <dir>]  summarize existing run results",
     "  version                  print the installed version",

@@ -50,6 +50,7 @@ import {
   xihulunjianCredentialStatus,
 } from "./xihulunjian-config.ts"
 import { normalizeCompetitionSettings } from "./competition/policy.ts"
+import { RelayGuiController } from "./relay/gui-controller.ts"
 
 const PACKAGE_ROOT = path.resolve(import.meta.dir, "..")
 const WEB_DIST = path.join(PACKAGE_ROOT, "frontend", "dist")
@@ -57,6 +58,24 @@ const WEB_INDEX = path.join(WEB_DIST, "index.html")
 const webReady = existsSync(WEB_INDEX)
 const LOOPBACK = new Set(["127.0.0.1", "::1", "[::1]", "localhost"])
 const encoder = new TextEncoder()
+
+/**
+ * Relay workers intentionally keep downloaded bundles below `relay/challenges/`, separate from
+ * operator-imported source.  Surface that read-only mirror beside the normal catalog so a worker
+ * joined through the GUI immediately shows the assignments it has pulled.
+ */
+async function discoverGuiChallenges(root: string) {
+  const local = await discoverChallenges(root)
+  const relayRoot = path.join(root, "relay")
+  const relayChallenges = await lstat(path.join(relayRoot, "challenges")).catch(() => undefined)
+  if (!relayChallenges?.isDirectory() || relayChallenges.isSymbolicLink()) return local
+  const relay = await discoverChallenges(relayRoot)
+  // A Relay assignment wins a same-slug collision: its files and remote URL are the material that
+  // the worker actually ran.  The normal catalog remains the source published by the master.
+  const bySlug = new Map<string, Challenge>()
+  for (const item of [...relay, ...local]) if (!bySlug.has(item.slug)) bySlug.set(item.slug, item)
+  return [...bySlug.values()]
+}
 
 export type GuiRunnerBackend = Pick<
   GuiRunner,
@@ -148,6 +167,11 @@ async function body(request: Request) {
 function positive(value: unknown, name: string, minimum = 1) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < minimum)
     throw new HttpError(400, `${name} must be at least ${minimum}`)
+  return value
+}
+
+function requiredText(value: unknown, name: string) {
+  if (typeof value !== "string") throw new HttpError(400, `${name}必须是字符串`)
   return value
 }
 
@@ -454,9 +478,12 @@ export async function startGuiServer(options: StartGuiOptions) {
     throw new Error("Boom GUI 前端尚未构建；请先运行 bun run build:web")
   const hostname = options.hostname ?? "127.0.0.1"
   if (!LOOPBACK.has(hostname)) throw new Error(`Boom GUI only listens on loopback, got: ${hostname}`)
+  await mkdir(path.resolve(options.root), { recursive: true, mode: 0o700 })
   let root = await canonicalDirectory(options.root)
   const challengeRoot = await lstat(path.join(root, "challenges")).catch(() => undefined)
-  if (!challengeRoot?.isDirectory()) throw new Error(`No challenges directory at ${path.join(root, "challenges")}`)
+  if (!challengeRoot) await mkdir(path.join(root, "challenges"), { recursive: true, mode: 0o700 })
+  else if (!challengeRoot.isDirectory() || challengeRoot.isSymbolicLink())
+    throw new Error(`No real challenges directory at ${path.join(root, "challenges")}`)
   const loaded = await loadRootGuiState(root)
   let persisted = stationaryRootState(loaded)
   // Persisted settings win at startup; the CLI flag only seeds a root with no saved state yet.
@@ -493,7 +520,12 @@ export async function startGuiServer(options: StartGuiOptions) {
   }
   const unsubscribe = runner.subscribe(broadcast)
 
-  const challenges = async () => discoverChallenges(root)
+  let distributed = new RelayGuiController({
+    root,
+    onState: (session) => broadcast({ at: Date.now(), type: "relay.session.changed", session }),
+  })
+
+  const challenges = async () => discoverGuiChallenges(root)
   const challenge = async (slug: string) => {
     const found = (await challenges()).find((item) => item.slug === slug)
     if (!found) throw new HttpError(404, `No such challenge: ${slug}`)
@@ -504,7 +536,7 @@ export async function startGuiServer(options: StartGuiOptions) {
     const snapshotSequence = sequence
     const stateRoot = root
     const statePersisted = persisted
-    const found = await discoverChallenges(stateRoot)
+    const found = await discoverGuiChallenges(stateRoot)
     const models = await runner.getModels()
     const environments = await loadEnvironmentStore()
     return {
@@ -514,6 +546,7 @@ export async function startGuiServer(options: StartGuiOptions) {
       settings: statePersisted.settings,
       models,
       runtime: runner.getRuntimeState(),
+      distributed: distributed.snapshot(),
       environments,
       challenges: await Promise.all(
         found.map(async (item) => {
@@ -543,10 +576,16 @@ export async function startGuiServer(options: StartGuiOptions) {
           return {
             slug: item.slug,
             category: item.category ?? "OTHER",
-            storagePath: path.relative(
-              path.join(stateRoot, "challenges"),
-              item.sourceDirectory ?? item.directory,
-            ).split(path.sep).join("/"),
+            storagePath: (() => {
+              const source = item.sourceDirectory ?? item.directory
+              const relayBase = path.join(stateRoot, "relay", "challenges")
+              const isRelay = source === relayBase || source.startsWith(`${relayBase}${path.sep}`)
+              const relative = path.relative(
+                isRelay ? relayBase : path.join(stateRoot, "challenges"),
+                source,
+              ).split(path.sep).join("/")
+              return isRelay ? `Relay/${relative}` : relative
+            })(),
             ...(item.difficulty ? { difficulty: item.difficulty } : {}),
             description: item.description,
             files: item.files,
@@ -699,7 +738,7 @@ export async function startGuiServer(options: StartGuiOptions) {
     slug: string,
     runID: string,
   ) => {
-    const found = (await discoverChallenges(detailRoot)).find((item) => item.slug === slug)
+    const found = (await discoverGuiChallenges(detailRoot)).find((item) => item.slug === slug)
     if (!found) throw new HttpError(404, `No such challenge: ${slug}`)
     const saved = detailPersisted.challenges[found.slug]
     const runs = mergeTransient(
@@ -797,11 +836,15 @@ export async function startGuiServer(options: StartGuiOptions) {
           const input = await body(request)
           return await exclusive(async () => {
             if (runner.hasWork()) throw new HttpError(409, "Stop active runs before changing root")
+            if (distributed.snapshot().role !== "inactive")
+              throw new HttpError(409, "请先停止当前分布式比赛会话，再切换工作目录")
             if (typeof input.root !== "string") throw new HttpError(400, "root must be a path")
+            await mkdir(path.resolve(input.root), { recursive: true, mode: 0o700 })
             const next = await canonicalDirectory(input.root)
             const challengeDirectory = await lstat(path.join(next, "challenges")).catch(() => undefined)
-            if (!challengeDirectory?.isDirectory())
-              throw new HttpError(400, `No challenges directory at ${path.join(next, "challenges")}`)
+            if (!challengeDirectory) await mkdir(path.join(next, "challenges"), { recursive: true, mode: 0o700 })
+            else if (!challengeDirectory.isDirectory() || challengeDirectory.isSymbolicLink())
+              throw new HttpError(400, `No real challenges directory at ${path.join(next, "challenges")}`)
             const nextLoaded = await loadRootGuiState(next)
             const nextPersisted = stationaryRootState(nextLoaded)
             autopilot.stop()
@@ -810,6 +853,10 @@ export async function startGuiServer(options: StartGuiOptions) {
             runner.setCompetitionSettings?.(nextPersisted.settings.competition)
             root = next
             persisted = nextPersisted
+            distributed = new RelayGuiController({
+              root,
+              onState: (session) => broadcast({ at: Date.now(), type: "relay.session.changed", session }),
+            })
             await runner.applyLiveModelSettings(nextPersisted.settings)
             broadcast({ at: Date.now(), type: "root.changed" })
             return json(await state())
@@ -842,6 +889,82 @@ export async function startGuiServer(options: StartGuiOptions) {
         // Live match status: clock, environment slots, and current slot usage.
         if (request.method === "GET" && url.pathname === "/api/competition")
           return json(competitionState())
+
+        if (request.method === "GET" && url.pathname === "/api/distributed")
+          return json(distributed.snapshot())
+
+        if (request.method === "POST" && url.pathname === "/api/distributed/worker/start") {
+          const input = await body(request)
+          return await exclusive(async () => {
+            if (runner.hasWork()) throw new HttpError(409, "请先停止本机普通任务，再作为从机加入比赛")
+            autopilot.stop()
+            try {
+              return json(await distributed.startWorker({
+                relayURL: requiredText(input.relayURL, "Relay 服务地址"),
+                joinToken: requiredText(input.joinToken, "比赛加入令牌"),
+                ...(typeof input.deviceID === "string" ? { deviceID: input.deviceID } : {}),
+                ...(typeof input.deviceName === "string" ? { deviceName: input.deviceName } : {}),
+                maxSlots: positive(input.maxSlots, "设备并发"),
+                model: typeof input.model === "string" ? input.model : persisted.settings.strongModel,
+                ...(input.pollMs === undefined ? {} : { pollMs: positive(input.pollMs, "轮询间隔") }),
+              }))
+            } catch (error) {
+              throw new HttpError(400, error instanceof Error ? error.message : String(error))
+            }
+          })
+        }
+
+        if (request.method === "POST" && url.pathname === "/api/distributed/worker/resume") {
+          return await exclusive(async () => {
+            if (runner.hasWork()) throw new HttpError(409, "请先停止本机普通任务，再恢复从机")
+            autopilot.stop()
+            try {
+              return json(await distributed.resumeWorker())
+            } catch (error) {
+              throw new HttpError(400, error instanceof Error ? error.message : String(error))
+            }
+          })
+        }
+
+        if (request.method === "POST" && url.pathname === "/api/distributed/master/start") {
+          const input = await body(request)
+          return await exclusive(async () => {
+            if (runner.hasWork()) throw new HttpError(409, "请先停止本机普通任务，再作为主机开始比赛")
+            autopilot.stop()
+            try {
+              return json(await distributed.startMaster({
+                relayURL: requiredText(input.relayURL, "Relay 服务地址"),
+                masterToken: requiredText(input.masterToken, "主控令牌"),
+                joinToken: requiredText(input.joinToken, "比赛加入令牌"),
+                ...(typeof input.deviceID === "string" ? { deviceID: input.deviceID } : {}),
+                ...(typeof input.deviceName === "string" ? { deviceName: input.deviceName } : {}),
+                maxSlots: positive(input.maxSlots, "主机解题并发"),
+                model: typeof input.model === "string" ? input.model : persisted.settings.strongModel,
+                ...(input.pollMs === undefined ? {} : { pollMs: positive(input.pollMs, "轮询间隔") }),
+                maxRemoteSlots: positive(input.maxRemoteSlots ?? persisted.settings.competition.remoteSlots, "线上靶机并发"),
+              }))
+            } catch (error) {
+              throw new HttpError(400, error instanceof Error ? error.message : String(error))
+            }
+          })
+        }
+
+        if (request.method === "POST" && url.pathname === "/api/distributed/master/sync") {
+          return await exclusive(async () => {
+            try {
+              return json(await distributed.syncMaster())
+            } catch (error) {
+              throw new HttpError(400, error instanceof Error ? error.message : String(error))
+            }
+          })
+        }
+
+        if (request.method === "POST" && url.pathname === "/api/distributed/stop") {
+          return await exclusive(async () => {
+            await distributed.stop()
+            return json(distributed.snapshot())
+          })
+        }
 
         // Start or clear the match clock. The deadline is what drives the endgame and give-up rules,
         // so it is set explicitly by the operator rather than guessed from the first run.
@@ -886,6 +1009,8 @@ export async function startGuiServer(options: StartGuiOptions) {
          */
         if (request.method === "POST" && url.pathname === "/api/competition/autopilot/start") {
           return await exclusive(async () => {
+            if (distributed.snapshot().role !== "inactive")
+              throw new HttpError(409, "分布式比赛会话已接管调度；请在比赛控制台同步题目")
             if (!await loadXihulunjianAccessKey())
               throw new HttpError(400, "开始比赛前请先在西湖论剑控制台保存 AccessKey")
             await automaticEnvironmentProfile()
@@ -931,6 +1056,8 @@ export async function startGuiServer(options: StartGuiOptions) {
          * then stop remote work and recover every target lease the runner currently owns.
          */
         if (request.method === "POST" && url.pathname === "/api/competition/environments/close") {
+          if (distributed.snapshot().role !== "inactive")
+            throw new HttpError(409, "分布式会话的靶机由主机 Relay connector 管理；请停止该会话以安全回收")
           const closeAllEnvironments = runner.closeAllEnvironments
           if (!closeAllEnvironments)
             throw new HttpError(501, "当前运行器不支持批量关闭靶机环境")
@@ -1014,6 +1141,12 @@ export async function startGuiServer(options: StartGuiOptions) {
         if (request.method === "POST" && url.pathname === "/api/xihulunjian/sync") {
           return await exclusive(async () => {
             try {
+              if (distributed.snapshot().role === "master") {
+                const result = await distributed.syncMaster()
+                return json({ challenges: [], published: result.published, distributed: result.state })
+              }
+              if (distributed.snapshot().role === "worker")
+                throw new HttpError(409, "从机从 Relay 领取题目，不直接连接比赛平台")
               const result = await synchronizeXihulunjian()
               return json({ challenges: result.slugs })
             } catch (error) {
@@ -1323,6 +1456,8 @@ export async function startGuiServer(options: StartGuiOptions) {
         if (request.method === "POST" && url.pathname === "/api/runs") {
           const input = await body(request)
           return await exclusive(async () => {
+            if (distributed.snapshot().role !== "inactive")
+              throw new HttpError(409, "分布式比赛会话已接管解题；本机请从 Relay 领取任务")
             const slugs = Array.isArray(input.slugs)
               ? input.slugs.filter((item): item is string => typeof item === "string")
               : []
@@ -1558,6 +1693,8 @@ export async function startGuiServer(options: StartGuiOptions) {
         if (request.method === "POST" && url.pathname === "/api/flags") {
           const input = await body(request)
           return await exclusive(async () => {
+            if (distributed.snapshot().role !== "inactive")
+              throw new HttpError(409, "分布式比赛的候选 flag 必须由 Relay 转交主机提交")
             if (typeof input.slug !== "string") throw new HttpError(400, "slug must be a string")
             if (typeof input.runID !== "string") throw new HttpError(400, "runID must be a string")
             if (typeof input.flag !== "string" || input.flag.trim() === "")
@@ -1887,6 +2024,7 @@ export async function startGuiServer(options: StartGuiOptions) {
       // Stop accepting new requests before draining jobs so close is a real lifecycle barrier.
       void server.stop(true)
       autopilot.stop()
+      await distributed.stop()
       clearInterval(heartbeat)
       unsubscribe()
       for (const client of clients) {

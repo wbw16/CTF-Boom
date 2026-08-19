@@ -28,17 +28,37 @@ CTF-Boom 是一个以证据为中心的自动化 CTF 解题系统。它把题目
 
 ## 分布式 Relay
 
-`boom relay serve` 是分布式解题的公网持久化信箱。它只保存题目 bundle、任务租约、成果包、候选 flag 和 writeup；不会运行 Boom、访问比赛平台或保存比赛 AccessKey。完整协议和工作流见 [distributed-solving-plan.md](./docs/distributed-solving-plan.md)。
+`boom relay serve` 是分布式解题的公网持久化信箱。它只保存题目 bundle、任务租约、成果包、候选 flag 和 writeup；不会运行 Boom、访问比赛平台或保存比赛 AccessKey。完整协议和工作流见 [distributed-solving-plan.md](./docs/distributed-solving-plan.md)，公网服务器部署与运维手册见 [relay-server-ops.md](./docs/relay-server-ops.md)。
 
 Relay 应部署在 HTTPS 反向代理之后，默认只监听回环地址：
 
 ```sh
-export BOOM_RELAY_JOIN_TOKEN="$(openssl rand -base64 32)"
-export BOOM_RELAY_MASTER_TOKEN="$(openssl rand -base64 32)"
 bun src/index.ts relay serve --data /var/lib/boom-relay --host 127.0.0.1 --port 7332
 ```
 
-将两个环境变量放在服务管理器的私有环境文件中，不要写进 Relay 数据目录、题目 bundle 或运行工作区。`BOOM_RELAY_MASTER_TOKEN` 仅供主机 connector 使用；普通设备通过一次性加入令牌换取自己的设备令牌。Relay 目录包含 SQLite WAL 数据库和不可替代的 bundle 文件，应定期备份并以单进程方式运行。
+无需手动生成令牌：未设置环境变量时，`boom relay serve` 会在首次启动时自动生成加入令牌和主控令牌，以 0600 权限保存在 `<data>/relay-tokens.json`，重启时复用同一组令牌。在 Relay 主机上执行以下命令即可查看，并复制到主机/从机的 GUI：
+
+```sh
+bun src/index.ts relay tokens --data /var/lib/boom-relay
+```
+
+也可以改用服务管理器的私有环境文件显式指定令牌（此时两个变量必须同时设置，令牌不会在 Relay 数据目录落盘）：
+
+```sh
+export BOOM_RELAY_JOIN_TOKEN="$(openssl rand -base64 32)"
+export BOOM_RELAY_MASTER_TOKEN="$(openssl rand -base64 32)"
+```
+
+`BOOM_RELAY_MASTER_TOKEN`（主控令牌）仅供主机 connector 使用，不能分享给从机；普通设备通过一次性加入令牌换取自己的设备令牌。无论哪种方式，都不要把令牌写进题目 bundle 或运行工作区。Relay 目录包含 SQLite WAL 数据库和不可替代的 bundle 文件，应定期备份并以单进程方式运行。
+
+### 在 GUI 中开始主从协作
+
+每台机器运行相同的 `boom gui`。打开 **西湖论剑控制台 → 分布式比赛会话** 后选择角色：
+
+- **主机**：先在本机配置平台 Server Host 和 AccessKey；再填 Relay 地址、主控令牌与加入令牌（可在 Relay 主机用 `boom relay tokens --data <dir>` 查看自动生成的值）。主机启动后会注册本机的 `master-worker`；点击“同步并发布题目”后，它负责发布题目、为远程题申请靶机，并且是唯一向比赛平台提交 flag 的设备。
+- **从机**：填 Relay 地址与主机安全分享的 `BOOM_RELAY_JOIN_TOKEN`，选择本机并发后加入。加入令牌只用于交换本机的设备令牌，不会写进题目、运行工作区或 GUI 状态；以后可用“恢复已加入从机”续租，不必再次输入它。
+
+主控令牌不能分享给从机；比赛平台 AccessKey 也只存在主机。主机和从机使用同一个 Boom agent、模型配置和解题流程，区别仅是主机负责平台连接、调度和提交。启动分布式会话后，普通本地“开始比赛”会被禁用，防止任何设备绕过 Relay 直接提交或重复解题。
 
 ## 核心能力
 

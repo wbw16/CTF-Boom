@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { copyFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { acceptTaskFlag, loadTaskRecord } from "../task.ts"
 import { readChallengeRuns } from "../history.ts"
@@ -39,6 +39,9 @@ export type RelayWorkerOptions = {
   pollMs?: number
   runner?: GuiRunner
   now?: () => number
+  /** GUI hosts use this for non-secret status updates; it never changes Relay semantics. */
+  onPoll?: (response: WorkerPollResponse) => void
+  onError?: (error: unknown) => void
 }
 
 export type RunningRelayWorker = {
@@ -92,6 +95,40 @@ function unique<T>(values: T[]) {
   return [...new Set(values)]
 }
 
+/** Write Relay-only presentation metadata without ever trusting a symlink in a downloaded task. */
+async function writeRelayPresentation(directory: string, challenge: Challenge) {
+  const atomic = async (name: string, value: string) => {
+    const target = path.join(directory, name)
+    const existing = await lstat(target).catch(() => undefined)
+    if (existing && (!existing.isFile() || existing.isSymbolicLink()))
+      throw new Error(`Relay challenge presentation target is unsafe: ${target}`)
+    const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`
+    try {
+      await writeFile(temporary, value, { encoding: "utf8", mode: 0o600, flag: "wx" })
+      await rename(temporary, target)
+    } finally {
+      await rm(temporary, { force: true }).catch(() => {})
+    }
+  }
+  await atomic("README.md", `${challenge.description.trim() || "(no challenge description provided)"}\n`)
+  await atomic("meta.json", `${JSON.stringify({
+    category: challenge.category,
+    ...(challenge.difficulty ? { difficulty: challenge.difficulty } : {}),
+    flag_format: challenge.flagFormat,
+    ...(challenge.remote ? { remote: challenge.remote } : {}),
+    ...(challenge.serviceRequired ? { service_required: true } : {}),
+    ...(challenge.platform
+      ? {
+          platform: {
+            adapter: challenge.platform.adapter,
+            ...(challenge.platform.challengeID ? { challenge_id: challenge.platform.challengeID } : {}),
+            ...(challenge.platform.options ? { options: challenge.platform.options } : {}),
+          },
+        }
+      : {}),
+  }, undefined, 2)}\n`)
+}
+
 async function copyWriteup(runDirectory: string, target: string) {
   const source = path.join(runDirectory, "work", "WRITEUP.md")
   const info = await lstat(source)
@@ -126,6 +163,8 @@ export class RelayWorker implements RunningRelayWorker {
   readonly #pollMs: number
   readonly #now: () => number
   readonly #runner: GuiRunner
+  readonly #onPoll?: (response: WorkerPollResponse) => void
+  readonly #onError?: (error: unknown) => void
   readonly #state: WorkerState
   readonly #assignments = new Map<string, WorkerAssignment>()
   readonly #outbox: WorkerOutboxItem[]
@@ -139,6 +178,8 @@ export class RelayWorker implements RunningRelayWorker {
     this.#maxSlots = options.maxSlots
     this.#pollMs = options.pollMs ?? 15_000
     this.#now = options.now ?? (() => Date.now())
+    this.#onPoll = options.onPoll
+    this.#onError = options.onError
     this.#state = { version: 1, assignments: {}, outbox: [] }
     this.#outbox = this.#state.outbox
     const submitter: CandidateSubmitter = async (input) => {
@@ -238,6 +279,8 @@ export class RelayWorker implements RunningRelayWorker {
     const existing = this.#assignments.get(assignment.id)
     if (existing && existing.challenge.files.length > 0) {
       existing.assignment = assignment
+      existing.challenge = { ...existing.challenge, remote: assignment.challenge.remoteUrl }
+      await writeRelayPresentation(existing.challengeDirectory, existing.challenge)
       return existing
     }
     const directory = assignmentRoot(this.#root, assignment)
@@ -256,6 +299,7 @@ export class RelayWorker implements RunningRelayWorker {
       const result = await unpackArtifactBundle({ bundle: resultArchive, directory: resultDirectory, kind: "result" }) as { files: string[] }
       challenge.files = unique([...challenge.files, ...result.files.map((file) => `.relay-result/${file}`)])
     }
+    await writeRelayPresentation(directory, challenge)
     const value: WorkerAssignment = {
       assignment,
       challenge,
@@ -420,8 +464,12 @@ export class RelayWorker implements RunningRelayWorker {
       }
       await this.#afterRunner()
       await this.#persist()
+      this.#onPoll?.(response)
       return response
-    })()
+    })().catch((error) => {
+      this.#onError?.(error)
+      throw error
+    })
     try {
       return await this.#polling
     } finally {

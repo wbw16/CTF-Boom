@@ -24,6 +24,7 @@ docs/
 !docs/
 docs/*
 !docs/distributed-solving-plan.md
+!docs/relay-server-ops.md
 
 # start-gui.sh 的默认本地比赛工作区；其中会包含下载附件、运行记录与提交台账。
 /xihulunjian-ctf/

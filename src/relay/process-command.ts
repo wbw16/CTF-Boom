@@ -104,7 +104,7 @@ async function masterRun(argv: string[], syncFirst: boolean) {
   try {
     await master.run(controller.signal)
   } finally {
-    master.stop()
+    await master.close()
     process.removeListener("SIGINT", stop)
     process.removeListener("SIGTERM", stop)
   }

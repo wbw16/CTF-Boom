@@ -120,6 +120,12 @@ export function TopBar() {
 
   const halt = useCallback(async () => {
     try {
+      if (data?.distributed?.role === "master" || data?.distributed?.role === "worker") {
+        await postJSON("/api/distributed/stop")
+        toast("分布式比赛会话已停止")
+        await refresh()
+        return
+      }
       const result = await postJSON<{ stopped: number; competition: CompetitionState }>("/api/competition/autopilot/stop")
       setCompetition(result.competition)
       toast(`无人值守已停止，并已请求停止 ${result.stopped} 个运行`)
@@ -127,7 +133,7 @@ export function TopBar() {
     } catch (error) {
       toast((error as Error).message, "error")
     }
-  }, [refresh, toast])
+  }, [data?.distributed?.role, refresh, toast])
 
   const copyPending = useCallback(async () => {
     if (!data) return
@@ -154,7 +160,8 @@ export function TopBar() {
   if (!data) return null
   const { runtime, challenges } = data
   const unattended = competition?.autopilot?.enabled === true
-  const busy = runtime.active > 0 || runtime.queued > 0 || unattended
+  const distributedActive = data.distributed?.role === "master" || data.distributed?.role === "worker"
+  const busy = runtime.active > 0 || runtime.queued > 0 || unattended || distributedActive
   const pendingRows = challenges
     .map((challenge) => [challenge, latestFlagRun(challenge)] as const)
     .filter(

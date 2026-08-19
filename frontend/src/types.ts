@@ -67,6 +67,31 @@ export type CompetitionState = {
   unavailable?: boolean
 }
 
+export type DistributedSessionState = {
+  role: "inactive" | "master" | "worker"
+  status: "idle" | "connecting" | "running" | "error"
+  relayURL?: string
+  device?: {
+    id: string
+    name: string
+    role: "worker" | "master-worker"
+    maxSlots: number
+  }
+  worker?: {
+    activeAssignments: number
+    assignmentSlugs: string[]
+    lastPollAt?: string
+  }
+  master?: {
+    pendingFlags: number
+    readyOnline: number
+    activeRemote: number
+    pendingWriteups: number
+    lastCycleAt?: string
+  }
+  lastError?: string
+}
+
 export type XihulunjianNotice = {
   id: number
   title: string
@@ -261,6 +286,7 @@ export type GuiState = {
   settings: GuiSettings
   models: ModelInfo[]
   runtime: RuntimeState
+  distributed?: DistributedSessionState
   environments: EnvironmentStore
   challenges: ChallengeGui[]
 }

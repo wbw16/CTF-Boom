@@ -19,12 +19,23 @@ export type RelayProvisioner = (input: {
   challengeDirectory: string
 }) => Promise<{ remoteUrl: string; remoteExpiresAt: number } | undefined>
 
+/**
+ * The Relay cannot access a competition platform, so the connector owns the matching teardown
+ * call for every environment it provisions.  Keeping this beside the provisioner makes the
+ * ownership explicit and lets a GUI-hosted connector release a slot after an accepted flag or a
+ * clean shutdown.
+ */
+export type RelayEnvironmentReleaser = (input: {
+  challenge: ChallengeSnapshot
+}) => Promise<void>
+
 export type RelayMasterOptions = {
   relay: RelayClient
   root: string
   maxRemoteSlots?: number
   submitFlag?: MasterFlagSubmitter
   provision?: RelayProvisioner
+  release?: RelayEnvironmentReleaser
   now?: () => number
 }
 
@@ -33,6 +44,7 @@ export type RunningRelayMaster = {
   cycle(): Promise<MasterState>
   run(signal?: AbortSignal): Promise<void>
   stop(): void
+  close(): Promise<void>
 }
 
 function challengeFromSnapshot(snapshot: ChallengeSnapshot, directory: string): Challenge {
@@ -54,8 +66,10 @@ export class RelayMaster implements RunningRelayMaster {
   readonly #maxRemoteSlots: number
   readonly #submitFlag?: MasterFlagSubmitter
   readonly #provision?: RelayProvisioner
+  readonly #release?: RelayEnvironmentReleaser
   readonly #now: () => number
-  readonly #remoteLeases = new Map<string, number>()
+  /** Snapshots are retained so a restarted/closing connector can safely recover its own targets. */
+  readonly #remoteLeases = new Map<string, ChallengeSnapshot>()
   #stopped = false
 
   constructor(options: RelayMasterOptions) {
@@ -64,6 +78,7 @@ export class RelayMaster implements RunningRelayMaster {
     this.#maxRemoteSlots = options.maxRemoteSlots ?? 3
     this.#submitFlag = options.submitFlag
     this.#provision = options.provision
+    this.#release = options.release
     this.#now = options.now ?? (() => Date.now())
   }
 
@@ -74,6 +89,29 @@ export class RelayMaster implements RunningRelayMaster {
 
   stop() {
     this.#stopped = true
+  }
+
+  /** Release all environments this connector knows about.  It is safe to call more than once. */
+  async close() {
+    this.stop()
+    const leases = [...this.#remoteLeases.values()]
+    this.#remoteLeases.clear()
+    if (!this.#release) return
+    await Promise.allSettled(leases.map((challenge) => this.#release!({ challenge })))
+  }
+
+  async #releaseRemote(challenge: ChallengeSnapshot) {
+    this.#remoteLeases.delete(challenge.id)
+    if (this.#release) await this.#release({ challenge })
+  }
+
+  /**
+   * A connector restart has no in-memory lease map.  Reserve the environments already published
+   * in Relay before considering ready work; otherwise a restart could overrun the platform's
+   * three-environment cap.
+   */
+  #restoreRemoteLeases(state: MasterState) {
+    for (const challenge of state.activeRemote) this.#remoteLeases.set(challenge.id, challenge)
   }
 
   async #challengeFor(snapshot: ChallengeSnapshot) {
@@ -150,6 +188,10 @@ export class RelayMaster implements RunningRelayMaster {
         }
       }
       await this.#relay.updateFlag(flag.id, { status: result.verdict, detail: result.detail })
+      // A remote challenge can be solved during its offline analysis phase, before the connector
+      // has ever provisioned a target.  Recover only a lease we actually own.
+      if (result.verdict === "accepted" && this.#remoteLeases.has(challengeSnapshot.id))
+        await this.#releaseRemote(challengeSnapshot).catch(() => {})
     }
   }
 
@@ -161,7 +203,11 @@ export class RelayMaster implements RunningRelayMaster {
       const materialized = await this.#challengeFor(snapshot)
       const environment = await this.#provision({ challenge: snapshot, challengeDirectory: materialized.directory })
       if (!environment) continue
-      this.#remoteLeases.set(snapshot.id, environment.remoteExpiresAt)
+      this.#remoteLeases.set(snapshot.id, {
+        ...snapshot,
+        remoteUrl: environment.remoteUrl,
+        remoteExpiresAt: new Date(environment.remoteExpiresAt).toISOString(),
+      })
       await this.#relay.publishChallenge(snapshot.id, {
         id: snapshot.id,
         slug: snapshot.slug,
@@ -178,6 +224,7 @@ export class RelayMaster implements RunningRelayMaster {
 
   async cycle() {
     const state = await this.#relay.masterState()
+    this.#restoreRemoteLeases(state)
     await this.#processPendingFlags(state)
     await this.#provisionReady(state)
     return state

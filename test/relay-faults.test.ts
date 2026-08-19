@@ -217,6 +217,13 @@ test("worker restart recovers its active assignment and retries the outbox", asy
   const polled = await worker.poll()
   expect(polled.assignments).toHaveLength(1)
   const assignmentID = polled.assignments[0]!.id
+  const presentation = JSON.parse(await readFile(
+    path.join(workerRoot, "relay", "challenges", "worker-restart", "meta.json"),
+    "utf8",
+  )) as { category?: string; platform?: { challenge_id?: string } }
+  expect(presentation).toMatchObject({ category: "MISC", platform: { challenge_id: "worker-restart" } })
+  expect(await readFile(path.join(workerRoot, "relay", "challenges", "worker-restart", "README.md"), "utf8"))
+    .toContain("worker-restart")
   await worker.stop()
 
   // Simulate a crash before the previous process flushed this candidate to the Relay.
@@ -310,6 +317,7 @@ test("master provisions at most three environments and the master worker takes o
   }
 
   let provisions = 0
+  let releases = 0
   const master = await RelayMaster.open({
     relay: client,
     root: path.join(root, "master"),
@@ -318,9 +326,9 @@ test("master provisions at most three environments and the master worker takes o
       provisions += 1
       return { remoteUrl: `https://env-${provisions}.example.test:4000`, remoteExpiresAt: Date.now() + 600_000 }
     },
+    release: async () => { releases += 1 },
   })
   await master.cycle()
-  master.stop()
   const after = await client.masterState()
   expect(provisions).toBe(3)
   expect(after.readyOnline).toHaveLength(1)
@@ -334,4 +342,6 @@ test("master provisions at most three environments and the master worker takes o
   })
   expect(online.body.assignments.filter((assignment) => assignment.phase === "online")).toHaveLength(3)
   expect(online.body.assignments.every((assignment) => assignment.phase === "online")).toBe(true)
+  await master.close()
+  expect(releases).toBe(3)
 })

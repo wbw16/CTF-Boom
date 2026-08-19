@@ -325,3 +325,22 @@ src/relay/master.ts
 | 6 | poll 响应丢失不超槽位、不多领 | relay-server：never fills a worker beyond its reported capacity |
 | 7 | 相同 flag 重传不重复调用平台；rejected 后原 worker 继续 | relay-server：deduplicated flags；relay-faults：worker restart outbox 重试 |
 | 8 | accepted 后停止任务、释放环境，最终保存一份 writeup | relay-server：writeup handoff / undelivered writeup falls back |
+
+## 16. GUI 主从会话（2026-08-19）
+
+第一版 CLI Relay 已接入 `boom gui` 的“西湖论剑控制台 → 分布式比赛会话”。这不是另一套 agent：每台设备运行同一份 Boom；主机和从机只是 Relay 中不同的协调角色。
+
+### 操作流程
+
+1. 先将 Relay 部署在 HTTPS 反向代理之后。令牌可由 `BOOM_RELAY_JOIN_TOKEN` 与 `BOOM_RELAY_MASTER_TOKEN` 显式提供；未提供时首次启动自动生成，并以 0600 权限保存在 `<data>/relay-tokens.json`，重启复用，用 `boom relay tokens --data <dir>` 查看。
+2. 主机在 GUI 保存西湖论剑 AccessKey，选择“作为主机”，输入 Relay 地址、主控令牌和加入令牌。GUI 启动 connector 和一个本机 `master-worker`；点击“同步并发布题目”后，connector 发布 bundle、申请/回收靶机并统一提交候选 flag。
+3. 每台从机选择“作为从机”，输入 Relay 地址和加入令牌即可。首次加入交换出设备专属 token；共享加入令牌不会落盘，之后可安全地恢复该设备。
+4. 从机仅从 Relay 拉取题目，候选 flag、远程题成果包和 writeup 都先写入本地 outbox，再由 Relay 转交主机。GUI 将 Relay 下载的题目显示为 `Relay/...`，与本机手工导入的题目隔离。
+
+### 补齐的运行时边界
+
+- GUI 主机给 `RelayMaster` 注入西湖论剑的环境 provision/recover 回调；远程题现在会实际申请靶机，accepted 或干净关闭后会回收已知靶机。
+- connector 重启时会先根据 Relay 已发布的线上题恢复环境槽位计数，避免错误超过平台的三靶机上限。
+- 主机/从机会话运行时，GUI 拒绝普通本地自动巡航、手工运行和直接 flag 判定，确保唯一的平台连接与提交路径仍是主机。
+- Relay 的 Authorization 解析支持文档中 `openssl rand -base64` 生成的标准 Base64 主控/加入令牌；每台设备的 token 仍由 Boom 生成并单独保存。
+- 未设置环境变量时，`boom relay serve` 自动生成主控/加入令牌并保存在 `<data>/relay-tokens.json`（0600，重启复用），`boom relay tokens --data <dir>` 负责展示；环境变量仍然优先且不落盘。

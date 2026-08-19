@@ -1,6 +1,7 @@
 import path from "node:path"
 import { startRelayServer } from "./server.ts"
 import { relayProcessCommand } from "./process-command.ts"
+import { loadRelayTokens, relayTokensFilePath, resolveRelayTokens } from "./tokens.ts"
 
 export type RelayServeOptions = {
   dataDirectory: string
@@ -14,6 +15,7 @@ export class RelayCommandError extends Error {}
 export function relayUsage() {
   return [
     "Usage: boom relay serve --data <directory> [options]",
+    "       boom relay tokens --data <directory> [--json]",
     "",
     "Run the standalone Boom Relay mailbox for distributed solving.",
     "",
@@ -23,9 +25,10 @@ export function relayUsage() {
     "  --port <n>               bind port (default: 7332)",
     "  --lease-seconds <n>      worker lease duration, 60-3600 (default: 600)",
     "",
-    "Required environment:",
-    "  BOOM_RELAY_JOIN_TOKEN    enrollment secret for new workers (at least 16 characters)",
-    "  BOOM_RELAY_MASTER_TOKEN  connector-only secret (at least 16 characters)",
+    "Tokens:",
+    "  Set BOOM_RELAY_JOIN_TOKEN and BOOM_RELAY_MASTER_TOKEN to choose both secrets, or leave",
+    "  both unset to auto-generate them on first start into <data>/relay-tokens.json (0600).",
+    "  Show the stored tokens with `boom relay tokens --data <directory>`.",
     "",
     "Expose the Relay only behind an HTTPS reverse proxy. Do not put contest credentials on this host.",
     "",
@@ -65,9 +68,70 @@ export function parseRelayServeArgs(argv: string[], cwd = process.cwd()): RelayS
   return { dataDirectory, hostname, port, ...(leaseMs === undefined ? {} : { leaseMs }) }
 }
 
+export function parseRelayTokensArgs(argv: string[], cwd = process.cwd()): { dataDirectory: string; json: boolean } {
+  let dataDirectory: string | undefined
+  let json = false
+  for (let index = 0; index < argv.length; index += 1) {
+    const option = argv[index]
+    const value = () => {
+      const next = argv[++index]
+      if (!next) throw new RelayCommandError(`${option} requires a value`)
+      return next
+    }
+    if (option === "--data") dataDirectory = path.resolve(cwd, value())
+    else if (option === "--json") json = true
+    else if (option === "-h" || option === "--help") throw new RelayCommandError("help")
+    else throw new RelayCommandError(`Unknown Relay tokens option: ${option}`)
+  }
+  if (!dataDirectory) throw new RelayCommandError("--data is required")
+  return { dataDirectory, json }
+}
+
+async function relayTokensCommand(argv: string[]) {
+  let parsed: { dataDirectory: string; json: boolean }
+  try {
+    parsed = parseRelayTokensArgs(argv)
+  } catch (error) {
+    if (!(error instanceof RelayCommandError)) throw error
+    process.stderr.write(`${error.message === "help" ? "" : `${error.message}\n\n`}${relayUsage()}`)
+    process.exitCode = error.message === "help" ? 0 : 1
+    return
+  }
+  let stored: Awaited<ReturnType<typeof loadRelayTokens>>
+  try {
+    stored = await loadRelayTokens(parsed.dataDirectory)
+  } catch (error) {
+    if (!(error instanceof Error)) throw error
+    process.stderr.write(`${error.message}\n`)
+    process.exitCode = 1
+    return
+  }
+  if (!stored) {
+    process.stderr.write(
+      `No Relay tokens file at ${relayTokensFilePath(parsed.dataDirectory)}; tokens were supplied through ` +
+        `environment variables and are not stored on disk.\n`,
+    )
+    process.exitCode = 1
+    return
+  }
+  if (parsed.json) {
+    process.stdout.write(`${JSON.stringify({ joinToken: stored.joinToken, masterToken: stored.masterToken }, undefined, 2)}\n`)
+    return
+  }
+  process.stdout.write(
+    [
+      `Relay tokens file: ${stored.file}`,
+      `join token:   ${stored.joinToken}`,
+      `master token: ${stored.masterToken}`,
+      "",
+    ].join("\n"),
+  )
+}
+
 export async function relayCommand(argv: string[]) {
   const [action, ...options] = argv
   if (action === "worker" || action === "master") return relayProcessCommand(argv)
+  if (action === "tokens") return relayTokensCommand(options)
   if (action !== "serve") {
     process.stderr.write(relayUsage())
     process.exitCode = action === "--help" || action === "-h" ? 0 : 1
@@ -82,15 +146,21 @@ export async function relayCommand(argv: string[]) {
     process.exitCode = error.message === "help" ? 0 : 1
     return
   }
-  const joinToken = process.env.BOOM_RELAY_JOIN_TOKEN
-  const masterToken = process.env.BOOM_RELAY_MASTER_TOKEN
-  if (!joinToken || !masterToken) {
-    process.stderr.write("Boom Relay requires BOOM_RELAY_JOIN_TOKEN and BOOM_RELAY_MASTER_TOKEN.\n")
+  let tokens: Awaited<ReturnType<typeof resolveRelayTokens>>
+  try {
+    tokens = await resolveRelayTokens(parsed.dataDirectory)
+  } catch (error) {
+    if (!(error instanceof RelayCommandError) && !(error instanceof Error)) throw error
+    process.stderr.write(`${error.message}\n`)
     process.exitCode = 1
     return
   }
-  const relay = await startRelayServer({ ...parsed, joinToken, masterToken })
+  const relay = await startRelayServer({ ...parsed, joinToken: tokens.joinToken, masterToken: tokens.masterToken })
   process.stdout.write(`Boom Relay listening on ${relay.url}\n`)
+  if (tokens.source === "generated")
+    process.stdout.write(
+      `Relay tokens generated at ${tokens.file} (mode 0600); run \`boom relay tokens --data <directory>\` to copy them.\n`,
+    )
   let stopping: Promise<void> | undefined
   const stop = (signal: "SIGINT" | "SIGTERM") => {
     stopping ??= relay.close().then(() => { process.exitCode = signal === "SIGINT" ? 130 : 143 })

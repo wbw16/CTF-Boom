@@ -1179,6 +1179,7 @@ code, .mono { font-family: var(--mono); }
   background: var(--panel-solid);
 }
 .competition-card.competition-gateway { grid-column: 1 / -1; }
+.competition-card.competition-distributed { grid-column: 1 / -1; }
 .competition-card-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 17px; }
 .competition-card-head > div { min-width: 0; }
 .competition-card-head h3 { margin: 0; color: var(--ink); font-size: 14px; font-weight: 650; }
@@ -1199,6 +1200,7 @@ code, .mono { font-family: var(--mono); }
 .competition-field > span { display: block; margin-bottom: 6px; color: var(--ink-48); font-size: 12px; }
 .competition-field .input { width: 100%; }
 .competition-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.competition-form-grid .competition-field.full { grid-column: 1 / -1; }
 .competition-rule, .competition-note {
   display: flex; align-items: flex-start; gap: 6px; margin: 12px 0 0; color: var(--ink-48); font-size: 11.5px; line-height: 1.5;
 }
@@ -1213,6 +1215,14 @@ code, .mono { font-family: var(--mono); }
 .competition-actions .btn { padding: 7px 13px; font-size: 13px; }
 .competition-actions .btn-ghost { padding-inline: 8px; }
 .competition-footnote { margin: 11px 0 0; color: var(--ink-48); font-size: 11.5px; line-height: 1.5; }
+.competition-role-switch { display: flex; gap: 8px; margin: -2px 0 14px; }
+.competition-distributed .competition-field + .competition-field { margin-top: 12px; }
+.distributed-live { display: grid; gap: 11px; }
+.distributed-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.distributed-metrics div { padding: 9px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--panel); }
+.distributed-metrics dt { color: var(--ink-48); font-size: 11px; }
+.distributed-metrics dd { margin: 3px 0 0; color: var(--ink); font: 700 16px var(--mono); }
+.competition-rule.distributed-error { background: var(--red-tint); color: var(--red-fg); }
 
 /* ── 西湖论剑 announcements ───────────────── */
 .notice-layout { display: grid; grid-template-columns: minmax(225px, 35%) minmax(0, 1fr); width: 100%; min-height: 0; }
@@ -1498,6 +1508,8 @@ code, .mono { font-family: var(--mono); }
   .competition-metrics { gap: 10px; }
   .competition-metrics dd { font-size: 14px; }
   .competition-form-grid { grid-template-columns: 1fr; }
+  .competition-form-grid .competition-field.full { grid-column: auto; }
+  .distributed-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 400px) {
   .provider-nav .provider-list { grid-template-columns: 1fr; }
