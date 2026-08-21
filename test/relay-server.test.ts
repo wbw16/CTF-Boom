@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
 import { createHash } from "node:crypto"
 import { mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { startRelayServer, type RunningRelayServer } from "../src/relay/server.ts"
+import { RelayStore } from "../src/relay/store.ts"
 
 const roots: string[] = []
 const relays: RunningRelayServer[] = []
@@ -279,4 +281,75 @@ test("remote result delivery, master online assignment, deduplicated flags, and 
     method: "POST", token: masterWorkerToken, body: { assignmentId: writeupAssignment, bundleSha256: writeupBundle },
   })
   expect(repeatedWriteup.body.idempotent).toBe(true)
+})
+
+test("a device may register and poll with far more than five slots", async () => {
+  const running = await relay()
+  const bundle = await upload(running, MASTER_TOKEN, "wide worker source")
+  for (let index = 0; index < 12; index++) {
+    await publish(running, `wide-${index}`, {
+      slug: `wide-${index}`, kind: "offline", phase: "offline", revision: 1, bundleSha256: bundle,
+    })
+  }
+  const token = await enroll(running, "wide-worker", "worker", 32)
+  const polled = await request<{
+    device: { maxSlots: number }
+    assignments: Array<{ id: string }>
+  }>(running, "/v1/worker/poll", {
+    method: "POST", token, body: { freeSlots: 32, activeAssignmentIds: [] },
+  })
+  expect(polled.response.status).toBe(200)
+  expect(polled.body.device.maxSlots).toBe(32)
+  expect(polled.body.assignments).toHaveLength(12)
+})
+
+test("a database created with the legacy five-slot cap is migrated on open", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-relay-migrate-"))
+  roots.push(root)
+  const legacy = new Database(path.join(root, "relay.sqlite"))
+  legacy.exec(`
+    CREATE TABLE devices (
+      id TEXT PRIMARY KEY,
+      role TEXT NOT NULL CHECK (role IN ('worker', 'master-worker')),
+      name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      max_slots INTEGER NOT NULL CHECK (max_slots BETWEEN 1 AND 5),
+      last_seen_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO devices (id, role, name, token_hash, max_slots, last_seen_at, created_at)
+      VALUES ('legacy-device', 'worker', 'legacy', 'legacy-hash', 4, 0, 0);
+    CREATE TABLE assignments (
+      id TEXT PRIMARY KEY,
+      challenge_id TEXT NOT NULL,
+      device_id TEXT NOT NULL REFERENCES devices(id),
+      revision INTEGER NOT NULL,
+      phase TEXT NOT NULL CHECK (phase IN ('offline', 'online', 'writeup')),
+      status TEXT NOT NULL CHECK (status IN ('active', 'finished', 'expired', 'superseded')),
+      lease_until INTEGER,
+      created_at INTEGER NOT NULL,
+      finished_at INTEGER
+    );
+    INSERT INTO assignments (id, challenge_id, device_id, revision, phase, status, created_at)
+      VALUES ('legacy-assignment', 'legacy-challenge', 'legacy-device', 1, 'offline', 'active', 0);
+  `)
+  legacy.close()
+
+  const store = await RelayStore.open(root)
+  const wide = store.registerDevice({ id: "wide", name: "wide", role: "worker", maxSlots: 32, tokenHash: "wide-hash" })
+  expect(wide.device.maxSlots).toBe(32)
+  expect(store.authenticateDevice("legacy-hash")?.maxSlots).toBe(4)
+  store.close()
+
+  const probe = new Database(path.join(root, "relay.sqlite"))
+  expect(probe.query("PRAGMA foreign_key_check").all()).toEqual([])
+  const assignment = probe.query("SELECT device_id FROM assignments WHERE id = 'legacy-assignment'").get() as { device_id: string } | null
+  expect(assignment?.device_id).toBe("legacy-device")
+  probe.close()
+
+  const reopened = await RelayStore.open(root)
+  const again = reopened.registerDevice({ id: "wide", name: "wide", role: "worker", maxSlots: 32, tokenHash: "wide-hash" })
+  expect(again.created).toBe(false)
+  expect(again.device.maxSlots).toBe(32)
+  reopened.close()
 })

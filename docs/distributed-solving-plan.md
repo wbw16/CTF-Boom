@@ -59,7 +59,7 @@ Relay 可以偶尔晚分配或重新投递同一任务；这比丢失任务或 f
 - 普通 worker：只领取 offline 阶段。
 - master-worker：优先领取 online 阶段；没有 ready online 题时可以领取 offline 题作为兜底。
 
-每台 worker 默认最多并行 5 个任务。主机 worker 可以设置为 1 到 2 个槽位，避免拖慢 connector。
+每台 worker 默认 5 个并行槽位，注册时可按需调高并发（Relay 不再设 5 的上限）。主机 worker 可以设置为 1 到 2 个槽位，避免拖慢 connector。
 
 ## 4. 题目和任务状态
 
@@ -289,7 +289,7 @@ src/relay/master.ts
 
 ## 14. 验收标准
 
-1. 一台主机加两台从机能自动领取不同 offline 题，每台不超过 5 槽。
+1. 一台主机加两台从机能自动领取不同 offline 题，每台默认 5 槽、注册时可按需调高。
 2. master-worker 优先领取 online 题，线上环境同时不超过 3 个。
 3. remote 题可完成“从机离线分析 -> 成果包 -> 主机在线联调 -> flag 提交”。
 4. 新从机加入后自动领取未分配题目，不抢已运行任务。
@@ -317,7 +317,7 @@ src/relay/master.ts
 
 | # | 标准 | 覆盖测试 |
 |---|------|----------|
-| 1 | 主机加两台从机自动领取不同 offline 题，各不超过 5 槽 | relay-distributed：master plus two local worker endpoints |
+| 1 | 主机加两台从机自动领取不同 offline 题，各按注册槽位领取 | relay-distributed：master plus two local worker endpoints |
 | 2 | master-worker 优先 online，线上环境同时不超过 3 个 | relay-faults：master provisions at most three environments |
 | 3 | remote 两阶段闭环（从机离线 -> 成果包 -> 主机在线 -> flag） | relay-server：remote result delivery ... survive retries |
 | 4 | 新从机自动领取未分配题，不抢已运行任务 | relay-server：poll renews ... / expired lease ...；relay-faults：Relay restart |

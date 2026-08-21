@@ -5,7 +5,8 @@
 
 export const RELAY_API_PREFIX = "/v1"
 export const DEFAULT_LEASE_MS = 10 * 60_000
-export const DEFAULT_MAX_SLOTS = 5
+export const DEFAULT_DEVICE_SLOTS = 5
+export const MAX_DEVICE_SLOTS = Number.MAX_SAFE_INTEGER
 export const MAX_BUNDLE_BYTES = 512 * 1024 * 1024
 export const MAX_JSON_BYTES = 1 * 1024 * 1024
 export const MAX_FLAG_LENGTH = 4_096
@@ -183,8 +184,13 @@ export function asEpoch(value: unknown, field: string) {
 }
 
 export function asPositiveInteger(value: unknown, field: string, maximum: number) {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > maximum)
-    throw new Error(`${field} must be an integer from 1 to ${maximum}`)
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new Error(
+      maximum === Number.MAX_SAFE_INTEGER
+        ? `${field} must be a positive safe integer`
+        : `${field} must be an integer from 1 to ${maximum}`,
+    )
+  }
   return value
 }
 

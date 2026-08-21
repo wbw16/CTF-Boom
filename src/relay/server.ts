@@ -15,6 +15,7 @@ import {
   isRelayId,
   isSha256,
   MAX_BUNDLE_BYTES,
+  MAX_DEVICE_SLOTS,
   MAX_FLAG_LENGTH,
   MAX_JSON_BYTES,
   type FlagStatus,
@@ -132,7 +133,7 @@ function parseRegister(body: Record<string, unknown>) {
   let maxSlots: number | undefined
   if (body.maxSlots !== undefined) {
     try {
-      maxSlots = asPositiveInteger(body.maxSlots, "maxSlots", 5)
+      maxSlots = asPositiveInteger(body.maxSlots, "maxSlots", MAX_DEVICE_SLOTS)
     } catch (error) {
       fail(400, error instanceof Error ? error.message : "maxSlots is invalid")
     }
@@ -185,8 +186,8 @@ function parsePublish(id: string, body: Record<string, unknown>): PublishChallen
 }
 
 function parsePoll(body: Record<string, unknown>) {
-  if (typeof body.freeSlots !== "number" || !Number.isSafeInteger(body.freeSlots) || body.freeSlots < 0 || body.freeSlots > 5)
-    fail(400, "freeSlots must be an integer from 0 to 5")
+  if (typeof body.freeSlots !== "number" || !Number.isSafeInteger(body.freeSlots) || body.freeSlots < 0 || body.freeSlots > MAX_DEVICE_SLOTS)
+    fail(400, "freeSlots must be a non-negative safe integer")
   if (body.activeAssignmentIds === undefined) return { freeSlots: body.freeSlots, activeAssignmentIds: [] as string[] }
   if (!Array.isArray(body.activeAssignmentIds) || body.activeAssignmentIds.length > 64)
     fail(400, "activeAssignmentIds must contain at most 64 IDs")

@@ -367,7 +367,7 @@ export function CompetitionDialog() {
               <div className="competition-form-grid">
                 <label className="competition-field full"><span>Relay 服务地址</span><input className="input mono" type="url" value={relayURL} onChange={(event) => setRelayURL(event.target.value)} placeholder="https://relay.example.com" autoComplete="url" spellCheck={false} /></label>
                 <label className="competition-field"><span>设备名称（可选）</span><input className="input" value={deviceName} onChange={(event) => setDeviceName(event.target.value)} placeholder="MacBook-worker-1" autoComplete="off" /></label>
-                <label className="competition-field"><span>本机解题并发</span><input className="input" type="number" min={1} max={5} value={workerSlots} onChange={(event) => setWorkerSlots(Number(event.target.value) || 1)} /></label>
+                <label className="competition-field"><span>本机解题并发</span><input className="input" type="number" min={1} value={workerSlots} onChange={(event) => setWorkerSlots(Number(event.target.value) || 1)} /></label>
               </div>
               <label className="competition-field"><span>比赛加入令牌</span><input className="input mono" type="password" value={joinToken} onChange={(event) => setJoinToken(event.target.value)} placeholder="由主机安全分享；仅用于换取本机设备令牌" autoComplete="off" spellCheck={false} /></label>
               {distributedRole === "master" && <>

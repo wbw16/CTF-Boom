@@ -6,7 +6,7 @@ import { RelayClient } from "./client.ts"
 import { loadRelayConfig, saveRelayConfig, type RelayLocalConfig } from "./config.ts"
 import { RelayMaster } from "./master.ts"
 import type { MasterState, WorkerPollResponse } from "./protocol.ts"
-import { isRelayId } from "./protocol.ts"
+import { isRelayId, MAX_DEVICE_SLOTS } from "./protocol.ts"
 import { RelayWorker } from "./worker.ts"
 
 export type DistributedRole = "inactive" | "master" | "worker"
@@ -88,8 +88,8 @@ function deviceName(value?: string) {
 }
 
 function slots(value: number) {
-  if (!Number.isSafeInteger(value) || value < 1 || value > 5)
-    throw new Error("设备并发必须是 1–5 的整数")
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_DEVICE_SLOTS)
+    throw new Error("设备并发必须是正整数")
   return value
 }
 

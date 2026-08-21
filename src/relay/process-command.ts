@@ -2,6 +2,7 @@ import path from "node:path"
 import { loadRelayConfig, relayConfigPath, saveRelayConfig, type RelayLocalConfig } from "./config.ts"
 import { RelayClient } from "./client.ts"
 import { RelayMaster } from "./master.ts"
+import { DEFAULT_DEVICE_SLOTS, MAX_DEVICE_SLOTS } from "./protocol.ts"
 import { createRelayWorkerFromConfig } from "./worker.ts"
 
 function option(argv: string[], name: string) {
@@ -22,8 +23,13 @@ function numberOption(argv: string[], name: string, fallback: number, minimum: n
   const value = option(argv, name)
   if (value === undefined) return fallback
   const parsed = Number(value)
-  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum)
-    throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`)
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(
+      maximum === Number.MAX_SAFE_INTEGER
+        ? `${name} must be a positive integer`
+        : `${name} must be an integer from ${minimum} to ${maximum}`,
+    )
+  }
   return parsed
 }
 
@@ -49,7 +55,7 @@ async function workerRegister(argv: string[]) {
   const root = path.resolve(requireOption(argv, "--root"))
   const role = option(argv, "--role") as "worker" | "master-worker" | undefined
   if (role !== undefined && role !== "worker" && role !== "master-worker") throw new Error("--role must be worker or master-worker")
-  const maxSlots = numberOption(argv, "--slots", 5, 1, 5)
+  const maxSlots = numberOption(argv, "--slots", DEFAULT_DEVICE_SLOTS, 1, MAX_DEVICE_SLOTS)
   const model = option(argv, "--model") ?? "free/deepseek-v4-flash-free"
   const pollMs = numberOption(argv, "--poll-ms", 15_000, 1_000, 300_000)
   const registered = await RelayClient.register({ url, joinToken, id, name, role: role ?? "worker", maxSlots })

@@ -3,7 +3,8 @@ import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import {
   DEFAULT_LEASE_MS,
-  DEFAULT_MAX_SLOTS,
+  DEFAULT_DEVICE_SLOTS,
+  MAX_DEVICE_SLOTS,
   iso,
   type Assignment,
   type AssignmentPhase,
@@ -139,6 +140,23 @@ function uniqueID() {
   return crypto.randomUUID()
 }
 
+function devicesTableDDL(name: string) {
+  return `CREATE TABLE ${name} (
+    id TEXT PRIMARY KEY,
+    role TEXT NOT NULL CHECK (role IN ('worker', 'master-worker')),
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    max_slots INTEGER NOT NULL CHECK (max_slots BETWEEN 1 AND ${MAX_DEVICE_SLOTS}),
+    last_seen_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  )`
+}
+
+function deviceSlotsUpperBound(sql: string) {
+  const match = /max_slots\s+INTEGER\s+NOT\s+NULL\s+CHECK\s*\(\s*max_slots\s+BETWEEN\s+1\s+AND\s+(\d+)\s*\)/i.exec(sql)
+  return match ? Number(match[1]) : undefined
+}
+
 /**
  * SQLite owns every state transition that can otherwise race between polling workers.  All methods
  * are synchronous internally so a BEGIN IMMEDIATE transaction cannot yield half an assignment.
@@ -172,16 +190,13 @@ export class RelayStore {
   }
 
   #migrate() {
+    const existing = this.#get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'devices'")
+    if (existing) {
+      if (deviceSlotsUpperBound(existing.sql) !== MAX_DEVICE_SLOTS) this.#rebuildDevicesTable()
+    } else {
+      this.#db.exec(devicesTableDDL("devices"))
+    }
     this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS devices (
-        id TEXT PRIMARY KEY,
-        role TEXT NOT NULL CHECK (role IN ('worker', 'master-worker')),
-        name TEXT NOT NULL,
-        token_hash TEXT NOT NULL UNIQUE,
-        max_slots INTEGER NOT NULL CHECK (max_slots BETWEEN 1 AND ${DEFAULT_MAX_SLOTS}),
-        last_seen_at INTEGER NOT NULL,
-        created_at INTEGER NOT NULL
-      );
       CREATE TABLE IF NOT EXISTS challenges (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL UNIQUE,
@@ -240,6 +255,28 @@ export class RelayStore {
         created_at INTEGER NOT NULL
       );
     `)
+  }
+
+  #rebuildDevicesTable() {
+    this.#db.exec("PRAGMA foreign_keys = OFF")
+    try {
+      this.#db.exec(`
+        BEGIN IMMEDIATE;
+        ${devicesTableDDL("devices_next")};
+        INSERT INTO devices_next (id, role, name, token_hash, max_slots, last_seen_at, created_at)
+          SELECT id, role, name, token_hash, max_slots, last_seen_at, created_at FROM devices;
+        DROP TABLE devices;
+        ALTER TABLE devices_next RENAME TO devices;
+        COMMIT;
+      `)
+    } catch (error) {
+      try {
+        this.#db.exec("ROLLBACK")
+      } catch {}
+      throw error
+    } finally {
+      this.#db.exec("PRAGMA foreign_keys = ON")
+    }
   }
 
   #transaction<T>(work: () => T): T {
@@ -420,7 +457,7 @@ export class RelayStore {
 
   registerDevice(input: { id: string; name: string; role: DeviceRole; maxSlots?: number; tokenHash: string }) {
     const now = this.#now()
-    const maxSlots = input.maxSlots ?? DEFAULT_MAX_SLOTS
+    const maxSlots = input.maxSlots ?? DEFAULT_DEVICE_SLOTS
     return this.#transaction(() => {
       const existing = this.#deviceByID(input.id)
       if (existing) {
