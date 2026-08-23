@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
+  inferChallengeCategory,
   innerFlagValue,
   selectEndpoint,
   XihulunjianPlatformAdapter,
@@ -399,7 +400,228 @@ test("prefers a proxied endpoint and records the full connection matrix", () => 
   }])
   expect(endpoint?.remote).toBe("1.2.3.4:30080")
   // Extra ports and credentials stay available to the solver through the README.
-  expect(endpoint?.detail).toContain("账号：root / 密码：password")
+  expect(endpoint?.detail).toContain("Account: root / password: password")
   expect(endpoint?.detail).toContain("80, 22")
   expect(selectEndpoint([])).toBeUndefined()
+})
+
+test("derives categories from attachment filenames for anonymized challenge names", () => {
+  // The REAL batch publishes anonymized names; the attachment is the only signal.
+  expect(inferChallengeCategory("REAL-01", "REAL", ["joomla-6.1.2-full-package.tar.gz.zip"])).toBe("WEB")
+  expect(inferChallengeCategory("REAL-02", "REAL", ["wordpress-7.0.4.tar.gz.zip"])).toBe("WEB")
+  expect(inferChallengeCategory("REAL-11", "REAL", ["01_nginx_1.31.4-source.zip"])).toBe("PWN")
+  expect(inferChallengeCategory("REAL-17", "REAL", ["07_postgresql_18.4-source.zip"])).toBe("PWN")
+  // No signal at all stays OTHER instead of guessing.
+  expect(inferChallengeCategory("REAL-01", "REAL")).toBe("OTHER")
+  expect(inferChallengeCategory("REAL-01", "REAL", [])).toBe("OTHER")
+  expect(inferChallengeCategory("Rank-U", "REAL")).toBe("OTHER")
+  // The challenge name outranks the attachment; a real platform category outranks both.
+  expect(inferChallengeCategory("easy_rsa", "REAL", ["joomla-6.1.2-full-package.tar.gz.zip"])).toBe("CRYPTO")
+  expect(inferChallengeCategory("whatever", "Pwn", ["nginx-source.zip"])).toBe("PWN")
+  expect(inferChallengeCategory("PWN-01", "REAL", ["joomla.zip"])).toBe("PWN")
+})
+
+/**
+ * A released-batch fixture: the group is a batch label, the names are anonymized, and only the
+ * attachment reveals the challenge's nature.
+ */
+const REAL_LIST = (solved = false) => [{
+  id: 3200,
+  name: "REAL",
+  corpus: [{ id: 10701, name: "REAL-01", isOpen: true, hasSolved: solved }],
+}]
+
+function realDetail() {
+  return {
+    id: 10701,
+    name: "REAL-01",
+    description: "REAL-01",
+    score: "300.0",
+    difficulty: "EASY",
+    attachment: {
+      url: "https://pro-resource.example.com/oss/joomla.zip",
+      name: "joomla-6.1.2-full-package.tar.gz.zip",
+      extension: "zip",
+    },
+    endpoints: [],
+    endpointType: "monopoly",
+    isNeedInit: true,
+    isNeedCheck: false,
+  }
+}
+
+test("re-syncs unchanged challenges without detail calls or re-downloads", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-incremental-"))
+  roots.push(root)
+  let detailCalls = 0
+  let downloads = 0
+  let solved = false
+  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST(solved))
+    if (url.pathname === `${PREFIX}/ctf/exercise`) {
+      detailCalls += 1
+      return envelope(realDetail())
+    }
+    if (url.hostname === "pro-resource.example.com") {
+      downloads += 1
+      return new Response(new Uint8Array([1, 2, 3]))
+    }
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  const first = await adapter.acquireChallenges({ root })
+  expect(first.map((item) => item.slug)).toEqual(["REAL-01"])
+  expect(first[0]!.category).toBe("WEB")
+  expect(detailCalls).toBe(1)
+  expect(downloads).toBe(1)
+
+  // An unchanged challenge must cost nothing on the next cycle: the platform rate-limits detail
+  // reads hard enough that re-reading the catalog starves flag submission of its request budget.
+  const second = await adapter.acquireChallenges({ root })
+  expect(second.map((item) => item.slug)).toEqual(["REAL-01"])
+  expect(second[0]!.category).toBe("WEB")
+  expect(detailCalls).toBe(1)
+  expect(downloads).toBe(1)
+
+  // A solve recorded on the platform reaches the local meta through the list alone.
+  solved = true
+  const third = await adapter.acquireChallenges({ root })
+  expect(detailCalls).toBe(1)
+  expect(downloads).toBe(1)
+  expect(third[0]!.platform?.options).toMatchObject({ solved: true })
+  const meta = JSON.parse(await readFile(path.join(root, "challenges", "WEB", "REAL-01", "meta.json"), "utf8"))
+  expect(meta.platform.options).toMatchObject({ solved: true })
+})
+
+test("re-downloads when a recorded attachment has gone missing", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-resume-"))
+  roots.push(root)
+  let detailCalls = 0
+  let downloads = 0
+  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
+    if (url.pathname === `${PREFIX}/ctf/exercise`) {
+      detailCalls += 1
+      return envelope(realDetail())
+    }
+    if (url.hostname === "pro-resource.example.com") {
+      downloads += 1
+      return new Response(new Uint8Array([1, 2, 3]))
+    }
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  await adapter.acquireChallenges({ root })
+  // Simulate an interrupted sync: the manifest names a file that is no longer on disk.
+  await unlink(path.join(root, "challenges", "WEB", "REAL-01", "files", "joomla-6.1.2-full-package.tar.gz.zip"))
+
+  const restored = await adapter.acquireChallenges({ root })
+  expect(restored.map((item) => item.slug)).toEqual(["REAL-01"])
+  expect(detailCalls).toBe(2)
+  expect(downloads).toBe(2)
+  expect(await readFile(path.join(root, "challenges", "WEB", "REAL-01", "files", "joomla-6.1.2-full-package.tar.gz.zip")))
+    .toEqual(Buffer.from([1, 2, 3]))
+})
+
+test("migrates a legacy local copy once, then re-classifies and de-duplicates it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-legacy-"))
+  roots.push(root)
+  let detailCalls = 0
+  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
+    if (url.pathname === `${PREFIX}/ctf/exercise`) {
+      detailCalls += 1
+      return envelope(realDetail())
+    }
+    if (url.hostname === "pro-resource.example.com") return new Response(new Uint8Array([9]))
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  // Pre-fix data: a copy under OTHER/ whose meta predates the attachment manifest.
+  const legacy = path.join(root, "challenges", "OTHER", "REAL-01")
+  await mkdir(path.join(legacy, "files"), { recursive: true })
+  await writeFile(path.join(legacy, "README.md"), "# REAL-01\n")
+  await writeFile(path.join(legacy, "meta.json"), `${JSON.stringify({
+    category: "OTHER",
+    platform: { adapter: "xihulunjian", challenge_id: "10701", options: { exercise_id: "10701" } },
+  }, undefined, 2)}\n`)
+
+  const migrated = await adapter.acquireChallenges({ root })
+  expect(migrated.map((item) => item.slug)).toEqual(["REAL-01"])
+  expect(migrated[0]!.category).toBe("WEB")
+  expect(detailCalls).toBe(1)
+  expect(await readdir(path.join(root, "challenges"))).toEqual(["WEB"])
+  const meta = JSON.parse(await readFile(path.join(root, "challenges", "WEB", "REAL-01", "meta.json"), "utf8"))
+  expect(meta.platform.options).toMatchObject({ attachments: ["joomla-6.1.2-full-package.tar.gz.zip"] })
+
+  // The migrated copy is complete now, so the next cycle is again free.
+  await adapter.acquireChallenges({ root })
+  expect(detailCalls).toBe(1)
+})
+
+test("moves a misfiled complete copy to the attachment-derived category without re-fetching", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-move-"))
+  roots.push(root)
+  let detailCalls = 0
+  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
+    detailCalls += 1
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  // A complete copy with a manifest, but filed under the pre-fix OTHER category.
+  const legacy = path.join(root, "challenges", "OTHER", "REAL-01")
+  await mkdir(path.join(legacy, "files"), { recursive: true })
+  await writeFile(path.join(legacy, "files", "joomla-6.1.2-full-package.tar.gz.zip"), "payload")
+  await writeFile(path.join(legacy, "README.md"), "# REAL-01\n")
+  await writeFile(path.join(legacy, "meta.json"), `${JSON.stringify({
+    category: "OTHER",
+    platform: {
+      adapter: "xihulunjian",
+      challenge_id: "10701",
+      options: { exercise_id: "10701", attachments: ["joomla-6.1.2-full-package.tar.gz.zip"] },
+    },
+  }, undefined, 2)}\n`)
+
+  const moved = await adapter.acquireChallenges({ root })
+  expect(detailCalls).toBe(0)
+  expect(moved.map((item) => item.slug)).toEqual(["REAL-01"])
+  expect(moved[0]!.category).toBe("WEB")
+  expect(await readdir(path.join(root, "challenges"))).toEqual(["WEB"])
+  const meta = JSON.parse(await readFile(path.join(root, "challenges", "WEB", "REAL-01", "meta.json"), "utf8"))
+  expect(meta.category).toBe("WEB")
+  // The attachment itself is preserved byte-for-byte by the move.
+  expect(await readFile(path.join(root, "challenges", "WEB", "REAL-01", "files", "joomla-6.1.2-full-package.tar.gz.zip"), "utf8"))
+    .toBe("payload")
+})
+
+test("revalidate forces a full re-pull of an unchanged challenge", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-revalidate-"))
+  roots.push(root)
+  let detailCalls = 0
+  let downloads = 0
+  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
+    if (url.pathname === `${PREFIX}/ctf/exercise`) {
+      detailCalls += 1
+      return envelope(realDetail())
+    }
+    if (url.hostname === "pro-resource.example.com") {
+      downloads += 1
+      return new Response(new Uint8Array([1, 2, 3]))
+    }
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  await adapter.acquireChallenges({ root })
+  expect(detailCalls).toBe(1)
+  expect(downloads).toBe(1)
+  await adapter.acquireChallenges({ root, revalidate: true })
+  expect(detailCalls).toBe(2)
+  expect(downloads).toBe(2)
 })

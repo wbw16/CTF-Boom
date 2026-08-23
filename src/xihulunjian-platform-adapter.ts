@@ -1,6 +1,11 @@
-import { lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, readdir, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
-import { loadChallenge, normalizeChallengeCategory, type Challenge } from "./challenge.ts"
+import {
+  loadChallenge,
+  recognizedChallengeCategory,
+  type Challenge,
+  type ChallengeCategory,
+} from "./challenge.ts"
 import type { Workspace } from "./workspace.ts"
 import { XIHULUNJIAN_DEFAULT_SERVER_HOST } from "./xihulunjian-config.ts"
 
@@ -336,6 +341,89 @@ function isIncorrectFlagResponse(endpoint: string, message: string) {
     && /(?:flag|答案).*(?:错误|不正确|incorrect)|(?:错误|不正确|incorrect).*(?:flag|答案)/i.test(message)
 }
 
+/**
+ * The platform's exercise list is grouped by batch labels ("测试题", "REAL", "批次一") rather than
+ * by real CTF categories, and the detail payload has no category field at all.  The challenge NAME
+ * is the primary signal ("PWN-01", "WEB-02", "easy_rsa", "逆向题"...); anonymized batches
+ * ("REAL-01"...) carry their real nature only in the ATTACHMENT filename
+ * ("joomla-6.1.2-full-package.tar.gz.zip", "01_nginx_1.31.4-source.zip"), which is scanned as a
+ * secondary signal.  A recognized platform category still wins when present.
+ */
+const NAME_CATEGORY_RULES: Array<{ category: ChallengeCategory; keywords: string[] }> = [
+  { category: "BLOCKCHAIN", keywords: ["blockchain", "web3", "solidity", "区块链", "合约", "智能合约"] },
+  { category: "FORENSICS", keywords: ["forensic", "dfir", "pcap", "wireshark", "取证", "内存取证", "流量"] },
+  { category: "MOBILE", keywords: ["mobile", "android", "apk", "ios", "ipa", "安卓", "手机"] },
+  { category: "PWN", keywords: ["pwn", "pwnable", "rop", "shellcode", "heap", "stack", "溢出", "栈溢出", "堆利用", "二进制"] },
+  { category: "REVERSE", keywords: ["reverse", "reversing", "crackme", "keygen", "unpack", "vmprotect", "re", "逆向", "反编译", "脱壳"] },
+  { category: "CRYPTO", keywords: ["crypto", "cryptography", "rsa", "aes", "des", "ecc", "密码学", "加密", "解密", "椭圆曲线"] },
+  { category: "WEB", keywords: ["web", "website", "webapp", "xss", "csrf", "ssrf", "sqli", "注入", "网站", "网页", "反序列化"] },
+  { category: "AI", keywords: ["ai", "ml", "llm", "prompt", "adversarial", "机器学习", "深度学习", "模型", "神经网络", "大模型", "对抗"] },
+  { category: "HARDWARE", keywords: ["hardware", "iot", "firmware", "硬件", "单片机", "嵌入式", "固件", "电路"] },
+  { category: "OSINT", keywords: ["osint", "社工", "情报"] },
+  { category: "MISC", keywords: ["misc", "steg", "steganography", "signin", "welcome", "隐写", "杂项", "签到"] },
+  // Real-world software audit batches: the attachment IS the challenge.  Scripted CMS/framework
+  // stacks are web vulnerability hunts; native servers and data stores are memory-safety hunts on
+  // C/C++ source, which is PWN work (the REVERSE/PWN prompt tier, not the web tier).
+  {
+    category: "WEB",
+    keywords: ["joomla", "wordpress", "drupal", "ghost", "cmsms", "php", "thinkphp", "laravel", "discuz", "spring", "struts", "tomcat", "shiro", "django", "flask", "rails"],
+  },
+  {
+    category: "PWN",
+    keywords: ["nginx", "httpd", "openlitespeed", "litespeed", "caddy", "openresty", "redis", "memcached", "mysql", "mariadb", "postgres", "postgresql", "clickhouse", "sqlite", "openssl", "ffmpeg", "imagemagick", "libpng", "zlib"],
+  },
+]
+
+/**
+ * Precompiled keyword matchers.  ASCII keywords must sit on token boundaries: match "PWN-01"/
+ * "easy_pwn" but not "pwnme", and "ios" but not the tail of "various".  CJK keywords use plain
+ * substring inclusion because CJK text has no token separators.
+ */
+const CATEGORY_MATCHERS: Array<{ category: ChallengeCategory; tests: Array<{ re: RegExp; substring: boolean; keyword: string }> }> =
+  NAME_CATEGORY_RULES.map((rule) => ({
+    category: rule.category,
+    tests: rule.keywords.map((keyword) => {
+      const ascii = /^[\x20-\x7e]+$/.test(keyword)
+      return {
+        keyword,
+        substring: !ascii,
+        re: ascii ? new RegExp(`(?:^|[\\W_])${keyword}(?=$|[\\W_])`) : new RegExp(keyword),
+      }
+    }),
+  }))
+
+function keywordMatches(test: { re: RegExp; substring: boolean; keyword: string }, normalized: string) {
+  return test.substring ? normalized.includes(test.keyword) : test.re.test(normalized)
+}
+
+function categoryFromKeywords(source: string): ChallengeCategory {
+  if (!source.trim()) return "OTHER"
+  const normalized = source.normalize("NFKC").toLowerCase()
+  for (const rule of CATEGORY_MATCHERS)
+    for (const test of rule.tests) if (keywordMatches(test, normalized)) return rule.category
+  return "OTHER"
+}
+
+/**
+ * Derive a challenge's folder category.  Signal precedence: a recognized platform category, then
+ * the challenge name, then attachment filenames (the only signal for anonymized batches).
+ */
+export function inferChallengeCategory(
+  name: string,
+  platformCategory?: unknown,
+  attachments?: string[],
+): ChallengeCategory {
+  const known = recognizedChallengeCategory(platformCategory)
+  if (known && known !== "OTHER") return known
+  const byName = categoryFromKeywords(name)
+  if (byName !== "OTHER") return byName
+  for (const attachment of attachments ?? []) {
+    const byAttachment = categoryFromKeywords(attachment)
+    if (byAttachment !== "OTHER") return byAttachment
+  }
+  return "OTHER"
+}
+
 export class XihulunjianPlatformAdapter {
   readonly id = XIHULUNJIAN_ADAPTER_ID
   readonly name = "西湖论剑"
@@ -592,6 +680,136 @@ export class XihulunjianPlatformAdapter {
       throw new Error(`拒绝覆盖不属于 ${this.id} 的题目目录: ${directory}`)
   }
 
+  /** One local copy of a challenge, as discovered by {@link scanExisting}. */
+  private async scanExisting(base: string) {
+    const index = new Map<string, Array<{ directory: string; category: ChallengeCategory; meta: JsonObject }>>()
+    const top = await readdir(base, { withFileTypes: true }).catch(() => [])
+    for (const entry of top) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue
+      const category = recognizedChallengeCategory(entry.name)
+      if (category) {
+        // Current layout: challenges/<CATEGORY>/<slug>/.
+        const nested = await readdir(path.join(base, entry.name), { withFileTypes: true }).catch(() => [])
+        for (const child of nested) {
+          if (!child.isDirectory() || child.name.startsWith(".")) continue
+          await this.indexOwned(index, path.join(base, entry.name, child.name), category)
+        }
+      } else {
+        // Legacy layout: a challenge directory sitting directly under challenges/.
+        await this.indexOwned(index, path.join(base, entry.name), "OTHER")
+      }
+    }
+    return index
+  }
+
+  private async indexOwned(
+    index: Map<string, Array<{ directory: string; category: ChallengeCategory; meta: JsonObject }>>,
+    directory: string,
+    category: ChallengeCategory,
+  ) {
+    const meta = await readFile(path.join(directory, "meta.json"), "utf8")
+      .then((raw) => JSON.parse(raw) as JsonObject)
+      .catch(() => undefined)
+    const owner = object(object(meta)?.platform)
+    if (owner?.adapter !== this.id) return
+    const challengeID = String(owner.challenge_id ?? "")
+    if (!challengeID) return
+    const copies = index.get(challengeID) ?? []
+    copies.push({ directory, category, meta: meta ?? {} })
+    index.set(challengeID, copies)
+  }
+
+  private async rewriteMeta(directory: string, mutate: (meta: JsonObject) => void) {
+    const target = path.join(directory, "meta.json")
+    const meta = object(await readFile(target, "utf8").then((raw) => JSON.parse(raw) as JsonObject).catch(() => undefined))
+    if (!meta) return
+    mutate(meta)
+    await this.atomicWrite(target, `${JSON.stringify(meta, undefined, 2)}\n`)
+  }
+
+  /** Drop a category directory that has just become empty, so the GUI shows no ghost category. */
+  private async pruneCategoryIfEmpty(base: string, directory: string) {
+    const parent = path.dirname(directory)
+    if (path.resolve(parent) === path.resolve(base)) return
+    await rmdir(parent).catch(() => {})
+  }
+
+  private async localAttachmentNames(directory: string) {
+    const entries = await readdir(path.join(directory, "files"), { withFileTypes: true }).catch(() => [])
+    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name)
+  }
+
+  /**
+   * Reconcile an already-materialized challenge against the current catalog entry using local data
+   * only: no platform detail call, no attachment download.  Returns the challenge, or undefined
+   * when the local copy is unusable and the caller must re-materialize it from the platform.
+   *
+   * This is what keeps periodic re-syncs cheap: the platform rate-limits detail reads (three
+   * back-to-back requests trigger 40001) and attachments are large, so an unchanged challenge must
+   * cost nothing but a directory scan.
+   */
+  private async reconcileExisting(input: {
+    base: string
+    item: { challengeID: string; title: string; category?: string; solved?: boolean }
+    copies: Array<{ directory: string; category: ChallengeCategory; meta: JsonObject }>
+  }): Promise<Challenge | undefined> {
+    // Prefer the copy that already sits in the freshly inferred category; otherwise a non-OTHER
+    // one; otherwise the first.
+    const ranked = await Promise.all(input.copies.map(async (copy) => ({
+      copy,
+      inferred: await inferChallengeCategory(
+        path.basename(copy.directory),
+        input.item.category,
+        await this.localAttachmentNames(copy.directory),
+      ),
+    })))
+    const chosen = ranked.find((entry) => entry.copy.category === entry.inferred)
+      ?? ranked.find((entry) => entry.copy.category !== "OTHER")
+      ?? ranked[0]!
+    let canonical = chosen.copy
+    let canonicalCategory = chosen.inferred
+    // A challenge may have several local copies only as debris from a category change; keep one.
+    for (const copy of input.copies)
+      if (path.resolve(copy.directory) !== path.resolve(canonical.directory)) {
+        await rm(copy.directory, { recursive: true, force: true })
+        await this.pruneCategoryIfEmpty(input.base, copy.directory)
+      }
+
+    // The attachment manifest is recorded at materialize time.  A meta without it predates the
+    // incremental sync, so re-materialize once to migrate; a recorded file that has gone missing
+    // means an interrupted download, so re-materialize to restore it.
+    const options = object(object(canonical.meta.platform)?.options)
+    const recorded = Array.isArray(options?.attachments)
+      ? options!.attachments.filter((name): name is string => typeof name === "string")
+      : undefined
+    if (recorded === undefined) return undefined
+    const present = new Set(await this.localAttachmentNames(canonical.directory))
+    if (recorded.some((name) => !present.has(name))) return undefined
+
+    if (canonical.category !== canonicalCategory) {
+      const destination = path.join(input.base, canonicalCategory, path.basename(canonical.directory))
+      const occupied = await lstat(destination).catch(() => undefined)
+      // An occupied destination belongs to a different challenge (slug collision), so the copy
+      // stays where it is with its meta unchanged rather than claiming a category it is not in.
+      if (!occupied) {
+        await mkdir(path.dirname(destination), { recursive: true })
+        await rename(canonical.directory, destination)
+        await this.pruneCategoryIfEmpty(input.base, canonical.directory)
+        canonical = { ...canonical, directory: destination, category: canonicalCategory }
+        await this.rewriteMeta(destination, (meta) => { meta.category = canonicalCategory })
+      }
+    }
+    if (input.item.solved === true && options?.solved !== true)
+      await this.rewriteMeta(canonical.directory, (meta) => {
+        const platform = object(meta.platform)
+        if (!platform) return
+        const target = object(platform.options) ?? {}
+        target.solved = true
+        platform.options = target
+      })
+    return await loadChallenge(canonical.directory, new Map())
+  }
+
   /**
    * Download an attachment. Attachments live on a separate CDN origin, so the AccessKey is never
    * forwarded: it is a platform API credential and must not leak to object storage.
@@ -616,21 +834,44 @@ export class XihulunjianPlatformAdapter {
    * Environments are deliberately NOT started here. Acquisition happens once up front for the whole
    * catalog, while only three environments may exist at a time; starting them at download would burn
    * all three slots on challenges nobody is solving yet and start their expiry clocks.
+   *
+   * A challenge that is already materialized and complete is reconciled from local data alone — no
+   * detail call, no re-download — because the platform rate-limits detail reads hard enough that
+   * re-reading the whole catalog every cycle starves flag submission of its request budget. Pass
+   * `revalidate` to force a full re-pull (broken attachment replaced by the organizers, etc.).
    */
-  async acquireChallenges(input: { root: string; signal?: AbortSignal }): Promise<Challenge[]> {
+  async acquireChallenges(
+    input: { root: string; signal?: AbortSignal; revalidate?: boolean },
+  ): Promise<Challenge[]> {
     const selected = await this.exerciseList(input.signal)
+    const base = path.join(path.resolve(input.root), "challenges")
+    const existing = input.revalidate ? new Map() : await this.scanExisting(base)
 
     const materialized: Challenge[] = []
     const used = new Set<string>()
     for (const item of selected) {
       try {
+        const copies = existing.get(item.challengeID) ?? []
+        if (copies.length > 0) {
+          const reconciled = await this.reconcileExisting({ base, item, copies })
+          if (reconciled) {
+            materialized.push(reconciled)
+            used.add(reconciled.slug)
+            continue
+          }
+        }
+
         const detail = await this.exerciseDetail(item.challengeID, input.signal)
         let slug = this.slug(detail.name || item.title || detail.id)
         if (used.has(slug)) slug = this.slug(`${slug}-${detail.id}`)
         used.add(slug)
 
-        const category = normalizeChallengeCategory(detail.category ?? item.category)
-        const directory = path.join(path.resolve(input.root), "challenges", category, slug)
+        const category = inferChallengeCategory(
+          detail.name || item.title || "",
+          detail.category ?? item.category,
+          detail.attachments.map((attachment) => attachment.name),
+        )
+        const directory = path.join(base, category, slug)
         await this.assertOwned(directory, detail.id)
 
         const names = new Set<string>()
@@ -666,6 +907,9 @@ export class XihulunjianPlatformAdapter {
               challenge_id: detail.id,
               options: {
                 exercise_id: detail.id,
+                // The written attachment manifest lets later syncs verify completeness without a
+                // platform round-trip, and distinguishes "no attachments" from "old meta format".
+                attachments: [...names],
                 ...(detail.solved || item.solved ? { solved: true } : {}),
                 ...(detail.score === undefined ? {} : { score: detail.score }),
                 ...(detail.difficulty ? { difficulty: detail.difficulty } : {}),
@@ -677,6 +921,13 @@ export class XihulunjianPlatformAdapter {
           }, undefined, 2)}\n`,
         )
         materialized.push(await loadChallenge(directory, new Map()))
+        // Debris from an earlier category derivation must not keep a duplicate slug on disk; the
+        // scan has already verified every indexed copy belongs to this challenge.
+        for (const copy of copies)
+          if (path.resolve(copy.directory) !== path.resolve(directory)) {
+            await rm(copy.directory, { recursive: true, force: true })
+            await this.pruneCategoryIfEmpty(base, copy.directory)
+          }
       } catch (error) {
         // A malformed or access-restricted individual challenge must not hide all other challenges
         // in the same release batch. A transport failure is different: propagate it so the outer

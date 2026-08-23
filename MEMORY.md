@@ -616,3 +616,45 @@ bun src/index.ts gui --root ./xihulunjian-ctf
 ```
 
 目录 `xihulunjian-ctf/` 是比赛用的干净目录（只有 `challenges/`）。
+
+## 2026-08-23 xhlj 分支修复：分类器与同步幂等性（`relay-autogen-tokens` 工作区）
+
+赛后复盘发现两个赛时真实发生的 bug，已修复并全部带测试（适配器 18 个用例全过，
+policy/autopilot/challenge/gui-detail 47 个全过，typecheck 干净）。
+
+### Bug 1：REAL 批次 20 道题全部落入 OTHER
+
+平台分组名是批次标签（"REAL"）而非分类；题目名被匿名化（REAL-01..20），名字分类器
+无从下手。但附件文件名暴露了题目本质：joomla/wordpress/drupal/ghost/cmsms 是 CMS
+源码审计（WEB），nginx/httpd/openlitespeed/caddy/openresty/postgresql/redis/
+clickhouse 是 C/C++ 服务源码审计（PWN，与 REVERSE/PWN 同一解题档位，拿 IDA 提示）。
+
+修复：`inferChallengeCategory` 增加附件名为第三优先级信号（平台分类 > 题目名 > 附件名），
+关键词表预编译；真实数据验证 17/20 道题正确重分类，无附件的 3 道 + 中文名题目保持
+OTHER 不误动，已正确分类的题目零误动。`scripts/classify-challenges.ts` 顺带修了
+把本地 meta.category 回馈为"平台分类"导致错分被冻结的 bug；python 应急脚本同步了
+相同规则与附件信号。
+
+### Bug 2：周期同步不是幂等的
+
+旧 `acquireChallenges` 每轮（默认 10 分钟）对全部题目重拉详情并重新下载全部附件：
+在"连续 3 次详情即触发 40001 限流"的平台上，这会挤占提交 flag 的请求配额，还会
+反复下载数十 MB 的源码包。旧去重逻辑还是每题全树扫描（O(n²)）。
+
+修复：同步改为增量——开扫一次本地索引（按 challenge_id 建索引，识别新旧两种目录
+布局），已完整落盘的题目零平台调用、零下载；meta 新增 `attachments` 清单用于判定
+完整性；清单缺失（旧数据）或文件丢失（中断）时自动走一次全量物化自愈；跨分类的
+重复副本就地合并（rename 到推断分类 + 清空目录修剪）；`hasSolved` 经题目列表直达
+本地 meta；`revalidate` 参数保留强制全量重拉的逃生口。python 应急脚本写入同格式
+附件清单，两个工具互通。
+
+### 环境坑：Bun canary test runner 子目录 spawn bug
+
+本机 Bun 1.3.14-canary.1：`bun test` 跑**子目录**里的测试文件时，`Bun.spawn`
+子进程的 stdout/stderr 静默为空（`python3 -c "print('hi')"` 返回空串）。最小复现
+十行，确定性 100%。后果：`runner-competition-scheduling`（python 环境探测失败 →
+`Selected Python environment is invalid: JSON Parse error: Unexpected EOF`）等
+涉及子进程的测试在 `bun test test/` 下假失败；同一文件放仓库根目录即通过。全量
+`bun test test/` 的 42 个失败里，除既有 EPERM/超时环境问题外均源于此。判断测试
+真伪时先看失败是否涉及子进程 + 文件是否在子目录；非 spawn 类测试（如适配器套件）
+不受影响。升级/回退 Bun 版本即可消除。
