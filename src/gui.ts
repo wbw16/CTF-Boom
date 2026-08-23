@@ -998,9 +998,10 @@ export async function startGuiServer(options: StartGuiOptions) {
         if (request.method === "PUT" && url.pathname === "/api/xihulunjian/server-host") {
           const input = await body(request)
           if (typeof input.value !== "string") throw new HttpError(400, "Server Host 必须是字符串")
+          const serverHost = input.value
           return await exclusive(async () => {
             try {
-              const saved = await saveXihulunjianServerHost(input.value)
+              const saved = await saveXihulunjianServerHost(serverHost)
               clearCompetitionAdapterCache()
               broadcast({ at: Date.now(), type: "xihulunjian.server-host.changed" })
               return json(saved)
