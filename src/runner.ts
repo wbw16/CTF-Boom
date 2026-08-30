@@ -1,6 +1,6 @@
 import { lstat, readFile } from "node:fs/promises"
 import path from "node:path"
-import { submitCandidate } from "./candidate-submission.ts"
+import { consumeCandidateSubmission, submitCandidate } from "./candidate-submission.ts"
 import { normalizeChallengeCategory, updateChallengeRemote, type Challenge } from "./challenge.ts"
 import {
   addConsultationUsage,
@@ -840,6 +840,8 @@ export class GuiRunner {
     workspace: Workspace
     candidate: string
     signal?: AbortSignal
+    /** Invoked after every live adapter response; each response consumes a platform submission. */
+    onAttempt?: (result: FlagSubmissionResult, attempt: number) => Promise<void> | void
   }): Promise<FlagSubmissionResult> {
     if (input.challenge.platform?.adapter === XIHULUNJIAN_ADAPTER_ID) {
       const adapter = await this.competitionAdapter().catch(() => undefined)
@@ -858,6 +860,7 @@ export class GuiRunner {
         try {
           const result = await adapter.submitFlag(input)
           last = result
+          await input.onAttempt?.(result, attempt)
           if (result.verdict !== "pending" || attempt === 2) return result
         } catch (error) {
           if (attempt === 2) {
@@ -880,10 +883,13 @@ export class GuiRunner {
 
     // Kept unreachable in normal product setup: no UI, API route, or CLI command can configure a
     // generic adapter. It only supports the repository's injected unit-test fakes.
-    if (this.testPlatformAdapters)
-      return this.testPlatformAdapters.submitFlagWithRetry({ root: this.root, ...input }, {
+    if (this.testPlatformAdapters) {
+      const result = await this.testPlatformAdapters.submitFlagWithRetry({ root: this.root, ...input }, {
         retryDelayMs: this.platformSubmissionRetryDelayMs,
       })
+      await input.onAttempt?.(result, 1)
+      return result
+    }
     return {
       adapter: "manual",
       verdict: "pending",
@@ -2292,8 +2298,26 @@ export class GuiRunner {
       billableTokens: 0,
       cost: 0,
       eventWrites: Promise.resolve(),
+      // A hot-switch request that arrived during the previous turn's wind-down can still sit on the
+      // source job when another product followup won the race (writeup, rejection retry, recovery).
+      // Carry it onto this solve continuation so a later gate applies it instead of dropping it;
+      // writeup turns deliberately leave it behind to be reported as unapplied instead.
+      ...(input.purpose === "solve" && job.pendingSwitch ? { pendingSwitch: job.pendingSwitch } : {}),
+      ...(input.purpose === "solve" && job.pendingEnvironmentSwitch
+        ? { pendingEnvironmentSwitch: job.pendingEnvironmentSwitch }
+        : {}),
+      ...(input.purpose === "solve" && job.pendingConsultation
+        ? { pendingConsultation: job.pendingConsultation }
+        : {}),
     }
     this.queue.push(followup)
+    if (input.purpose === "solve") {
+      // Transferred onto the followup above; drop the source copies so this run's stranded-request
+      // accounting does not double-report them.
+      job.pendingSwitch = undefined
+      job.pendingEnvironmentSwitch = undefined
+      job.pendingConsultation = undefined
+    }
     this.notify({
       at,
       type: input.purpose === "writeup"
@@ -2854,7 +2878,7 @@ export class GuiRunner {
         // Anti-brute-force gate. The platform allows 50 submissions per challenge and forbids
         // brute-forcing, so Boom keeps a far lower ceiling and never resends a value it already tried.
         // The ledger is durable, so restarting mid-match cannot reset the count.
-        const ledger = await loadSubmissionLedger(this.root, job.challenge.slug).catch(() =>
+        let ledger = await loadSubmissionLedger(this.root, job.challenge.slug).catch(() =>
           ({ version: 1 as const, slug: job.challenge.slug, attempts: [] }))
         const gate = gateSubmission({
           ledger,
@@ -2875,19 +2899,25 @@ export class GuiRunner {
             text: gate.reason,
           })
         } else try {
+          // Every adapter response is a real platform submission, so each one enters the ledger as
+          // it happens — the first pending verdict included, tagged with its attempt number.
+          // Recording only the final verdict used to undercount whenever the pending retry re-sent
+          // the same flag and burned double quota for a single ledger row.
           job.platformSubmission = await this.submitCandidateToPlatform({
             challenge: { ...job.challenge, flagFormat: job.flagFormat },
             workspace: job.workspace!,
             candidate: outcome.primaryCandidate,
             signal: job.controller.signal,
+            onAttempt: async (result, attempt) => {
+              ledger = recordAttempt(ledger, {
+                value: gate.value,
+                verdict: result.verdict,
+                at: result.submittedAt,
+                detail: `[attempt ${attempt}] ${result.detail}`.slice(0, 500),
+              })
+              await saveSubmissionLedger(this.root, ledger).catch(() => {})
+            },
           })
-          // Record the attempt regardless of verdict: a pending submission still consumed quota.
-          await saveSubmissionLedger(this.root, recordAttempt(ledger, {
-            value: gate.value,
-            verdict: job.platformSubmission.verdict,
-            at: job.platformSubmission.submittedAt,
-            detail: job.platformSubmission.detail.slice(0, 500),
-          })).catch(() => {})
         } catch (error) {
           job.platformSubmission = {
             adapter: job.challenge.platform?.adapter ?? "manual",
@@ -2935,6 +2965,20 @@ export class GuiRunner {
             },
           }
           candidateDisposition = job.platformSubmission.verdict
+        }
+        // The gate has now evaluated this candidate slot one way or another — accepted, rejected, or
+        // held for manual review. Mark the durable slot consumed so a resumed followup of the same
+        // session cannot re-offer the old flag as a fresh submission. Best-effort: a failure here is
+        // reported but must not lose the candidate.
+        try {
+          await consumeCandidateSubmission(job.workspace!.directory)
+        } catch (error) {
+          this.recordEvent(job, {
+            at: Date.now(),
+            type: "status",
+            status: "candidate.slot.consume-failed",
+            text: errorText(error),
+          })
         }
         finishedAt = Date.now()
       }
@@ -2986,16 +3030,25 @@ export class GuiRunner {
 
     let queuedProductFollowup = false
     const remoteURLBlocked = isRemoteURLBlocked(outcome)
+    // A hot-switch request can arrive while the turn is already winding down — platform submission
+    // backoff, blind review, ledger writes — after `runChallenge` has resolved, so `outcome.stop`
+    // never becomes "switched". Queueing therefore must not hinge on that stop reason alone: any
+    // pending switch/environment/consultation request left on the job queues a followup here, no
+    // matter whether the turn ended normally or wound down on budget/stall. Hard aborts and blocked
+    // remote URLs still never queue (unconsumed requests are reported below instead).
+    const solvedTaskNeedsNoSolveTurn = job.purpose === "solve" && job.task?.status === "solved"
     if (
       job.task &&
       job.workspace &&
-      (
-        (outcome.stop === "switched" &&
-          (job.pendingSwitch || job.pendingEnvironmentSwitch || job.pendingConsultation)) ||
-        (job.pendingConsultation && job.task.status !== "solved")
-      ) &&
+      !solvedTaskNeedsNoSolveTurn &&
       !remoteURLBlocked &&
-      !job.controller.signal.aborted
+      !job.controller.signal.aborted &&
+      (
+        outcome.stop === "switched" ||
+        job.pendingSwitch ||
+        job.pendingEnvironmentSwitch ||
+        Boolean(job.pendingConsultation && job.task.status !== "solved")
+      )
     ) {
       const request = job.pendingSwitch
       const environment = job.pendingEnvironmentSwitch
@@ -3144,6 +3197,13 @@ export class GuiRunner {
           event,
           detail: hint,
         })
+        // The followup above already adopts everything the requests asked for (model, policy,
+        // consult pool, environment binding, consultation input), so the pending fields are consumed
+        // now. Clear them so this turn's final accounting does not report them stranded and a later
+        // gate cannot queue the same request twice.
+        job.pendingSwitch = undefined
+        job.pendingEnvironmentSwitch = undefined
+        job.pendingConsultation = undefined
         queuedProductFollowup = true
       }
     }
@@ -3198,7 +3258,13 @@ export class GuiRunner {
           hint: "The final Chinese WRITEUP.md does not yet contain the confirmed flag or enough derivation. If there is no PoC, do not invent one; just write the verified reasoning and reproduction steps, then finish.",
         })
       }
-    } else if (!remoteURLBlocked && job.task && outcome.primaryCandidate && candidateDisposition === "rejected") {
+    } else if (
+      !queuedProductFollowup &&
+      !remoteURLBlocked &&
+      job.task &&
+      outcome.primaryCandidate &&
+      candidateDisposition === "rejected"
+    ) {
       queuedProductFollowup = this.queueTaskFollowup({
         source: job,
         purpose: "solve",
@@ -3294,6 +3360,39 @@ export class GuiRunner {
           runID: job.workspace!.runID,
           detail: errorText(error),
         })
+      })
+    }
+
+    // Last-chance accounting for hot-switch requests. Every path above that consumes or transfers a
+    // pending request clears it; reaching this point with one still attached means nothing will ever
+    // apply it — hard abort, blocked remote URL, exhausted autonomy budget, competition give-up.
+    // That must never die silently: broadcast a warning so the user can retry after the pause.
+    if ((job.pendingSwitch || job.pendingEnvironmentSwitch) && job.task && job.workspace) {
+      const giveUp = this.competitionStop(job)
+      const reason = job.controller.signal.aborted
+        ? "任务已被中止"
+        : remoteURLBlocked
+          ? "远端靶机地址被安全策略阻止"
+          : giveUp
+            ? `比赛收盘（${giveUp}）`
+            : job.task.status === "solved"
+              ? "该题已有被接受的 flag，无需切换模型继续解题"
+              : this.remainingAutonomyLimits(job) === undefined
+                ? "授权运行预算已耗尽，无法排队续作回合"
+                : "收尾阶段无法排队续作回合"
+      const detail = [
+        `切换请求未能生效：${reason}，请在任务暂停后手动重试。`,
+        ...(job.pendingSwitch ? [`模型切换目标：${job.pendingSwitch.model}`] : []),
+        ...(job.pendingEnvironmentSwitch
+          ? [`环境切换目标：${job.pendingEnvironmentSwitch.executionMode} (${job.pendingEnvironmentSwitch.profileId})`]
+          : []),
+      ].join("\n")
+      console.warn(`[boom] ${job.challenge.slug}: ${detail.split("\n").join(" ")}`)
+      this.recordEvent(job, {
+        at: Date.now(),
+        type: "status",
+        status: "model.switch.not-applied",
+        text: detail,
       })
     }
     finishedAt = Date.now()

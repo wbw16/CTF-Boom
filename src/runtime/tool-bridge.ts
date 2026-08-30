@@ -14,10 +14,17 @@ function object(value: unknown): Record<string, unknown> | undefined {
  * The random bearer token never enters a task process environment. The child adapter receives no
  * implementation code or policy authority; it only translates its tool context into this endpoint.
  */
-export function startBoomToolBridge(registry: CompiledBoomAgentRegistry) {
+export function startBoomToolBridge(
+  registry: CompiledBoomAgentRegistry,
+  /**
+   * Live deny-list shared with the runtime layer. Callers may pre-seed Boom control-plane origins
+   * (the GUI API) that task agents must never reach through this broker; the bridge adds its own
+   * endpoint to the same set.
+   */
+  deniedOrigins: Set<string> = new Set<string>(),
+) {
   const token = crypto.randomUUID() + crypto.randomUUID()
   const profiles = new Map(registry.agents.map((agent) => [agent.resource.id, agent.resource.toolProfile]))
-  const deniedOrigins = new Set<string>()
   const host = createBoomToolHost(registry.catalog, {
     networkBroker: createBoomNetworkBroker({ deniedOrigins }),
     network: registry.network,

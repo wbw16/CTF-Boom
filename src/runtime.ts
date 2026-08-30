@@ -66,6 +66,21 @@ export function resolveRuntimeModel(model: string) {
   return model
 }
 
+/**
+ * Origins that serve a Boom control plane (currently the GUI API on loopback).
+ *
+ * The GUI has no bearer credential for local processes, so any task agent could otherwise read and
+ * drive it through the network broker (or a plain shell fetch). Every tool bridge started by this
+ * module denies these origins in addition to its own endpoint; the set is passed live into each
+ * bridge, so registrations made after a bridge started still apply.
+ */
+const boomControlPlaneOrigins = new Set<string>()
+
+/** Called by the GUI server once its listen port is known. */
+export function registerBoomControlPlaneOrigin(...origins: string[]) {
+  for (const origin of origins) boomControlPlaneOrigins.add(origin)
+}
+
 /** Keep the compatibility provider name out of Boom's public model picker and persisted GUI state. */
 export function publicRuntimeModel(providerID: string, modelID: string) {
   return `${providerID === "opencode" ? "free" : providerID}/${modelID}`
@@ -682,7 +697,7 @@ async function startOpenCodeCompatibility(runtime: {
     ? reusableModels
     : undefined
   const exactEndpointProxy = await installExactEndpointProxy(runtime.directory)
-  const bridge = startBoomToolBridge(runtime.agentRegistry)
+  const bridge = startBoomToolBridge(runtime.agentRegistry, boomControlPlaneOrigins)
   const child = Bun.spawn(
     [runtime.executable, "serve", "--hostname=127.0.0.1", "--port=0"],
     {

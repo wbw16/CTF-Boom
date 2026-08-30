@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { spawn, type ChildProcess } from "node:child_process"
-import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { resolveTaskPath } from "../src/runtime/policy.ts"
 
 const PROXY = path.join(import.meta.dir, "..", "src", "runtime", "ida-proxy.ts")
 const UPSTREAM = path.join(import.meta.dir, "fixtures", "ida-proxy-upstream.ts")
@@ -91,12 +92,14 @@ class TestClient {
 }
 
 const running: Array<{ child: ChildProcess; home: string }> = []
+const policyRoots: string[] = []
 
 afterEach(async () => {
   for (const item of running.splice(0)) {
     item.child.kill()
   }
   await Promise.all(running.map((item) => rm(item.home, { recursive: true, force: true })))
+  await Promise.all(policyRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
 async function startProxy(options: { roots?: boolean; offloadChars?: number } = {}) {
@@ -161,7 +164,7 @@ describe("IDA result proxy", () => {
       arguments: { function: "big" },
     })
     const text = response.result.content[0].text as string
-    expect(text).toContain("[IDA 结果已归档]")
+    expect(text).toContain("[IDA result archived]")
     expect(text).toContain("work/ida/results/")
     expect(text).toContain("idalib_boom_ida_get(id=")
     const id = text.match(/id="([^"]+)"/)?.[1]
@@ -184,7 +187,7 @@ describe("IDA result proxy", () => {
       arguments: { queries: [{ addr: "sub_A" }, { addr: "sub_B" }] },
     })
     const text = response.result.content[0].text as string
-    expect(text).toContain("[IDA analyze_batch 拆批归档]")
+    expect(text).toContain("[IDA analyze_batch split-and-archive]")
     expect(text).toContain("sub_A")
     expect(text).toContain("sub_B")
     const calls = await callLog(logPath)
@@ -215,7 +218,7 @@ describe("IDA result proxy", () => {
     })
     const firstID = (first.result.content[0].text as string).match(/id="([^"]+)"/)?.[1]
     const secondID = (second.result.content[0].text as string).match(/id="([^"]+)"/)?.[1]
-    expect(second.result.content[0].text).toContain("未重复写盘")
+    expect(second.result.content[0].text).toContain("not rewritten")
     expect(secondID).toBe(firstID)
     const files = (await readdir(path.join(workspace, "work", "ida", "results")))
       .filter((entry) => entry.endsWith(".txt"))
@@ -247,8 +250,8 @@ describe("IDA result proxy", () => {
     })
     const chunkText = chunk.result.content[0].text as string
     expect(chunkText).toContain("# work/ida/results/")
-    expect(chunkText).toContain("第 1-5 行")
-    expect(chunkText).toContain("还有")
+    expect(chunkText).toContain("lines 1-5 / 202 total")
+    expect(chunkText).toContain("more lines")
     const listed = await client.request("tools/call", {
       name: "boom_ida_list",
       arguments: { limit: 10 },
@@ -270,6 +273,114 @@ describe("IDA result proxy", () => {
       name: "boom_ida_list",
       arguments: {},
     })
-    expect(listed.result.content[0].text).toContain("暂无归档")
+    expect(listed.result.content[0].text).toContain("No archived IDA results.")
+  })
+
+  test("refuses poisoned manifest entries instead of reading escaped paths", async () => {
+    const { client, home, workspace } = await startProxy({ offloadChars: 200 })
+    await client.request("initialize", {})
+    const archived = await client.request("tools/call", {
+      name: "idalib_decompile",
+      arguments: { function: "big" },
+    })
+    const legitID = (archived.result.content[0].text as string).match(/id="([^"]+)"/)?.[1]!
+
+    // 模拟 manifest 被改写：插入指向归档目录之外的穿越条目与非 .txt 条目。
+    const secret = path.join(home, "secret.txt")
+    await writeFile(secret, "TOPSECRET_CREDENTIALS", "utf8")
+    const manifestPath = path.join(workspace, "work", "ida", "results", "index.jsonl")
+    const planted = [
+      {
+        v: 1,
+        id: "evil-traversal",
+        at: new Date().toISOString(),
+        tool: "idalib_decompile",
+        key: "planted",
+        hash: "planted",
+        file: "../../../secret.txt",
+        chars: 20,
+        lines: 1,
+      },
+      {
+        v: 1,
+        id: "evil-extension",
+        at: new Date().toISOString(),
+        tool: "idalib_decompile",
+        key: "planted-2",
+        hash: "planted-2",
+        file: "secret.json",
+        chars: 20,
+        lines: 1,
+      },
+    ] satisfies Array<Record<string, unknown>>
+    const existing = await readFile(manifestPath, "utf8")
+    await writeFile(
+      manifestPath,
+      existing + planted.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+      "utf8",
+    )
+
+    for (const evil of ["evil-traversal", "evil-extension"]) {
+      const attack = await client.request("tools/call", {
+        name: "boom_ida_get",
+        arguments: { id: evil },
+      })
+      // 与「条目不存在」同一错误风格，且绝不把越权文件内容带回模型上下文。
+      expect(attack.error?.message).toContain(`archive ID not found: ${evil}`)
+      expect(JSON.stringify(attack)).not.toContain("TOPSECRET_CREDENTIALS")
+    }
+
+    // 被污染的条目被拒绝，但不牵连同一 manifest 里的合法归档。
+    const legit = await client.request("tools/call", {
+      name: "boom_ida_get",
+      arguments: { id: legitID },
+    })
+    expect(legit.error).toBeUndefined()
+    expect(legit.result.content[0].text).toContain("BIG_BODY")
+  })
+
+  test("still serves archived artifacts with legitimate single-segment .txt names", async () => {
+    const { client, workspace } = await startProxy({ offloadChars: 200 })
+    await client.request("initialize", {})
+    const archived = await client.request("tools/call", {
+      name: "idalib_decompile",
+      arguments: { function: "big" },
+    })
+    const pointer = archived.result.content[0].text as string
+    expect(pointer).toContain("[IDA result archived]")
+    const id = pointer.match(/id="([^"]+)"/)?.[1]!
+    const file = pointer.match(/work\/ida\/results\/([^\s]+)/)?.[1]!
+    expect(file).toMatch(/^[A-Za-z0-9._-]+\.txt$/)
+
+    const chunk = await client.request("tools/call", {
+      name: "boom_ida_get",
+      arguments: { id, max_lines: 3 },
+    })
+    expect(chunk.error).toBeUndefined()
+    expect(chunk.result.content[0].text).toContain("BIG_BODY")
+    expect(await readFile(path.join(workspace, "work", "ida", "results", file), "utf8"))
+      .toContain("BIG_BODY")
+  })
+})
+
+describe("IDA archive write policy", () => {
+  test("denies agent writes into the host-owned work/ida tree", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "boom-ida-policy-"))
+    policyRoots.push(root)
+    await mkdir(path.join(root, "work", "ida", "results"), { recursive: true })
+    await writeFile(path.join(root, "work", "ida", "results", "index.jsonl"), "{}\n")
+    await writeFile(path.join(root, "work", "ida", "results", "artifact.txt"), "archived body\n")
+    await writeFile(path.join(root, "work", "ida", "notes.txt"), "proxy-owned\n")
+    await writeFile(path.join(root, "work", "draft.txt"), "agent-owned\n")
+
+    for (const requested of [
+      "work/ida/results/index.jsonl",
+      "work/ida/results/artifact.txt",
+      "work/ida/notes.txt",
+    ]) {
+      await expect(resolveTaskPath(root, requested, "write")).rejects.toThrow("host-owned task state")
+    }
+    // 只有 work/ida 被锁定；其余 work/ 文件保持可写。
+    expect((await resolveTaskPath(root, "work/draft.txt", "write")).relative).toBe("work/draft.txt")
   })
 })

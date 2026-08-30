@@ -37,6 +37,9 @@ function driver(
     baseURL: descriptor.baseURL,
     ...(credential ? { apiKey: credential.key } : {}),
     ...(model.pricing ? { pricing: model.pricing } : {}),
+    // One output ceiling across protocols: without it only Anthropic capped generation, so the
+    // same model limit silently did not apply on OpenAI-style gateways.
+    ...(model.limit.output !== undefined ? { maxOutputTokens: model.limit.output } : {}),
   }
   if (descriptor.driver === "openai") return new OpenAIResponsesProviderDriver(common)
   if (descriptor.driver === "anthropic") return new AnthropicMessagesProviderDriver({

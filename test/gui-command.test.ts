@@ -34,14 +34,14 @@ describe("GUI command arguments", () => {
     const cwd = path.join(path.sep, "tmp", "Boom GUI tests")
 
     expect(parseGuiArgs([], { cwd, platform: "darwin" })).toEqual({
-      root: path.join(cwd, "ctf"),
+      root: cwd,
       port: 0,
       mode: "native",
       help: false,
       network: "allow",
     })
     expect(parseGuiArgs([], { cwd, platform: "linux" })).toEqual({
-      root: path.join(cwd, "ctf"),
+      root: cwd,
       port: 0,
       mode: "browser",
       help: false,
@@ -77,7 +77,7 @@ describe("GUI command arguments", () => {
     for (const item of cases) {
       const parsed = parseGuiArgs(item.argv, { cwd, platform: item.platform })
       expect(parsed).toEqual({
-        root: item.root ?? path.join(cwd, "ctf"),
+        root: item.root ?? cwd,
         port: item.port ?? 0,
         mode: item.mode,
         help: item.help ?? false,

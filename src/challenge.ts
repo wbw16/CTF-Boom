@@ -1,4 +1,4 @@
-import { lstat, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 
 export type Challenge = {
@@ -274,41 +274,127 @@ export async function loadChallenge(
   }
 }
 
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+export type ChallengeCatalog = {
+  /** Directory whose direct children are scanned for challenges. */
+  directory: string
+  /** True when category folders sit directly under the workspace root instead of `challenges/`. */
+  atRoot: boolean
+}
+
 /**
- * Every challenge under `<root>/challenges`.
+ * Locate the challenge catalog for a workspace root.
  *
- * Preferred layout is `<CATEGORY>/<slug>/`; legacy flat `<slug>/` directories remain readable.
- * Slugs stay globally unique because run/task identity remains `<root>/runs/<slug>/`.
+ * `<root>/challenges/` stays the preferred layout. A root that itself contains recognized category
+ * folders (WEB/, PWN/, MISC/, …) — the shape of many downloaded competition archives — is accepted
+ * as the catalog. Anything else resolves to the default `<root>/challenges/` so callers can create it.
  */
-export async function discoverChallenges(root: string) {
-  const directory = path.join(root, "challenges")
-  const info = await lstat(directory).catch(() => undefined)
+export async function resolveChallengeCatalog(root: string): Promise<ChallengeCatalog> {
+  const nested = path.join(root, "challenges")
+  const nestedInfo = await lstat(nested).catch(() => undefined)
+  if (nestedInfo?.isDirectory() && !nestedInfo.isSymbolicLink())
+    return { directory: nested, atRoot: false }
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => undefined)
+  for (const entry of entries ?? []) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+    if (recognizedChallengeCategory(entry.name)) return { directory: root, atRoot: true }
+  }
+  return { directory: nested, atRoot: false }
+}
+
+/**
+ * Create the directories a workspace root needs before Boom opens it: `runs/` always, plus the
+ * default `challenges/` catalog unless categories already live at the root — creating it there
+ * would shadow the root layout on the next open.
+ */
+export async function prepareWorkspaceRoot(root: string) {
+  await mkdir(path.join(root, "runs"), { recursive: true })
+  const catalog = await resolveChallengeCatalog(root)
+  if (!catalog.atRoot) await mkdir(catalog.directory, { recursive: true })
+}
+
+/**
+ * Every challenge under a workspace root's catalog.
+ *
+ * Preferred layout is `<root>/challenges/<CATEGORY>/<slug>/`; legacy flat `<slug>/` directories
+ * remain readable there. When categories instead sit directly under the root, only they are
+ * scanned — other top-level entries are workspace infrastructure such as `runs/`, not challenges.
+ *
+ * A single unresolvable challenge directory must not take down the whole catalog (the GUI serves
+ * this list directly): it is skipped and reported in a summary warning. Cross-category slug
+ * collisions keep the first challenge and warn instead of throwing.
+ */
+export async function discoverChallenges(root: string): Promise<Challenge[]> {
+  const catalog = await resolveChallengeCatalog(root)
+  const info = await lstat(catalog.directory).catch(() => undefined)
   if (!info?.isDirectory() || info.isSymbolicLink())
-    throw new Error(`No real challenges directory at ${directory}`)
-  const entries = await readdir(directory, { withFileTypes: true }).catch(() => {
-    throw new Error(`No challenges directory at ${directory}`)
+    throw new Error(
+      `No challenge catalog under ${root}: expected ${path.join(root, "challenges")} or category folders such as WEB/PWN/MISC directly inside`,
+    )
+  const entries = await readdir(catalog.directory, { withFileTypes: true }).catch(() => {
+    throw new Error(`No challenges directory at ${catalog.directory}`)
   })
-  const answers = await loadAnswers(root)
+  const answersFile = path.join(root, "eval", "answers.txt")
+  let answers: Map<string, string>
+  try {
+    answers = await loadAnswers(root)
+  } catch (error) {
+    // The root answers file is configuration, so a format error stays fatal — but the operator
+    // gets the offending file path up front instead of bare parser context.
+    throw new Error(`无法加载挑战答案文件 ${answersFile}: ${errorText(error)}`)
+  }
   const challenges: Challenge[] = []
+  const diagnostics: Array<{ directory: string; error: string }> = []
+  const seen = new Set<string>()
+  const consider = (challenge: Challenge, source: string) => {
+    if (seen.has(challenge.slug)) {
+      // Keep the first occurrence so one mirrored category cannot invalidate discovery.
+      console.warn(`[boom] 挑战 slug 跨分类重复，保留首个并跳过：${challenge.slug} (${source})`)
+      return
+    }
+    seen.add(challenge.slug)
+    challenges.push(challenge)
+  }
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue
     const category = recognizedChallengeCategory(entry.name)
     if (!category) {
-      challenges.push(await loadChallenge(path.join(directory, entry.name), answers))
+      // At the workspace root only categories are challenges; the rest is infrastructure.
+      if (catalog.atRoot) continue
+      const target = path.join(catalog.directory, entry.name)
+      try {
+        consider(await loadChallenge(target, answers), target)
+      } catch (error) {
+        diagnostics.push({ directory: target, error: errorText(error) })
+      }
       continue
     }
-    const categoryDirectory = path.join(directory, entry.name)
-    const nested = await readdir(categoryDirectory, { withFileTypes: true })
-    for (const challenge of nested.sort((a, b) => a.name.localeCompare(b.name))) {
+    const categoryDirectory = path.join(catalog.directory, entry.name)
+    const nested = await readdir(categoryDirectory, { withFileTypes: true }).catch(
+      (error: unknown) => {
+        diagnostics.push({ directory: categoryDirectory, error: errorText(error) })
+        return undefined
+      },
+    )
+    for (const challenge of nested?.sort((a, b) => a.name.localeCompare(b.name)) ?? []) {
       if (!challenge.isDirectory() || challenge.name.startsWith(".")) continue
-      challenges.push(await loadChallenge(path.join(categoryDirectory, challenge.name), answers, category))
+      const target = path.join(categoryDirectory, challenge.name)
+      try {
+        consider(await loadChallenge(target, answers, category), target)
+      } catch (error) {
+        diagnostics.push({ directory: target, error: errorText(error) })
+      }
     }
   }
-  const seen = new Set<string>()
-  for (const challenge of challenges) {
-    if (seen.has(challenge.slug))
-      throw new Error(`Duplicate challenge slug across categories: ${challenge.slug}`)
-    seen.add(challenge.slug)
+  if (diagnostics.length > 0) {
+    const first = diagnostics[0]
+    console.warn(
+      `[boom] ${diagnostics.length} 个挑战目录无法解析：${first.directory}: ${first.error}` +
+        (diagnostics.length > 1 ? "…" : ""),
+    )
   }
   return challenges.sort((left, right) =>
     CHALLENGE_CATEGORIES.indexOf(left.category ?? "OTHER") -

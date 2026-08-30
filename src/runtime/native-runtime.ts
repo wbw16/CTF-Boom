@@ -531,12 +531,31 @@ class NativeConversation implements RuntimeConversation {
           name: tool.name ?? "unknown",
           arguments: tool.arguments,
         }))
+        // A length-cut tool call can be neither executed nor answered; leaving it in the protocol
+        // history would dangle an unanswered tool_call on every later request. When a continuation
+        // is still available, omit it and ask the model to re-issue the complete call instead.
+        const deferTruncatedTools =
+          step.finish === "length" && lengthContinuations < this.#limits.maxLengthContinuations
         await this.#ledger.append({
           role: "assistant",
           content: step.text,
           ...(step.reasoning ? { reasoning: step.reasoning } : {}),
-          ...(toolCalls.length ? { toolCalls } : {}),
+          ...(!deferTruncatedTools && toolCalls.length ? { toolCalls } : {}),
         })
+
+        if (deferTruncatedTools) {
+          lengthContinuations += 1
+          await this.#ledger.append(
+            {
+              role: "user",
+              content: toolCalls.length > 0
+                ? "Your previous response reached its output limit in the middle of a tool call, so the call was not executed or recorded. Re-issue that tool call in full, with complete arguments."
+                : "Continue from the exact point where the previous response reached its output limit.",
+            },
+            "length-continuation",
+          )
+          continue
+        }
 
         if (toolCalls.length > 0) {
           const outcomes = await this.#executeTools(
@@ -566,14 +585,6 @@ class NativeConversation implements RuntimeConversation {
           continue
         }
 
-        if (step.finish === "length" && lengthContinuations < this.#limits.maxLengthContinuations) {
-          lengthContinuations += 1
-          await this.#ledger.append(
-            { role: "user", content: "Continue from the exact point where the previous response reached its output limit." },
-            "length-continuation",
-          )
-          continue
-        }
         if (!step.text && !step.reasoning) throw malformed("Provider returned an empty response")
         return await this.#completedResult(parts, step.finish, usageBefore, costBefore, requestID)
       }
@@ -607,7 +618,26 @@ class NativeConversation implements RuntimeConversation {
     signal: AbortSignal
     step: number
   }): Promise<ProviderStep> {
+    // Streaming bookkeeping shared by every attempt of this step. Retries replay the step from
+    // scratch; only the suffix beyond what earlier attempts already pushed to the event bus is
+    // forwarded, so a retried step never doubles the live text.
+    let streamedText = ""
+    let streamedReasoning = ""
     for (let attempt = 0; ; attempt += 1) {
+      let attemptDiverged = false
+      const emitDelta = (
+        kind: "text" | "reasoning",
+        accumulated: string[],
+        alreadyStreamed: string,
+      ): { suffix: string; diverged: boolean } => {
+        const full = accumulated.join("")
+        if (attemptDiverged) return { suffix: "", diverged: true }
+        if (full.startsWith(alreadyStreamed)) return { suffix: full.slice(alreadyStreamed.length), diverged: false }
+        // The provider generated different content on this attempt. Suppress the remainder instead
+        // of interleaving unrelated text; the durable result always comes from the winning attempt.
+        attemptDiverged = true
+        return { suffix: "", diverged: true }
+      }
       try {
         return await this.#coordinator.runActive(input.signal, async () => {
           const text: string[] = []
@@ -631,13 +661,21 @@ class NativeConversation implements RuntimeConversation {
             if (event.type === "text-delta") {
               if (finish) throw malformed("Provider emitted text after finish")
               text.push(event.delta)
-              if (event.delta) await this.#bus.emit({ type: "text-delta", sessionID: this.id, delta: event.delta })
+              const { suffix } = emitDelta("text", text, streamedText)
+              if (suffix) {
+                streamedText += suffix
+                await this.#bus.emit({ type: "text-delta", sessionID: this.id, delta: suffix })
+              }
               continue
             }
             if (event.type === "reasoning-delta") {
               if (finish) throw malformed("Provider emitted reasoning after finish")
               reasoning.push(event.delta)
-              if (event.delta) await this.#bus.emit({ type: "reasoning-delta", sessionID: this.id, delta: event.delta })
+              const { suffix } = emitDelta("reasoning", reasoning, streamedReasoning)
+              if (suffix) {
+                streamedReasoning += suffix
+                await this.#bus.emit({ type: "reasoning-delta", sessionID: this.id, delta: suffix })
+              }
               continue
             }
             if (event.type === "tool-call-delta") {
@@ -693,13 +731,29 @@ class NativeConversation implements RuntimeConversation {
         input.signal.throwIfAborted()
         const failure = failureFrom(error, input.signal)
         if (failure.retryable === true && attempt < this.#limits.maxRetries) {
+          // Honor Retry-After when the server advised one; otherwise back off exponentially with
+          // jitter. Immediate replays of 429/5xx almost always fail again and re-bill the attempt.
+          const advised = typeof failure.retryAfterMs === "number" && failure.retryAfterMs > 0
+            ? Math.min(failure.retryAfterMs, 60_000)
+            : 0
+          const exponential = Math.min(500 * 2 ** attempt, 15_000)
+          const delayMs = Math.max(advised, Math.floor(exponential * (0.7 + 0.6 * Math.random())))
           await this.#bus.emit({ type: "conversation-state", sessionID: this.id, state: "retrying" })
           await this.#bus.emit({
             type: "retry",
             sessionID: this.id,
             attempt: attempt + 1,
             error: failure,
+            delayMs,
           })
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, delayMs)
+            input.signal.addEventListener("abort", () => {
+              clearTimeout(timer)
+              resolve()
+            }, { once: true })
+          })
+          if (input.signal.aborted) input.signal.throwIfAborted()
           await this.#bus.emit({ type: "conversation-state", sessionID: this.id, state: "generating" })
           continue
         }

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, spyOn, test } from "bun:test"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -8,6 +8,7 @@ import type {
   RuntimeHandle,
   RuntimePrompt,
 } from "../src/runtime-contract.ts"
+import { NativeMessageLedger } from "../src/runtime/native-storage.ts"
 import { DEFAULT_NATIVE_KERNEL_LIMITS } from "../src/runtime/native-runtime.ts"
 import { ScriptedNativeProviderDriver } from "../src/runtime/scripted-provider.ts"
 import { selectRuntimeBackend, startRuntime } from "../src/runtime.ts"
@@ -617,5 +618,61 @@ describe("Boom Native Agent Kernel", () => {
     expect(() => selectRuntimeBackend("other")).toThrow("Unknown Boom Runtime backend")
     expect(DEFAULT_NATIVE_KERNEL_LIMITS.maxConcurrency).toBe(4)
     expect(DEFAULT_NATIVE_KERNEL_LIMITS.maxTaskDepth).toBe(2)
+  })
+})
+
+describe("M15 native message ledger resilience", () => {
+  function ledgerLine(id: string) {
+    return JSON.stringify({
+      version: 1,
+      id,
+      timestamp: new Date().toISOString(),
+      message: { role: "user", content: `payload-${id}` },
+    })
+  }
+
+  test("skips a torn trailing line so the ledger stays recoverable", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "boom-ledger-tail-"))
+    temporaryDirectories.push(directory)
+    await writeFile(
+      path.join(directory, "messages.jsonl"),
+      `${ledgerLine("message-1")}\n${ledgerLine("message-2")}\n${ledgerLine("message-3").slice(0, 40)}`,
+    )
+    const warn = spyOn(console, "warn")
+    try {
+      const ledger = await NativeMessageLedger.open(directory)
+
+      expect(ledger.length).toBe(2)
+      expect(ledger.entries().map((entry) => entry.id)).toEqual(["message-1", "message-2"])
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/offset \d+/))
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  test("still rejects corruption before the tail", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "boom-ledger-middle-"))
+    temporaryDirectories.push(directory)
+    await writeFile(
+      path.join(directory, "messages.jsonl"),
+      // The damaged line is followed by more records and is newline-terminated: real corruption.
+      `${ledgerLine("message-1")}\n{"version":1,"id":"broken"\n${ledgerLine("message-3")}\n`,
+    )
+
+    await expect(NativeMessageLedger.open(directory))
+      .rejects.toThrow("Invalid Boom Native message ledger JSON at line 2")
+  })
+
+  test("keeps structural corruption fatal even when it sits in the final record", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "boom-ledger-final-"))
+    temporaryDirectories.push(directory)
+    // Terminated by a newline and parseable JSON — not a torn write — so it stays an error.
+    await writeFile(
+      path.join(directory, "messages.jsonl"),
+      `${ledgerLine("message-1")}\n${JSON.stringify({ version: 2 })}\n`,
+    )
+
+    await expect(NativeMessageLedger.open(directory))
+      .rejects.toThrow("Invalid Boom Native message ledger entry at line 2")
   })
 })

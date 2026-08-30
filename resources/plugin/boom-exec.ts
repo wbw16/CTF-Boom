@@ -34,6 +34,16 @@ const FORBIDDEN = new Set([
 ])
 const MAX_VISIBLE_OUTPUT_BYTES = 32_768
 
+/**
+ * Same isolation ladder as Boom's command executor: managed < isolated < static-only. The task
+ * binding is the ceiling; a requested mode must rank at or above it.
+ */
+const EXECUTION_MODE_RANK: Record<Binding["executionMode"], number> = {
+  managed: 0,
+  isolated: 1,
+  "static-only": 2,
+}
+
 function finite(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback
 }
@@ -194,8 +204,13 @@ Use isolated for unknown binaries or untrusted installers. It never falls back t
         const mode = args.mode === "managed" || args.mode === "isolated" || args.mode === "static-only"
           ? args.mode
           : binding.executionMode
-        if (binding.executionMode === "static-only" && mode === "managed")
-          throw new Error("static-only cannot silently downgrade to managed")
+        // Same ceiling rule as src/command-executor.ts: a request may not rank below the bound
+        // execution mode. Managed under isolated loses the container boundary, and isolated (or
+        // managed) under static-only would void the no-challenge-execution promise and allowlist.
+        if (EXECUTION_MODE_RANK[mode] < EXECUTION_MODE_RANK[binding.executionMode])
+          throw new Error(
+            `Execution mode ceiling violated: task binding is ${binding.executionMode}, requested mode is ${args.mode}; a request cannot lower isolation below the task's bound execution mode`,
+          )
         if (path.isAbsolute(relativeCwd) || relativeCwd.split(/[\\/]/).includes("..")) throw new Error("cwd must stay inside the task")
         const cwd = path.resolve(ctx.directory, relativeCwd)
         const sessionRoot = await realpath(ctx.directory)

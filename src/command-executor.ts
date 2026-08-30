@@ -66,6 +66,16 @@ const SHELLS = new Set(["bash", "sh", "zsh", "fish", "cmd", "powershell", "pwsh"
 const MAX_CAPTURE_BYTES = 10_000_000
 const MAX_VISIBLE_SHELL_BYTES = 32_768
 
+/**
+ * Execution modes form a strict isolation ladder: managed < isolated < static-only. A task's bound
+ * execution mode is the isolation ceiling, so a requested mode must rank at or above it.
+ */
+const EXECUTION_MODE_RANK: Record<ExecutionMode, number> = {
+  managed: 0,
+  isolated: 1,
+  "static-only": 2,
+}
+
 function inside(base: string, target: string) {
   const relative = path.relative(base, target)
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
@@ -264,8 +274,13 @@ export async function executeControlledCommand(input: {
   const binding = await loadTaskEnvironment(root)
   if (!binding) throw new Error("This task has no Python environment binding")
   const mode = input.request.mode ?? binding.executionMode
-  if (binding.executionMode === "static-only" && mode === "managed")
-    throw new Error("A static-only task cannot silently downgrade to managed execution")
+  // The binding mode is an isolation ceiling, not merely a static-only rule. Reject every request
+  // that ranks below it: managed under isolated loses the container boundary, and isolated (or
+  // managed) under static-only would void the no-challenge-execution promise and its allowlist.
+  if (EXECUTION_MODE_RANK[mode] < EXECUTION_MODE_RANK[binding.executionMode])
+    throw new Error(
+      `Execution mode ceiling violated: task binding is ${binding.executionMode}, requested mode is ${mode}; a request cannot lower isolation below the task's bound execution mode`,
+    )
   const relativeCwd = input.request.cwd?.trim() || "."
   const resolvedCwd = await resolveTaskPath(root, relativeCwd)
   const cwd = resolvedCwd.absolute

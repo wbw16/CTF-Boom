@@ -16,6 +16,8 @@ export type CandidateSubmission = {
   }
   writeup: "work/WRITEUP.md"
   recordedAt: string
+  /** Set when a gate evaluation has already taken this slot; a consumed slot is never re-offered. */
+  consumedAt?: string
 }
 
 const LEVELS = new Set<VerificationLevel>([
@@ -77,6 +79,11 @@ function parseCandidateSubmission(value: unknown): CandidateSubmission {
       : {}),
     writeup: "work/WRITEUP.md",
     recordedAt,
+    // Presence alone blocks reuse, so any non-empty value is passed through even if unparseable as a
+    // date: dropping it would silently resurrect an already-consumed submission.
+    ...(typeof input.consumedAt === "string" && input.consumedAt.trim()
+      ? { consumedAt: input.consumedAt }
+      : {}),
   }
 }
 
@@ -97,6 +104,48 @@ export async function loadCandidateSubmission(directory: string) {
     return parseCandidateSubmission(JSON.parse(await readFile(candidate, "utf8")))
   }
   return undefined
+}
+
+/**
+ * Mark the live `work/RESULT.json` slot as consumed after a gate evaluation has taken it, so a later
+ * turn of the same session cannot re-offer the old candidate as a fresh submission. Best-effort
+ * bookkeeping: a missing or unreadable slot is silently left alone. The legacy `.boom/candidate.json`
+ * path stays read-only here — only the current target is ever rewritten.
+ */
+export async function consumeCandidateSubmission(directory: string): Promise<void> {
+  const paths = await resultPaths(directory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined
+    throw error
+  })
+  if (!paths) return
+  const { target } = paths
+  let raw: string
+  try {
+    const info = await lstat(target)
+    // Never rewrite anything but the real file: a planted symlink must not be followed, and rename
+    // would otherwise clobber the link itself instead of the attacker's target.
+    if (!info.isFile() || info.isSymbolicLink()) return
+    raw = await readFile(target, "utf8")
+  } catch {
+    return
+  }
+  let stored: unknown
+  try {
+    stored = JSON.parse(raw)
+  } catch {
+    return
+  }
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return
+  const updated: Record<string, unknown> = {
+    ...(stored as Record<string, unknown>),
+    consumedAt: new Date().toISOString(),
+  }
+  const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`
+  await writeFile(temporary, `${JSON.stringify(updated, undefined, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  })
+  await rename(temporary, target)
 }
 
 export async function submitCandidate(input: {

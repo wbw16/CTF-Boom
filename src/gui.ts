@@ -1,9 +1,13 @@
-import { chmod, copyFile, lstat, mkdir, readdir, rm } from "node:fs/promises"
+import { chmod, copyFile, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
+import { randomBytes, timingSafeEqual } from "node:crypto"
+import os from "node:os"
 import path from "node:path"
 import {
   discoverChallenges,
   normalizeChallengeCategory,
+  prepareWorkspaceRoot,
+  resolveChallengeCatalog,
   updateChallengeRemote,
   type Challenge,
 } from "./challenge.ts"
@@ -50,6 +54,7 @@ import {
   xihulunjianCredentialStatus,
 } from "./xihulunjian-config.ts"
 import { normalizeCompetitionSettings } from "./competition/policy.ts"
+import { registerBoomControlPlaneOrigin } from "./runtime.ts"
 
 const PACKAGE_ROOT = path.resolve(import.meta.dir, "..")
 const WEB_DIST = path.join(PACKAGE_ROOT, "frontend", "dist")
@@ -110,6 +115,11 @@ export type StartGuiOptions = {
   startRuntime?: boolean
   /** Host-wide network switch handed to the runner; "deny" isolates tool sandboxes. */
   network?: "allow" | "deny"
+  /**
+   * Require the per-installation GUI token on every request (default true). Tests disable this to
+   * exercise handlers directly; production always authenticates local callers.
+   */
+  tokenAuth?: boolean
 }
 
 class HttpError extends Error {
@@ -449,14 +459,106 @@ function stationaryRootState(state: RootGuiState): RootGuiState {
   }
 }
 
+const GUI_COOKIE = "boom_gui"
+
+/** Directory holding gui-state.json; the GUI token lives beside it under the same BOOM_HOME rule. */
+function boomStateHome() {
+  return path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+}
+
+/**
+ * Load the per-installation GUI token, creating a random one on first use.
+ *
+ * Loopback binding plus origin checks keep remote browsers out but not local processes: any task
+ * agent or script on the machine could previously call the API anonymously. This token is the
+ * bearer credential for those callers; it is stored 0600 next to gui-state.json so only the
+ * operating user (and processes they already trust) can read it, and it survives restarts so
+ * browser sessions keep working across Boom upgrades within one installation.
+ */
+async function loadOrCreateGuiToken(stateHome: string) {
+  const target = path.join(stateHome, ".gui-token")
+  const existing = (await readFile(target, "utf8").catch(() => "")).trim()
+  if (/^[0-9a-f]{48}$/.test(existing)) return existing
+  const token = randomBytes(24).toString("hex")
+  await mkdir(stateHome, { recursive: true })
+  // Atomic replace like gui-state so a concurrent reader never observes a partial token.
+  const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`
+  await writeFile(temporary, `${token}\n`, { encoding: "utf8", mode: 0o600 })
+  await rename(temporary, target)
+  // Defense in depth: keep 0600 even when a umask or a pre-existing wider file loosened the mode.
+  await chmod(target, 0o600).catch(() => {})
+  return token
+}
+
+function guiCookieValue(request: Request, name: string) {
+  const header = request.headers.get("cookie")
+  if (!header) return undefined
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=")
+    if (separator === -1) continue
+    if (part.slice(0, separator).trim() === name) return part.slice(separator + 1).trim()
+  }
+  return undefined
+}
+
+function guiTokenMatches(supplied: string | null | undefined, expected: string) {
+  if (!supplied) return false
+  const left = encoder.encode(supplied)
+  const right = encoder.encode(expected)
+  return left.length === right.length && timingSafeEqual(left, right)
+}
+
+/** Minimal unauthenticated page for document navigations; points at the startup banner URL. */
+function unauthenticatedGuiPage() {
+  return new Response(
+    `<!doctype html><html lang="zh"><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width, initial-scale=1">` +
+    `<title>Boom GUI 需要访问令牌</title>` +
+    `<body style="font-family:system-ui,sans-serif;max-width:40rem;margin:4rem auto;line-height:1.6;color:#1f2430">` +
+    `<h1>401 · 需要 Boom GUI 访问令牌</h1>` +
+    `<p>本机其他进程不允许匿名访问 Boom GUI。请使用 Boom 启动时控制台输出的带 <code>?token=…</code> 的完整地址重新打开本页面。</p>` +
+    `</body></html>`,
+    {
+      status: 401,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+      },
+    },
+  )
+}
+
+/**
+ * Resolve a workspace root to its real path, initializing a missing one first so opening any
+ * folder works on the first start. Preparation precedes canonicalization because realpath
+ * requires the directory to exist; both spellings denote the same directory even when an
+ * ancestor is a symlink.
+ */
+async function resolveWorkspaceRoot(directory: string) {
+  await prepareWorkspaceRoot(directory)
+  return canonicalDirectory(directory)
+}
+
+/**
+ * Storage whose contents originate from challenges or agents: run workspaces plus every challenge
+ * directory. Interpreters inside them are rejected no matter how the path is spelled.
+ */
+async function workspaceTaskStorageRoots(workspace: string) {
+  const found = await discoverChallenges(workspace)
+  return [
+    path.join(workspace, "runs"),
+    ...found.map((item) => item.sourceDirectory ?? item.directory),
+  ]
+}
+
 export async function startGuiServer(options: StartGuiOptions) {
   if (!webReady)
     throw new Error("Boom GUI 前端尚未构建；请先运行 bun run build:web")
   const hostname = options.hostname ?? "127.0.0.1"
   if (!LOOPBACK.has(hostname)) throw new Error(`Boom GUI only listens on loopback, got: ${hostname}`)
-  let root = await canonicalDirectory(options.root)
-  const challengeRoot = await lstat(path.join(root, "challenges")).catch(() => undefined)
-  if (!challengeRoot?.isDirectory()) throw new Error(`No challenges directory at ${path.join(root, "challenges")}`)
+  let root = await resolveWorkspaceRoot(options.root)
   const loaded = await loadRootGuiState(root)
   let persisted = stationaryRootState(loaded)
   // Persisted settings win at startup; the CLI flag only seeds a root with no saved state yet.
@@ -518,7 +620,7 @@ export async function startGuiServer(options: StartGuiOptions) {
       challenges: await Promise.all(
         found.map(async (item) => {
           const saved = statePersisted.challenges[item.slug]
-          const history = await readChallengeRuns(stateRoot, item.slug)
+          const history = await readChallengeRuns(stateRoot, item.slug, { files: false, eventTail: 120 })
           const runs = mergeTransient(history, runner.getTransientRuns(item.slug)).map((inputRun) => {
             const preserveWriteup =
               saved?.confirmed?.runID === inputRun.id ||
@@ -544,7 +646,7 @@ export async function startGuiServer(options: StartGuiOptions) {
             slug: item.slug,
             category: item.category ?? "OTHER",
             storagePath: path.relative(
-              path.join(stateRoot, "challenges"),
+              stateRoot,
               item.sourceDirectory ?? item.directory,
             ).split(path.sep).join("/"),
             ...(item.difficulty ? { difficulty: item.difficulty } : {}),
@@ -584,7 +686,7 @@ export async function startGuiServer(options: StartGuiOptions) {
     const saved = persisted.challenges[item.slug]
     if (saved?.state || saved?.confirmed) return undefined
     if (runner.getTransientRuns(item.slug).length > 0) return undefined
-    const history = await readChallengeRuns(root, item.slug)
+    const history = await readChallengeRuns(root, item.slug, { files: false, eventTail: 20 })
     const previous = history.at(-1)
     if (!previous) return { challenge: item }
     if (previous.taskStatus === "archived" || previous.acceptedFlag || previous.confirmedFlag)
@@ -714,10 +816,17 @@ export async function startGuiServer(options: StartGuiOptions) {
       : run
   }
 
-  const server = Bun.serve({
-    hostname,
-    port: options.port ?? 7331,
-    async fetch(request, bunServer) {
+  // Loopback binding keeps remote browsers out, but without a credential any local process could
+  // drive the API. The token is created once per installation and handed to callers exclusively
+  // through the startup URL; tests may opt out via tokenAuth: false.
+  const guiToken = options.tokenAuth === false ? undefined : await loadOrCreateGuiToken(boomStateHome())
+
+  /**
+   * Route one already-authenticated request. Extracted from Bun.serve so the fetch shell below can
+   * gate every response this handler returns and seed the strict session cookie when credentials
+   * arrived through the URL or a header instead of a cookie.
+   */
+  const route = async (request: Request, bunServer: { timeout(request: Request, seconds: number): void }): Promise<Response> => {
       const url = new URL(request.url)
       if (!LOOPBACK.has(url.hostname)) return json({ error: "Invalid Host header" }, 403)
       const origin = request.headers.get("origin")
@@ -798,10 +907,7 @@ export async function startGuiServer(options: StartGuiOptions) {
           return await exclusive(async () => {
             if (runner.hasWork()) throw new HttpError(409, "Stop active runs before changing root")
             if (typeof input.root !== "string") throw new HttpError(400, "root must be a path")
-            const next = await canonicalDirectory(input.root)
-            const challengeDirectory = await lstat(path.join(next, "challenges")).catch(() => undefined)
-            if (!challengeDirectory?.isDirectory())
-              throw new HttpError(400, `No challenges directory at ${path.join(next, "challenges")}`)
+            const next = await resolveWorkspaceRoot(input.root)
             const nextLoaded = await loadRootGuiState(next)
             const nextPersisted = stationaryRootState(nextLoaded)
             autopilot.stop()
@@ -1031,25 +1137,31 @@ export async function startGuiServer(options: StartGuiOptions) {
 
         if (request.method === "POST" && url.pathname === "/api/environments/discover") {
           const input = await body(request)
-          const profiles = await discoverCondaEnvironments(
-            typeof input.conda === "string" && input.conda.trim() ? input.conda.trim() : "conda",
-          )
-          const store = await loadEnvironmentStore()
-          for (const profile of profiles) {
-            const index = store.profiles.findIndex((item) => item.id === profile.id)
-            if (index === -1) store.profiles.push(profile)
-            else store.profiles[index] = { ...profile, installPolicy: store.profiles[index]!.installPolicy }
-          }
-          const saved = await saveEnvironmentStore(store)
-          broadcast({ at: Date.now(), type: "environments.changed" })
-          return json({ store: saved, discovered: profiles.length })
+          // Captured before exclusive() so the closure sees a const, matching the sibling handlers.
+          const conda = typeof input.conda === "string" && input.conda.trim() ? input.conda.trim() : "conda"
+          return await exclusive(async () => {
+            const profiles = await discoverCondaEnvironments(conda)
+            const store = await loadEnvironmentStore()
+            for (const profile of profiles) {
+              const index = store.profiles.findIndex((item) => item.id === profile.id)
+              if (index === -1) store.profiles.push(profile)
+              else store.profiles[index] = { ...profile, installPolicy: store.profiles[index]!.installPolicy }
+            }
+            const saved = await saveEnvironmentStore(store)
+            broadcast({ at: Date.now(), type: "environments.changed" })
+            return json({ store: saved, discovered: profiles.length })
+          })
         }
 
         if (request.method === "POST" && url.pathname === "/api/environments") {
           const input = await body(request)
           if (typeof input.interpreter !== "string" || input.interpreter.trim() === "")
             throw new HttpError(400, "interpreter must be an existing Python executable")
-          const profile = await probePythonEnvironment({
+          // Probe options are captured before exclusive() because the typeof guard above narrows
+          // input.interpreter only inside its own scope (see the server-host credential handler).
+          // The explicit parameter type keeps the discriminated `kind` narrow outside its guard.
+          const taskStorageRoots = await workspaceTaskStorageRoots(root)
+          const probeOptions: Parameters<typeof probePythonEnvironment>[0] = {
             interpreter: input.interpreter,
             ...(typeof input.displayName === "string" ? { displayName: input.displayName } : {}),
             ...(input.kind === "conda" || input.kind === "python" ? { kind: input.kind } : {}),
@@ -1058,24 +1170,31 @@ export async function startGuiServer(options: StartGuiOptions) {
               ? { installPolicy: input.installPolicy }
               : {}),
             ...(typeof input.id === "string" ? { id: input.id } : {}),
+            taskStorageRoots,
+          }
+          return await exclusive(async () => {
+            const profile = await probePythonEnvironment(probeOptions)
+            if (profile.status !== "ready")
+              throw new HttpError(400, profile.detail ?? `Python environment is ${profile.status}`)
+            const store = await upsertEnvironmentProfile(profile, input.makeDefault === true)
+            broadcast({ at: Date.now(), type: "environments.changed" })
+            return json({ profile, store }, 201)
           })
-          if (profile.status !== "ready")
-            throw new HttpError(400, profile.detail ?? `Python environment is ${profile.status}`)
-          const store = await upsertEnvironmentProfile(profile, input.makeDefault === true)
-          broadcast({ at: Date.now(), type: "environments.changed" })
-          return json({ profile, store }, 201)
         }
 
         if (request.method === "PATCH" && url.pathname === "/api/environments/default") {
           const input = await body(request)
           if (typeof input.profileId !== "string") throw new HttpError(400, "profileId must be a string")
-          const store = await loadEnvironmentStore()
-          if (!store.profiles.some((item) => item.id === input.profileId))
-            throw new HttpError(404, `No such environment profile: ${input.profileId}`)
-          store.defaultProfileId = input.profileId
-          const saved = await saveEnvironmentStore(store)
-          broadcast({ at: Date.now(), type: "environments.changed" })
-          return json({ store: saved })
+          const profileId = input.profileId
+          return await exclusive(async () => {
+            const store = await loadEnvironmentStore()
+            if (!store.profiles.some((item) => item.id === profileId))
+              throw new HttpError(404, `No such environment profile: ${profileId}`)
+            store.defaultProfileId = profileId
+            const saved = await saveEnvironmentStore(store)
+            broadcast({ at: Date.now(), type: "environments.changed" })
+            return json({ store: saved })
+          })
         }
 
         if (request.method === "PATCH" && url.pathname === "/api/environments/task") {
@@ -1753,7 +1872,8 @@ export async function startGuiServer(options: StartGuiOptions) {
             const category = normalizeChallengeCategory(
               typeof input.category === "string" ? input.category : path.basename(path.dirname(source)),
             )
-            const destination = path.join(root, "challenges", category, slug)
+            const catalogDirectory = (await resolveChallengeCatalog(root)).directory
+            const destination = path.join(catalogDirectory, category, slug)
             if (containsPath(source, destination) || containsPath(destination, source))
               throw new HttpError(400, "Import source and destination must not contain one another")
             await assertPathWithin(root, destination, true)
@@ -1859,8 +1979,52 @@ export async function startGuiServer(options: StartGuiOptions) {
               : 500
         return json({ error: error instanceof Error ? error.message : String(error) }, status)
       }
+  }
+
+  const server = Bun.serve({
+    hostname,
+    port: options.port ?? 7331,
+    async fetch(request, bunServer) {
+      if (guiToken === undefined) return route(request, bunServer)
+      const url = new URL(request.url)
+      const cookie = guiCookieValue(request, GUI_COOKIE)
+      const header = request.headers.get("x-boom-token")
+      const query = url.searchParams.get("token")
+      if (!guiTokenMatches(cookie ?? header ?? query, guiToken)) {
+        // Document navigations get a human-readable hint; everything else speaks JSON.
+        if (request.method === "GET" && !url.pathname.startsWith("/api/"))
+          return unauthenticatedGuiPage()
+        return json({
+          error:
+            "Boom GUI 需要鉴权：请使用启动横幅输出的带 ?token= 的完整 URL 打开，或在请求头携带 x-boom-token。",
+        }, 401)
+      }
+      const response = await route(request, bunServer)
+      // The credential arrived out-of-band (first navigation or a local API client): seed the
+      // strict cookie so every later frontend request authenticates without frontend changes.
+      if (cookie === undefined && (header !== null || query !== null)) {
+        const seeded = new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        })
+        seeded.headers.set(
+          "set-cookie",
+          `${GUI_COOKIE}=${guiToken}; HttpOnly; SameSite=Strict; Path=/`,
+        )
+        return seeded
+      }
+      return response
     },
   })
+
+  // Task agents reach the network broker, not the browser, so the GUI's own origin is denied to
+  // them explicitly. Registered for both loopback name spellings once the port is bound.
+  registerBoomControlPlaneOrigin(
+    `http://127.0.0.1:${server.port}`,
+    `http://localhost:${server.port}`,
+    ...(hostname === "::1" ? [`http://[::1]:${server.port}`] : []),
+  )
 
   if (!options.runner && options.startRuntime !== false)
     void runner.applyLiveModelSettings(persisted.settings).catch(() => {})
@@ -1875,11 +2039,14 @@ export async function startGuiServer(options: StartGuiOptions) {
     }
   }, 15_000)
   const url = server.url.toString()
-  if (options.open !== false) void openExternal(url)
+  // The full URL printed by the startup banner carries the token, so the first browser navigation
+  // both authenticates and receives the strict cookie; the frontend itself never sees credentials.
+  const authenticatedUrl = guiToken === undefined ? url : `${url}?token=${guiToken}`
+  if (options.open !== false) void openExternal(authenticatedUrl)
 
   return {
     server,
-    url,
+    url: authenticatedUrl,
     runner,
     async close() {
       if (closing) return

@@ -5,7 +5,7 @@ import path from "node:path"
 import { saveProviderStore, providerStorePath } from "../src/provider-config.ts"
 import { NativeProviderFailure, type NativeProviderRequest } from "../src/runtime/native-provider.ts"
 import { OpenAICompatibleProviderDriver } from "../src/runtime/openai-compatible-driver.ts"
-import { serverSentEvents } from "../src/runtime/provider-http.ts"
+import { providerFetch, serverSentEvents } from "../src/runtime/provider-http.ts"
 import {
   credentialStorePath,
   hasProviderAPIKey,
@@ -489,4 +489,48 @@ describe("Boom first-party Provider Drivers", () => {
     }
   })
 
+})
+
+describe("Provider transport hardening", () => {
+  test("surfaces an in-stream OpenAI-compatible error instead of swallowing it (M1)", async () => {
+    const driver = new OpenAICompatibleProviderDriver({
+      baseURL: "https://gateway.example/v1",
+      apiKey: "k",
+      fetch: (async () => sse([
+        { id: "req-1", choices: [{ delta: {} }] },
+        { id: "req-1", error: { code: "insufficient_quota", message: "You exceeded your current quota" } },
+        "[DONE]",
+      ])) as unknown as typeof fetch,
+    })
+    const request: NativeProviderRequest = {
+      conversationID: "conv", step: 1, agent: "a", model: "m",
+      system: "s", messages: [], tools: [], signal: new AbortController().signal,
+    }
+    await expect(Array.fromAsync(driver.stream(request))).rejects.toMatchObject({
+      failure: { message: "You exceeded your current quota", retryable: true },
+    })
+  })
+
+  test("carries Retry-After from 429 responses into the failure (M2)", async () => {
+    await expect(providerFetch({
+      baseURL: "https://gateway.example/v1",
+      endpoint: "chat/completions",
+      fetch: (async () => new Response("slow down", { status: 429, headers: { "retry-after": "7" } })) as unknown as typeof fetch,
+    })).rejects.toMatchObject({ failure: { statusCode: 429, retryAfterMs: 7_000 } })
+  })
+
+  test("treats a truncated tail after parsed events as non-retryable (EOF double-billing guard)", async () => {
+    const encoder = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: {\"id\":1}\r\n\r\n"))
+        controller.enqueue(encoder.encode("data: {\"id\":"))
+        controller.close()
+      },
+    })
+    const response = new Response(body, { headers: { "content-type": "text/event-stream" } })
+    await expect(Array.fromAsync(serverSentEvents(response))).rejects.toMatchObject({
+      failure: { category: "network", retryable: false },
+    })
+  })
 })

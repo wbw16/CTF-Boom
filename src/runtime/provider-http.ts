@@ -33,7 +33,17 @@ function redactKnownSecrets(value: string, values: Array<string | undefined>) {
   return output
 }
 
-function statusFailure(status: number, message: string, requestID?: string): RuntimeFailure {
+/** Parse a Retry-After header value (delta-seconds or HTTP-date) into milliseconds. */
+function retryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(600_000, Math.ceil(seconds * 1_000))
+  const date = Date.parse(value)
+  if (!Number.isNaN(date)) return Math.max(0, Math.min(600_000, date - Date.now()))
+  return undefined
+}
+
+function statusFailure(status: number, message: string, requestID?: string, retryAfter?: number): RuntimeFailure {
   const category = status === 401
     ? "authentication"
     : status === 403
@@ -48,6 +58,7 @@ function statusFailure(status: number, message: string, requestID?: string): Run
     category,
     statusCode: status,
     retryable: status === 408 || status === 409 || status === 429 || status >= 500,
+    ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}),
     ...(requestID ? { requestID } : {}),
   }
 }
@@ -63,6 +74,7 @@ async function boundedResponseText(response: Response, maximumBytes: number, tru
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let observed = 0
+  let completed = false
   try {
     while (true) {
       const item = await reader.read()
@@ -75,7 +87,10 @@ async function boundedResponseText(response: Response, maximumBytes: number, tru
       }
       chunks.push(item.value)
     }
+    completed = true
   } finally {
+    // An error or early exit must not leave the connection draining until GC.
+    if (!completed) await reader.cancel().catch(() => {})
     reader.releaseLock()
   }
   return new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))))
@@ -173,8 +188,20 @@ export async function providerFetch(input: ProviderHTTPClientOptions & {
   body?: unknown
   signal?: AbortSignal
   accept?: string
+  /** Hard ceiling on time-to-response-headers only; streaming bodies are never cut by it. */
+  connectTimeoutMs?: number
 }) {
   const request = input.fetch ?? fetch
+  // The connect timeout must not bound the whole exchange: LLM streams legitimately run for minutes.
+  // Its timer is cleared as soon as headers arrive, leaving only the caller's signal downstream.
+  const connectController = new AbortController()
+  const connectTimeoutMs = Math.max(0, input.connectTimeoutMs ?? 30_000)
+  const connectTimer = connectTimeoutMs > 0
+    ? setTimeout(() => connectController.abort(new Error("connect timed out")), connectTimeoutMs)
+    : undefined
+  const combined = input.signal
+    ? AbortSignal.any([input.signal, connectController.signal])
+    : connectController.signal
   let response: Response
   try {
     response = await request(providerEndpoint(input.baseURL, input.endpoint), {
@@ -186,7 +213,7 @@ export async function providerFetch(input: ProviderHTTPClientOptions & {
         ...input.headers,
       },
       ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
-      signal: input.signal,
+      signal: combined,
     })
   } catch (error) {
     if (input.signal?.aborted) throw providerFailure({
@@ -194,16 +221,24 @@ export async function providerFetch(input: ProviderHTTPClientOptions & {
       message: input.signal.reason instanceof Error ? input.signal.reason.message : "Provider request cancelled",
       category: "cancelled",
     })
+    if (!input.signal?.aborted && connectController.signal.aborted) throw providerFailure({
+      message: `Provider did not respond within ${Math.round(connectTimeoutMs / 1_000)}s`,
+      category: "network",
+      retryable: true,
+    })
     throw providerFailure({
       name: error instanceof Error ? error.name : undefined,
       message: error instanceof Error ? error.message : String(error),
       category: "network",
       retryable: true,
     })
+  } finally {
+    if (connectTimer !== undefined) clearTimeout(connectTimer)
   }
   if (!response.ok) {
     const body = await boundedResponseText(response, MAX_ERROR_BODY_BYTES, true).catch(() => "")
     const requestID = response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? undefined
+    const retryAfter = retryAfterMs(response.headers.get("retry-after"))
     const headerSecrets = Object.entries(input.headers ?? {}).flatMap(([name, value]) =>
       /authorization|api[-_]?key|token|secret/i.test(name) ? [value] : [],
     )
@@ -211,13 +246,23 @@ export async function providerFetch(input: ProviderHTTPClientOptions & {
       response.status,
       redactKnownSecrets(body, [input.apiKey, ...headerSecrets]),
       requestID,
+      retryAfter,
     ))
   }
   return response
 }
 
 /** Parse SSE framing without exposing transport chunk boundaries to a Provider Driver. */
-export async function* serverSentEvents(response: Response, signal?: AbortSignal): AsyncIterable<ServerSentEvent> {
+export async function* serverSentEvents(
+  response: Response,
+  signal?: AbortSignal,
+  /**
+   * Reset on every received chunk. A gateway that accepts the connection and then goes silent must
+   * not hold a provider slot forever; LLM streams legitimately pause between tokens, so this bounds
+   * idleness rather than total duration.
+   */
+  idleTimeoutMs = 120_000,
+): AsyncIterable<ServerSentEvent> {
   if (!response.body) throw providerFailure({
     message: "Provider returned no response stream",
     category: "malformed-response",
@@ -230,10 +275,31 @@ export async function* serverSentEvents(response: Response, signal?: AbortSignal
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
+  let parsedEvents = 0
+  let stallReject: ((reason?: unknown) => void) | undefined
+  const stalled = new Promise<never>((_, reject) => {
+    stallReject = reject
+  })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const armIdleTimer = () => {
+    if (idleTimeoutMs <= 0) return
+    if (timer !== undefined) clearTimeout(timer)
+    timer = setTimeout(() => {
+      stallReject?.(providerFailure({
+        message: `Provider stream went silent for over ${Math.round(idleTimeoutMs / 1_000)}s`,
+        category: "network",
+        retryable: true,
+      }))
+    }, idleTimeoutMs)
+  }
+  // Whether the stream reached its natural end. Anything else (consumer break/return, throw, stall)
+  // must cancel the body so the underlying HTTP connection is not left draining until GC.
+  let completed = false
   try {
     while (true) {
       signal?.throwIfAborted()
-      const item = await reader.read()
+      armIdleTimer()
+      const item = await Promise.race([reader.read(), stalled])
       if (item.done) break
       buffer += decoder.decode(item.value, { stream: true })
       while (true) {
@@ -247,17 +313,26 @@ export async function* serverSentEvents(response: Response, signal?: AbortSignal
         const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim()
         const data = lines.filter((line) => line.startsWith("data:"))
           .map((line) => line.slice(5).replace(/^ /, "")).join("\n")
-        if (data) yield { ...(event ? { event } : {}), data }
+        if (data) {
+          parsedEvents += 1
+          yield { ...(event ? { event } : {}), data }
+        }
       }
       if (Buffer.byteLength(buffer) > MAX_SSE_EVENT_BYTES)
         throw providerFailure({ message: "Provider SSE event exceeded Boom's limit", category: "malformed-response" })
     }
     buffer += decoder.decode()
-    if (buffer.trim()) throw providerFailure({
-      message: "Provider SSE stream ended with an incomplete event",
-      category: "network",
-      retryable: true,
-    })
+    if (buffer.trim()) {
+      // A half-delivered final event means the connection was cut mid-write. When this attempt has
+      // already produced events, replaying the whole step would double-bill the prefix; only a
+      // connection that died before its first event is worth retrying.
+      throw providerFailure({
+        message: "Provider SSE stream ended with an incomplete event",
+        category: "network",
+        retryable: parsedEvents === 0,
+      })
+    }
+    completed = true
   } catch (error) {
     await reader.cancel(error).catch(() => {})
     if (error instanceof NativeProviderFailure) throw error
@@ -273,6 +348,8 @@ export async function* serverSentEvents(response: Response, signal?: AbortSignal
       retryable: true,
     })
   } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (!completed) await reader.cancel().catch(() => {})
     reader.releaseLock()
   }
 }

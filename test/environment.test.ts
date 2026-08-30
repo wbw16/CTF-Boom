@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -7,6 +7,7 @@ import {
   controlledProcessEnvironment,
   detectContainerCapability,
   environmentPrompt,
+  fingerprint,
   loadTaskEnvironment,
   probePythonEnvironment,
 } from "../src/environment.ts"
@@ -124,5 +125,68 @@ describe("task Python environments", () => {
     expect(env.PYTHONPATH).toBeUndefined()
     await expect(executeControlledCommand({ directory, request: { program: "pip", args: ["install", "x"] } })).rejects.toThrow("purpose=install")
     await expect(executeControlledCommand({ directory, request: { program: "python", cwd: "../" } })).rejects.toThrow("escapes the workspace")
+  })
+})
+
+describe("environment hardening", () => {
+  test("fingerprints distinguish package sets regardless of key order", () => {
+    const base = { interpreter: "/usr/bin/python3", pythonVersion: "3.12.1", architecture: "arm64" }
+    const withRequests = fingerprint({ ...base, packages: { requests: "2.31.0" } })
+    expect(withRequests).not.toBe(fingerprint({ ...base, packages: { requests: "2.32.0" } }))
+    expect(withRequests).not.toBe(fingerprint({ ...base, packages: {} }))
+    // Key order must not matter (the old array-replacer collapsed nested objects entirely).
+    expect(fingerprint({ ...base, packages: { a: "1", b: "2" } })).toBe(
+      fingerprint({ ...base, packages: { b: "2", a: "1" } }),
+    )
+  })
+
+  test("rejects interpreters inside temporary directories or task storage", async () => {
+    const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "boom-probe-policy-"))
+    temporary.push(temporaryDirectory)
+    const fake = path.join(temporaryDirectory, "evil-python")
+    await writeFile(fake, "#!/bin/sh\nexit 0\n")
+    await chmod(fake, 0o755)
+    const rejected = await probePythonEnvironment({ interpreter: fake })
+    expect(rejected.status).toBe("invalid")
+    expect(rejected.detail).toContain("temporary")
+
+    const storage = path.join(temporaryDirectory, "runs", "some-challenge", "run-1")
+    await mkdir(storage, { recursive: true })
+    const planted = path.join(storage, "python")
+    await writeFile(planted, "#!/bin/sh\nexit 0\n")
+    await chmod(planted, 0o755)
+    const blocked = await probePythonEnvironment({ interpreter: planted })
+    expect(blocked.status).toBe("invalid")
+    expect(blocked.detail).toContain("task storage")
+  })
+
+  test("rejects interpreters planted in root-level challenge directories via taskStorageRoots", async () => {
+    const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "boom-probe-policy-"))
+    temporary.push(temporaryDirectory)
+    const challenge = path.join(temporaryDirectory, "WEB", "login", "files")
+    await mkdir(challenge, { recursive: true })
+    const planted = path.join(challenge, "python")
+    await writeFile(planted, "#!/bin/sh\nexit 0\n")
+    await chmod(planted, 0o755)
+
+    // The path carries neither a `runs` nor a `challenges` segment, so only the explicit
+    // workspace storage roots can catch it.
+    const blocked = await probePythonEnvironment({
+      interpreter: planted,
+      taskStorageRoots: [path.join(temporaryDirectory, "WEB", "login")],
+    })
+    expect(blocked.status).toBe("invalid")
+    expect(blocked.detail).toContain("task storage")
+
+    const unlisted = path.join(temporaryDirectory, "WEB", "other", "files", "python")
+    await mkdir(path.dirname(unlisted), { recursive: true })
+    await writeFile(unlisted, "#!/bin/sh\nexit 0\n")
+    await chmod(unlisted, 0o755)
+    const outside = await probePythonEnvironment({
+      interpreter: unlisted,
+      taskStorageRoots: [path.join(temporaryDirectory, "WEB", "login")],
+    })
+    expect(outside.status).toBe("invalid")
+    expect(outside.detail).not.toContain("task storage")
   })
 })

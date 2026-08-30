@@ -9,7 +9,7 @@ export function DeleteDialog() {
   if (!data || !deleteTarget) return null
   const challenge = data.challenges.find((item) => item.slug === deleteTarget)
   if (!challenge) return null
-  const path = `challenges/${challenge.storagePath || `${categoryOf(challenge)}/${challenge.slug}`}/ + runs/${challenge.slug}/`
+  const path = `${challenge.storagePath || `challenges/${categoryOf(challenge)}/${challenge.slug}`}/ + runs/${challenge.slug}/`
 
   return (
     <Modal

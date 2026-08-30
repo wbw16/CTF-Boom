@@ -114,7 +114,18 @@ async function capture(command: string[], timeout = 10_000) {
     stdout: "pipe",
     stderr: "pipe",
   })
-  const timer = setTimeout(() => child.kill(), timeout)
+  // A probe that ignores SIGTERM must not hang task startup forever: escalate to SIGKILL.
+  let escalate: ReturnType<typeof setTimeout> | undefined
+  const timer = setTimeout(() => {
+    child.kill()
+    escalate = setTimeout(() => {
+      try {
+        child.kill("SIGKILL")
+      } catch {
+        // Already exited between the two signals.
+      }
+    }, 3_000)
+  }, timeout)
   try {
     const [status, stdout, stderr] = await Promise.all([
       child.exited,
@@ -124,17 +135,37 @@ async function capture(command: string[], timeout = 10_000) {
     return { status, stdout, stderr }
   } finally {
     clearTimeout(timer)
+    if (escalate !== undefined) clearTimeout(escalate)
   }
 }
 
-function fingerprint(input: {
+/**
+ * Deterministic serialization for environment fingerprints. JSON.stringify's array-replacer form
+ * whitelists keys at every depth, so nested objects whose keys are absent from the top-level key
+ * list silently collapsed to {} — package sets contributed nothing. Walk the value instead and
+ * sort object keys recursively (undefined values dropped, matching JSON semantics).
+ */
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue)
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, item]) => item !== undefined)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, item]) => [key, stableValue(item)]),
+    )
+  }
+  return value
+}
+
+export function fingerprint(input: {
   interpreter: string
   pythonVersion: string
   architecture: string
   packages: Record<string, string | undefined>
 }) {
   return createHash("sha256")
-    .update(JSON.stringify(input, Object.keys(input).sort()))
+    .update(JSON.stringify(stableValue(input)))
     .digest("hex")
 }
 
@@ -173,23 +204,42 @@ function parseProfile(value: unknown): PythonEnvironmentProfile | undefined {
   }
 }
 
+/** Move an unreadable store aside so the next save cannot silently destroy it, then fail loudly. */
+async function quarantineCorruptStore(target: string, reason: string): Promise<never> {
+  const backup = `${target}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`
+  const moved = await rename(target, backup)
+    .then(() => true)
+    .catch(() => false)
+  throw new Error(
+    `Failed to read the environment store at ${target}: ${reason}. ` +
+      (moved
+        ? `The corrupt file was preserved at ${backup}; inspect or delete it, then retry.`
+        : `Automatic quarantine failed; move the file aside manually before retrying.`),
+  )
+}
+
 export async function loadEnvironmentStore(): Promise<EnvironmentStore> {
-  const raw = await readFile(storePath(), "utf8").catch(() => undefined)
-  if (!raw) return { version: 1, profiles: [] }
+  const target = storePath()
+  const info = await lstat(target).catch(() => undefined)
+  if (!info) return { version: 1, profiles: [] }
+  if (!info.isFile() || info.isSymbolicLink())
+    throw new Error(`Environment store is not a real file: ${target}`)
+  let parsed: unknown
   try {
-    const input = object(JSON.parse(raw))
-    const profiles = Array.isArray(input?.profiles)
-      ? input.profiles.flatMap((item) => parseProfile(item) ?? [])
-      : []
-    return {
-      version: 1,
-      ...(typeof input?.defaultProfileId === "string"
-        ? { defaultProfileId: input.defaultProfileId }
-        : {}),
-      profiles,
-    }
-  } catch {
-    return { version: 1, profiles: [] }
+    parsed = JSON.parse(await readFile(target, "utf8"))
+  } catch (error) {
+    return await quarantineCorruptStore(
+      target,
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+  const input = object(parsed)
+  if (!input || !Array.isArray(input.profiles))
+    return await quarantineCorruptStore(target, "expected an object with a profiles array")
+  return {
+    version: 1,
+    ...(typeof input.defaultProfileId === "string" ? { defaultProfileId: input.defaultProfileId } : {}),
+    profiles: input.profiles.flatMap((item) => parseProfile(item) ?? []),
   }
 }
 
@@ -215,6 +265,35 @@ export async function saveEnvironmentStore(store: EnvironmentStore) {
   return normalized
 }
 
+/**
+ * Task agents can plant executables inside run workspaces and temporary directories; probing such
+ * a path would execute attacker-controlled code with the operator's privileges on the host.
+ *
+ * The segment check is a heuristic for callers without workspace context. Callers that know the
+ * workspace pass its storage explicitly (`taskStorageRoots`: runs/ plus every challenge directory)
+ * because challenge folders can sit directly under a root (WEB/PWN/MISC layout) without ever
+ * producing a `challenges` segment.
+ */
+async function interpreterPolicyRejection(
+  interpreter: string,
+  taskStorageRoots: string[] = [],
+): Promise<string | undefined> {
+  const segments = interpreter.split(path.sep)
+  if (segments.includes("runs") || segments.includes("challenges"))
+    return "the interpreter path crosses Boom task storage (`runs`/`challenges`); select one from a system or dedicated environment prefix instead"
+  for (const candidate of taskStorageRoots) {
+    const resolved = await realpath(candidate).catch(() => undefined)
+    if (resolved !== undefined && inside(resolved, interpreter))
+      return "the interpreter path crosses Boom task storage (`runs`/challenge directories); select one from a system or dedicated environment prefix instead"
+  }
+  // The caller already realpath-resolved `interpreter`, so the temporary root must be resolved too
+  // (on macOS /var/folders is a symlink to /private/var/folders and a lexical compare never hits).
+  const tmp = await realpath(os.tmpdir()).catch(() => path.resolve(os.tmpdir()))
+  if (inside(tmp, interpreter))
+    return "interpreters inside temporary directories are not accepted; install or select a stable environment instead"
+  return undefined
+}
+
 export async function probePythonEnvironment(input: {
   interpreter: string
   displayName?: string
@@ -222,6 +301,8 @@ export async function probePythonEnvironment(input: {
   prefix?: string
   installPolicy?: InstallPolicy
   id?: string
+  /** Workspace storage roots (runs/, challenge directories) to reject regardless of spelling. */
+  taskStorageRoots?: string[]
 }): Promise<PythonEnvironmentProfile> {
   const requested = path.resolve(input.interpreter)
   let interpreter: string
@@ -249,6 +330,28 @@ export async function probePythonEnvironment(input: {
       }),
       status: "missing",
       detail: error instanceof Error ? error.message : String(error),
+    }
+  }
+  const policyRejection = await interpreterPolicyRejection(interpreter, input.taskStorageRoots)
+  if (policyRejection) {
+    return {
+      id: safeID(input.id ?? path.basename(requested)),
+      displayName: input.displayName?.trim() || path.basename(requested),
+      kind: input.kind ?? "python",
+      interpreter: requested,
+      ...(input.prefix ? { prefix: path.resolve(input.prefix) } : {}),
+      pythonVersion: "unknown",
+      architecture: "unknown",
+      packages: {},
+      installPolicy: input.installPolicy ?? "deny",
+      fingerprint: fingerprint({
+        interpreter: requested,
+        pythonVersion: "unknown",
+        architecture: "unknown",
+        packages: {},
+      }),
+      status: "invalid",
+      detail: policyRejection,
     }
   }
   const result = await capture([interpreter, "-I", "-c", PROBE])

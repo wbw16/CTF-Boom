@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -320,6 +320,43 @@ describe("multi-model consultation", () => {
       )
       expect(remaining).toMatchObject({ tokens: 760, repeats: 5 })
       expect(remaining!.timeout).toBeGreaterThan(59_000)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("refuses to persist when an output file is a planted symlink", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "boom-consult-link-"))
+    try {
+      const consultation = await conductConsultation({
+        trigger: "manual",
+        expertModels: ["openai/a", "anthropic/b"],
+        synthesizerModel: "openai/main",
+        context: snapshot,
+        ask: async ({ model, title }) =>
+          reply(model, title === "Boom consult synthesis" ? "merged" : `plan ${model}`),
+      })
+      await mkdir(path.join(directory, "work"))
+
+      const outside = path.join(directory, "outside.json")
+      await writeFile(outside, "host payload")
+      await symlink(outside, path.join(directory, "work", "consultation.json"))
+      await expect(persistConsultation(directory, consultation)).rejects.toThrow(
+        /not a real file/,
+      )
+      expect(await readFile(outside, "utf8")).toBe("host payload")
+
+      // The same guard protects the markdown artifact.
+      const outsideMarkdown = path.join(directory, "outside.md")
+      await writeFile(outsideMarkdown, "host notes")
+      await rm(path.join(directory, "work", "consultation.json"))
+      await symlink(outsideMarkdown, path.join(directory, "work", "CONSULTATION.md"))
+      await expect(persistConsultation(directory, consultation)).rejects.toThrow(
+        /not a real file/,
+      )
+      expect(await readFile(outsideMarkdown, "utf8")).toBe("host notes")
+      expect((await readdir(path.join(directory, "work"))).filter((name) => name.endsWith(".tmp")))
+        .toEqual([])
     } finally {
       await rm(directory, { recursive: true, force: true })
     }

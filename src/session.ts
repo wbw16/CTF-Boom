@@ -1209,8 +1209,20 @@ export async function runChallenge(input: {
   // Abort can also arrive while the event subscription is being established. Never send a prompt
   // after the session has already been stopped.
   if (input.signal?.aborted && stop === undefined) await abort("aborted", "aborted by user")
+  // Cancellation fast lane for the prompt itself. `subscription.signal` fires on every internal stop
+  // (deadline, watchdog, stall, error) because `abort` trips it first; `input.signal` covers user
+  // cancellation. Both keep their existing behaviour — the runtime-contract signal only lets an
+  // in-flight prompt unwind immediately instead of waiting for the abort HTTP path.
+  const cancelSources = [input.signal, subscription.signal].filter(
+    (signal): signal is AbortSignal => signal !== undefined,
+  )
   const sendPrompt = (text: string) =>
-    conversation.prompt({ agent: AGENT, model: input.model, text })
+    conversation.prompt({
+      agent: AGENT,
+      model: input.model,
+      text,
+      ...(cancelSources.length > 0 ? { signal: AbortSignal.any(cancelSources) } : {}),
+    })
   const retried: string[] = []
   const retryBaseMs = Math.max(0, Math.floor(input.limits.retryBaseMs ?? 2_000))
   const promptWithProviderRecovery = async (initialText: string, label: string) => {
@@ -1436,9 +1448,11 @@ export async function runChallenge(input: {
   let submission = undefined
   try {
     const stored = await loadCandidateSubmission(input.workspace.directory)
-    // The slot is task-durable, but a result belongs only to the conversation that called the tool.
-    // This prevents a continuation from silently reusing a previous turn's candidate.
-    if (stored?.sessionID === sessionID && input.purpose !== "writeup") submission = stored
+    // The slot is task-durable, but a result belongs only to the conversation that called the tool,
+    // and only until its gate evaluation consumed it. This prevents a continuation from silently
+    // reusing a previous turn's candidate — including one the gate already accepted or rejected.
+    if (stored?.sessionID === sessionID && !stored.consumedAt && input.purpose !== "writeup")
+      submission = stored
   } catch (error) {
     await emit({
       type: "status",

@@ -264,10 +264,11 @@ async function readRunText(directory: string, relative: string) {
   }
 }
 
-async function readEvents(directory: string) {
-  const raw = (await readRunText(directory, path.join("work", "events.jsonl"))) ?? ""
+function parseEventLines(raw: string, skipLeadingPartial: boolean) {
   const events: RunEvent[] = []
-  for (const line of raw.split(/\r?\n/)) {
+  const lines = raw.split(/\r?\n/)
+  if (skipLeadingPartial && lines.length > 0) lines.shift()
+  for (const line of lines) {
     if (line.trim() === "") continue
     try {
       const parsed = JSON.parse(line) as Record<string, unknown> | null
@@ -299,6 +300,10 @@ async function readEvents(directory: string) {
   return events
 }
 
+async function readEvents(directory: string) {
+  return parseEventLines((await readRunText(directory, path.join("work", "events.jsonl"))) ?? "", false)
+}
+
 async function listFiles(directory: string, base = "", output: RunFile[] = []): Promise<RunFile[]> {
   if (output.length >= 2_000) return output
   const entries = await readdir(path.join(directory, base), { withFileTypes: true }).catch(() => [])
@@ -317,12 +322,94 @@ async function listFiles(directory: string, base = "", output: RunFile[] = []): 
   return output
 }
 
-export async function readRunHistory(root: string, slug: string, runID: string): Promise<RunHistory> {
-  const directory = await assertPathWithin(root, path.join(root, "runs", slug, runID))
-  const resultFile = path.join(directory, "result.json")
+/**
+ * Options controlling how much durable state gets loaded for one run. List views pass lighter
+ * options because they render bounded summaries; detail views keep the defaults.
+ */
+export type ReadRunHistoryOptions = {
+  /** Recursively enumerate files under the run directory. Defaults to true. */
+  files?: boolean
+  /** Keep only the most recent N events instead of parsing the whole log. Defaults to all. */
+  eventTail?: number
+}
+
+/** Hard cap on how many trailing bytes of an event log a tail-bounded refresh reads. */
+const EVENT_TAIL_BYTES = 262_144
+
+async function readEventTail(directory: string, tail: number): Promise<RunEvent[]> {
+  if (!Number.isFinite(tail) || tail <= 0) return []
+  const target = path.join(directory, "work", "events.jsonl")
+  try {
+    const info = await lstat(target)
+    if (!info.isFile() || info.isSymbolicLink()) return []
+    const safe = await assertPathWithin(directory, target)
+    const handle = await open(safe, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      const size = Number(info.size)
+      const start = Math.max(0, size - EVENT_TAIL_BYTES)
+      const length = size - start
+      if (length === 0) return []
+      const buffer = Buffer.allocUnsafe(length)
+      const read = await handle.read(buffer, 0, length, start)
+      return parseEventLines(buffer.toString("utf8", 0, read.bytesRead), start > 0).slice(-tail)
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Everything the assembled history depends on lives at these paths (or directly inside these
+ * directories). Directory entries catch files appearing, disappearing, or being swapped; explicit
+ * entries catch in-place rewrites regardless of depth. Nothing deeper can change the assembled
+ * output, so this fingerprint is complete for cache validity.
+ */
+const RUN_WATCHED_PATHS = [
+  ".",
+  "result.json",
+  "task.json",
+  "NOTES.md",
+  "work",
+  path.join("work", "events.jsonl"),
+  path.join("work", "WRITEUP.md"),
+  path.join("work", "RESULT.json"),
+  path.join("work", ".boom", "candidate.json"),
+  path.join("work", ".boom", "environment.json"),
+]
+
+async function runPartsFingerprint(directory: string) {
+  const marks = await Promise.all(
+    RUN_WATCHED_PATHS.map(async (relative) => {
+      const info = await lstat(path.join(directory, relative)).catch(() => undefined)
+      return `${relative}:${info ? `${info.mtimeMs}:${info.size}` : "-"}`
+    }),
+  )
+  return marks.join("|")
+}
+
+type RunDiskParts = {
+  result: Record<string, unknown>
+  resultExists: boolean
+  resultInvalid?: string
+  resultModifiedAt?: string
+  events: RunEvent[]
+  task?: ReturnType<typeof parseTaskRecord>
+  notes: string
+  writeupText: string
+  writeup: ReturnType<typeof parseWriteup>
+  submission?: Awaited<ReturnType<typeof loadCandidateSubmission>>
+  environment?: TaskEnvironmentBinding
+}
+
+const runPartsCache = new Map<string, { fingerprint: string; parts: RunDiskParts }>()
+const RUN_PARTS_CACHE_LIMIT = 1024
+
+async function buildRunParts(directory: string, eventTail?: number): Promise<RunDiskParts> {
   const raw = await readRunText(directory, "result.json")
   let result: Record<string, unknown> = {}
-  let invalid: string | undefined
+  let resultInvalid: string | undefined
   if (raw !== undefined) {
     try {
       const parsed = JSON.parse(raw) as unknown
@@ -330,17 +417,12 @@ export async function readRunHistory(root: string, slug: string, runID: string):
         throw new Error("expected a JSON object")
       result = parsed as Record<string, unknown>
     } catch (error) {
-      invalid = `invalid result.json: ${error instanceof Error ? error.message : String(error)}`
+      resultInvalid = `invalid result.json: ${error instanceof Error ? error.message : String(error)}`
     }
   }
-  const declaredRunID = string(result.runID) ?? string(result.run_id)
-  if (declaredRunID !== undefined && declaredRunID !== runID)
-    invalid ??= `invalid result.json: run_id does not match directory (${declaredRunID})`
-  const declaredStop = string(result.stop)
-  if (declaredStop !== undefined && !RESULT_STOPS.has(declaredStop as Outcome["stop"]))
-    invalid ??= `invalid result.json: unknown stop value (${declaredStop})`
-
-  const events = await readEvents(directory)
+  const resultStat = await lstat(path.join(directory, "result.json")).catch(() => undefined)
+  const events =
+    eventTail === undefined ? await readEvents(directory) : await readEventTail(directory, eventTail)
   const taskRaw = await readRunText(directory, "task.json")
   let task = undefined
   if (taskRaw) {
@@ -352,11 +434,53 @@ export async function readRunHistory(root: string, slug: string, runID: string):
   }
   const notes = (await readRunText(directory, "NOTES.md")) ?? ""
   const writeupText = (await readRunText(directory, path.join("work", "WRITEUP.md"))) ?? ""
-  const writeup = parseWriteup(writeupText)
+  return {
+    result,
+    resultExists: raw !== undefined,
+    resultInvalid,
+    resultModifiedAt: resultStat ? resultStat.mtime.toISOString() : undefined,
+    events,
+    task,
+    notes,
+    writeupText,
+    writeup: parseWriteup(writeupText),
+    submission: await loadCandidateSubmission(directory).catch(() => undefined),
+    environment: await loadTaskEnvironment(directory).catch(() => undefined),
+  }
+}
+
+async function loadRunParts(cacheKey: string, directory: string, eventTail?: number) {
+  const fingerprint = await runPartsFingerprint(directory)
+  const hit = runPartsCache.get(cacheKey)
+  if (hit && hit.fingerprint === fingerprint) {
+    // Refresh recency so the eviction pass drops genuinely cold runs first.
+    runPartsCache.delete(cacheKey)
+    runPartsCache.set(cacheKey, hit)
+    return hit.parts
+  }
+  const parts = await buildRunParts(directory, eventTail)
+  runPartsCache.delete(cacheKey)
+  runPartsCache.set(cacheKey, { fingerprint, parts })
+  while (runPartsCache.size > RUN_PARTS_CACHE_LIMIT) {
+    const oldest = runPartsCache.keys().next().value
+    if (oldest === undefined) break
+    runPartsCache.delete(oldest)
+  }
+  return parts
+}
+
+function assembleRunHistory(runID: string, parts: RunDiskParts, files: RunFile[]): RunHistory {
+  const { result, events, task, notes, writeupText, writeup, submission } = parts
+  let invalid = parts.resultInvalid
+  const declaredRunID = string(result.runID) ?? string(result.run_id)
+  if (declaredRunID !== undefined && declaredRunID !== runID)
+    invalid ??= `invalid result.json: run_id does not match directory (${declaredRunID})`
+  const declaredStop = string(result.stop)
+  if (declaredStop !== undefined && !RESULT_STOPS.has(declaredStop as Outcome["stop"]))
+    invalid ??= `invalid result.json: unknown stop value (${declaredStop})`
   const reply = string(result.reply) ?? ""
   const declaredReplyCandidates = findDeclaredCandidates(reply)
   const rejected = new Set(task?.rejectedFlags ?? [])
-  const submission = await loadCandidateSubmission(directory).catch(() => undefined)
   const submittedCandidate = submission && !rejected.has(submission.flag)
     ? submission.flag
     : undefined
@@ -407,9 +531,8 @@ export async function readRunHistory(root: string, slug: string, runID: string):
     : undefined)
   const startedAt =
     task?.createdAt ?? string(result.startedAt) ?? string(result.started_at) ?? runTimestamp(runID)
-  const resultStat = raw === undefined ? undefined : await lstat(resultFile).catch(() => undefined)
   const finishedAt =
-    string(result.finishedAt) ?? string(result.finished_at) ?? (resultStat ? resultStat.mtime.toISOString() : undefined)
+    string(result.finishedAt) ?? string(result.finished_at) ?? parts.resultModifiedAt
   const duration =
     number(result.durationMs) ||
     number(result.duration_ms) ||
@@ -433,7 +556,7 @@ export async function readRunHistory(root: string, slug: string, runID: string):
     runtimeBackend: string(result.runtimeBackend) ?? string(result.runtime_backend),
     runtimeVersion: string(result.runtimeVersion) ?? string(result.runtime_version),
     promptVersion: string(result.promptVersion) ?? string(result.prompt_version),
-    stop: raw === undefined ? "interrupted" : invalid ? "error" : declaredStop ?? "interrupted",
+    stop: !parts.resultExists ? "interrupted" : invalid ? "error" : declaredStop ?? "interrupted",
     tokens: totals?.tokens ?? number(result.tokens),
     billableTokens:
       totals?.billableTokens ?? (number(result.billableTokens) || number(result.billable_tokens)),
@@ -469,7 +592,7 @@ export async function readRunHistory(root: string, slug: string, runID: string):
     events,
     notes,
     writeup: writeupText || undefined,
-    files: await listFiles(directory),
+    files,
     taskStatus: task?.status,
     turns: task?.turns,
     candidateHistory,
@@ -477,11 +600,28 @@ export async function readRunHistory(root: string, slug: string, runID: string):
     acceptedFlag: task?.acceptedFlag?.value,
     consultation: runConsultation,
     contextPolicy: runContextPolicy,
-    environment: await loadTaskEnvironment(directory).catch(() => undefined),
+    environment: parts.environment,
   }
 }
 
-export async function readChallengeRuns(root: string, slug: string) {
+export async function readRunHistory(
+  root: string,
+  slug: string,
+  runID: string,
+  options: ReadRunHistoryOptions = {},
+): Promise<RunHistory> {
+  const directory = await assertPathWithin(root, path.join(root, "runs", slug, runID))
+  const cacheKey = `${directory}|events=${options.eventTail ?? "all"}`
+  const parts = await loadRunParts(cacheKey, directory, options.eventTail)
+  const files = options.files === false ? [] : await listFiles(directory)
+  return assembleRunHistory(runID, parts, files)
+}
+
+export async function readChallengeRuns(
+  root: string,
+  slug: string,
+  options: ReadRunHistoryOptions = {},
+) {
   const directory = path.join(root, "runs", slug)
   const safe = await assertPathWithin(root, directory, true)
   const entries = await readdir(safe, { withFileTypes: true }).catch(() => [])
@@ -489,7 +629,7 @@ export async function readChallengeRuns(root: string, slug: string) {
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue
     try {
-      runs.push(await readRunHistory(root, slug, entry.name))
+      runs.push(await readRunHistory(root, slug, entry.name, options))
     } catch {
       // A symlink escape or unreadable directory is excluded instead of exposing it.
     }

@@ -867,65 +867,89 @@ export function consultationHint(consultation: Consultation) {
 }
 
 export async function persistConsultation(directory: string, consultation: Consultation) {
-  const work = path.join(directory, "work")
-  await mkdir(work, { recursive: true })
-  await writeFile(
-    path.join(work, "consultation.json"),
-    `${JSON.stringify(
-      {
-        id: consultation.id,
-        trigger: consultation.trigger,
-        source_run_id: consultation.sourceRunID,
-        plans: consultation.plans,
-        failures: consultation.failures,
-        merged: consultation.merged,
-        degraded: consultation.degraded,
-        budgets: consultation.budgets,
-        tokens: consultation.tokens,
-        billable_tokens: consultation.billable,
-        cost: consultation.cost,
-        started_at: consultation.startedAt,
-        finished_at: consultation.finishedAt,
-      },
-      undefined,
-      2,
-    )}\n`,
-    "utf8",
-  )
-  await writeFile(
-    path.join(work, "CONSULTATION.md"),
+  const runRoot = await realpath(path.resolve(directory))
+  const work = path.join(runRoot, "work")
+  const existingWork = await lstat(work).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined
+    throw error
+  })
+  if (existingWork?.isSymbolicLink() || (existingWork && !existingWork.isDirectory()))
+    throw new Error("Consultation work directory is not a real directory")
+  if (!existingWork) await mkdir(work, { recursive: true, mode: 0o700 })
+  const workRoot = await realpath(work)
+  if (path.relative(runRoot, workRoot).startsWith(".."))
+    throw new Error("Consultation work directory escapes the run")
+  const files: Array<[name: string, contents: string]> = [
     [
-      "# Multi-model consultation",
-      "",
-      `- Trigger: ${consultation.trigger}`,
-      `- Consultation ID: ${consultation.id}`,
-      ...(consultation.sourceRunID ? [`- Source run: ${consultation.sourceRunID}`] : []),
-      `- Experts: ${consultation.plans.map((plan) => plan.model).join(", ")}`,
-      `- Synthesizer: ${consultation.merged.model}`,
-      ...(consultation.degraded ? [`- Degradation: ${consultation.degraded.detail}`] : []),
-      ...(consultation.failures.length > 0
-        ? [`- Failed experts: ${consultation.failures.map((failure) => failure.model).join(", ")}`]
-        : []),
-      ...consultation.plans.flatMap((plan, index) => [
+      "consultation.json",
+      `${JSON.stringify(
+        {
+          id: consultation.id,
+          trigger: consultation.trigger,
+          source_run_id: consultation.sourceRunID,
+          plans: consultation.plans,
+          failures: consultation.failures,
+          merged: consultation.merged,
+          degraded: consultation.degraded,
+          budgets: consultation.budgets,
+          tokens: consultation.tokens,
+          billable_tokens: consultation.billable,
+          cost: consultation.cost,
+          started_at: consultation.startedAt,
+          finished_at: consultation.finishedAt,
+        },
+        undefined,
+        2,
+      )}\n`,
+    ],
+    [
+      "CONSULTATION.md",
+      [
+        "# Multi-model consultation",
         "",
-        `## ${expertLabel(index)}: ${plan.model}`,
+        `- Trigger: ${consultation.trigger}`,
+        `- Consultation ID: ${consultation.id}`,
+        ...(consultation.sourceRunID ? [`- Source run: ${consultation.sourceRunID}`] : []),
+        `- Experts: ${consultation.plans.map((plan) => plan.model).join(", ")}`,
+        `- Synthesizer: ${consultation.merged.model}`,
+        ...(consultation.degraded ? [`- Degradation: ${consultation.degraded.detail}`] : []),
+        ...(consultation.failures.length > 0
+          ? [`- Failed experts: ${consultation.failures.map((failure) => failure.model).join(", ")}`]
+          : []),
+        ...consultation.plans.flatMap((plan, index) => [
+          "",
+          `## ${expertLabel(index)}: ${plan.model}`,
+          "",
+          plan.text,
+        ]),
+        ...consultation.failures.flatMap((failure) => [
+          "",
+          `## Failed expert: ${failure.model}`,
+          "",
+          failure.error,
+        ]),
         "",
-        plan.text,
-      ]),
-      ...consultation.failures.flatMap((failure) => [
+        `${consultation.degraded ? "## Degraded plan" : "## Synthesized plan"}: ${consultation.merged.model}`,
         "",
-        `## Failed expert: ${failure.model}`,
+        consultation.merged.text,
         "",
-        failure.error,
-      ]),
-      "",
-      `${consultation.degraded ? "## Degraded plan" : "## Synthesized plan"}: ${consultation.merged.model}`,
-      "",
-      consultation.merged.text,
-      "",
-    ].join("\n"),
-    "utf8",
-  )
+      ].join("\n"),
+    ],
+  ]
+  for (const [name, contents] of files) {
+    const target = path.join(workRoot, name)
+    const existing = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined
+      throw error
+    })
+    if (existing?.isSymbolicLink() || (existing && !existing.isFile()))
+      throw new Error(`Consultation artifact is not a real file: ${name}`)
+    // Atomic replace instead of an in-place write: a reader never observes a half-written artifact,
+    // and the rename lands on this exact path rather than following any planted link.
+    const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`
+    await writeFile(temporary, contents, { encoding: "utf8", mode: 0o600 })
+    await rename(temporary, target)
+  }
 }
 
 export function addConsultationUsage<T extends {

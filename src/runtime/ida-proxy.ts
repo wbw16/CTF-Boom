@@ -21,6 +21,7 @@ import {
   lstat,
   mkdir,
   readFile,
+  realpath,
   rename,
   writeFile,
 } from "node:fs/promises"
@@ -69,6 +70,8 @@ const UPSTREAM_TIMEOUT_MS = 120_000
 const MANIFEST_NAME = "index.jsonl"
 const MAX_MANIFEST_TAIL_BYTES = 2 * 1024 * 1024
 const MAX_ARTIFACT_READ_BYTES = 8 * 1024 * 1024
+/** Manifest 是 agent 可触达的状态：归档文件名必须是单段纯文件名且以 .txt 结尾，绝不信任 entry.file。 */
+const ARTIFACT_NAME_PATTERN = /^[A-Za-z0-9._-]{1,128}\.txt$/
 
 const LOCAL_TOOLS = new Set(["boom_ida_get", "boom_ida_list"])
 
@@ -102,6 +105,12 @@ function canonical(value: unknown): string {
 
 function digest(value: string) {
   return createHash("sha256").update(value).digest("hex")
+}
+
+/** 与 src/runtime/policy.ts 相同的包含判断习惯：path.relative 前缀检查（这里要求严格位于目录内）。 */
+function inside(base: string, target: string): boolean {
+  const relative = path.relative(base, target)
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative)
 }
 
 /** 逐行读取一个字节流，兼容任意分块；stdout/stdin 的 MCP stdio 帧就是一行一个 JSON。 */
@@ -482,8 +491,14 @@ async function handleLocalTool(state: ProxyState, message: Rpc) {
       if (!directory) throw new Error("IDA result archive unavailable (no task workspace found)")
       if (!id) throw new Error("boom_ida_get requires an id argument")
       const entry = (await readManifestTail(directory, 500)).find((item) => item.id === id)
-      if (!entry) throw new Error(`archive ID not found: ${id} (use boom_ida_list() to view available IDs)`)
+      // 条目缺失与条目损坏（file 字段非法）返回同一错误，不回显 entry.file，避免侧信道。
+      if (!entry || typeof entry.file !== "string" || !ARTIFACT_NAME_PATTERN.test(entry.file))
+        throw new Error(`archive ID not found: ${id} (use boom_ida_list() to view available IDs)`)
       const target = path.join(directory, entry.file)
+      // 二次防御：即使文件名通过校验，也必须真实解析回 results 目录内部（防目录级符号链接等）。
+      const [resultsReal, targetReal] = await Promise.all([realpath(directory), realpath(target)])
+      if (!inside(resultsReal, targetReal))
+        throw new Error(`archive ID not found: ${id} (use boom_ida_list() to view available IDs)`)
       const info = await lstat(target)
       if (!info.isFile()) throw new Error(`archive file is not a regular file: ${entry.file}`)
       if (info.size > MAX_ARTIFACT_READ_BYTES)

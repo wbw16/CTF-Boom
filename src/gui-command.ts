@@ -43,7 +43,7 @@ export function parseGuiArgs(
 ): GuiCommandOptions {
   const cwd = environment.cwd ?? process.cwd()
   const platform = environment.platform ?? process.platform
-  let root = path.resolve(cwd, "ctf")
+  let root = cwd
   let port = 0
   let explicitMode: GuiMode | undefined
   let help = false

@@ -35,6 +35,8 @@ export type RuntimeFailure = {
   category?: RuntimeFailureCategory
   statusCode?: number
   retryable?: boolean
+  /** Server-advised wait before retrying (Retry-After), in milliseconds. */
+  retryAfterMs?: number
   /** Bounded and redacted at the adapter boundary. Never contains headers or credentials. */
   responseBody?: string
   requestID?: string

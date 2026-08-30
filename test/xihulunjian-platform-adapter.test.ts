@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:f
 import os from "node:os"
 import path from "node:path"
 import {
+  FlagRejectedError,
   inferChallengeCategory,
   innerFlagValue,
   selectEndpoint,
@@ -624,4 +625,228 @@ test("revalidate forces a full re-pull of an unchanged challenge", async () => {
   await adapter.acquireChallenges({ root, revalidate: true })
   expect(detailCalls).toBe(2)
   expect(downloads).toBe(2)
+})
+
+/**
+ * Shared submission fixture: the platform-facing fields submitFlag reads, nothing else.
+ */
+function submissionChallenge(challengeID: string) {
+  return {
+    slug: "shopping",
+    directory: "/tmp/shopping",
+    description: "",
+    files: [],
+    flagFormat: "",
+    platform: { adapter: "xihulunjian", challengeID },
+  }
+}
+
+const SUBMISSION_WORKSPACE = { directory: "/tmp/run", runID: "r1", extracted: [] }
+
+test("throws on an exhausted 5xx whose body merely contains 错误 instead of a verdict (H3)", async () => {
+  let calls = 0
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () => {
+    calls += 1
+    // A gateway failure whose body text would have matched the old message regex and permanently
+    // gated this flag as "rejected" downstream.
+    return Response.json({ code: "50000", message: "服务器内部错误" }, { status: 500 })
+  }) as unknown as typeof fetch, instant)
+
+  // The transport error must surface as an error after retries exhaust — never as a verdict.
+  await expect(adapter.submitFlag({
+    challenge: submissionChallenge("10662"),
+    workspace: SUBMISSION_WORKSPACE,
+    candidate: "flag{maybe_right}",
+  })).rejects.toThrow(/服务器内部错误/)
+  expect(calls).toBe(5)
+})
+
+test("reports the structurally confirmed wrong answer as rejected with its own detail (H3)", async () => {
+  let calls = 0
+  const detail = "提交flag错误，请重新提交（当前还有9次提交机会）"
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () => {
+    calls += 1
+    return envelope(null, "40001", detail)
+  }) as unknown as typeof fetch, instant)
+
+  const result = await adapter.submitFlag({
+    challenge: submissionChallenge("10663"),
+    workspace: SUBMISSION_WORKSPACE,
+    candidate: "DASCTF{nope}",
+  })
+  expect(result).toMatchObject({ adapter: "xihulunjian", verdict: "rejected", detail })
+  // A definitive verdict is final: no rate-limit retries may burn quota behind it.
+  expect(calls).toBe(1)
+})
+
+test("classifies FlagRejectedError by construction and never from message text (H3)", () => {
+  const rejected = new FlagRejectedError("提交flag错误")
+  expect(rejected).toBeInstanceOf(Error)
+  expect(rejected.name).toBe("FlagRejectedError")
+  expect(rejected.detail).toBe("提交flag错误")
+})
+
+test("propagates a timeout as an error instead of a verdict (H3)", async () => {
+  let calls = 0
+  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () => {
+    calls += 1
+    // What AbortSignal.timeout produces when REQUEST_TIMEOUT_MS elapses.
+    throw new DOMException("The signal timed out.", "TimeoutError")
+  }) as unknown as typeof fetch, instant)
+
+  await expect(adapter.submitFlag({
+    challenge: submissionChallenge("10662"),
+    workspace: SUBMISSION_WORKSPACE,
+    candidate: "flag{slow}",
+  })).rejects.toThrow(/timed out/i)
+  expect(calls).toBe(5)
+})
+
+test("skips broken groups and entries without aborting the catalog sync (M23-a)", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-badgroup-"))
+  roots.push(root)
+  const originalWarn = console.warn
+  const warnings: string[] = []
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")) }
+  try {
+    const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (url.pathname === `${PREFIX}/ctf/exercise-list`) {
+        return envelope([
+          // A group whose ID fails identifier() validation: skipped, never fatal for the batch.
+          { id: null, name: "BrokenGroup", corpus: [{ id: 9001, name: "ghost", isOpen: true }] },
+          {
+            id: 3300,
+            name: "Misc",
+            corpus: [
+              // A broken entry must not hide its valid sibling in the same group.
+              { id: null, name: "broken-id", isOpen: true },
+              { id: 10702, name: "usable", isOpen: true, hasSolved: false },
+            ],
+          },
+        ])
+      }
+      if (url.pathname === `${PREFIX}/ctf/exercise`) {
+        return envelope({
+          id: Number(url.searchParams.get("exerciseId")),
+          name: "usable",
+          description: "继续处理这一题",
+          attachment: [],
+          endpoints: [],
+          endpointType: "none",
+          isNeedInit: false,
+          isNeedCheck: false,
+        })
+      }
+      return Response.json({ code: "40400" }, { status: 404 })
+    }) as typeof fetch, instant)
+
+    const challenges = await adapter.acquireChallenges({ root })
+    expect(challenges.map((item) => item.slug)).toEqual(["usable"])
+  } finally {
+    console.warn = originalWarn
+  }
+  // Both swallowed problems (one bad group, one bad entry) are summarized once.
+  expect(warnings.some((line) => line.includes("跳过 2 个无法物化的题目"))).toBe(true)
+})
+
+test("promotes the verified-complete copy to canonical before deleting anything (M23-b)", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-canonical-"))
+  roots.push(root)
+  let detailCalls = 0
+  let downloads = 0
+  const attachment = "joomla-6.1.2-full-package.tar.gz.zip"
+  const meta = (category: string) => `${JSON.stringify({
+    category,
+    platform: {
+      adapter: "xihulunjian",
+      challenge_id: "10701",
+      options: { exercise_id: "10701", attachments: [attachment] },
+    },
+  }, undefined, 2)}\n`
+  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
+    if (url.pathname === `${PREFIX}/ctf/exercise`) {
+      detailCalls += 1
+      return envelope(realDetail())
+    }
+    if (url.hostname === "pro-resource.example.com") {
+      downloads += 1
+      return new Response(new Uint8Array([1]))
+    }
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  // Copy A sits in the inferred category but is incomplete (interrupted download: the manifest
+  // names a file that never landed).
+  const incomplete = path.join(root, "challenges", "WEB", "REAL-01")
+  await mkdir(incomplete, { recursive: true })
+  await writeFile(path.join(incomplete, "README.md"), "# REAL-01\n")
+  await writeFile(path.join(incomplete, "meta.json"), meta("WEB"))
+  // Copy B is complete but filed under OTHER.
+  const complete = path.join(root, "challenges", "OTHER", "REAL-01")
+  await mkdir(path.join(complete, "files"), { recursive: true })
+  await writeFile(path.join(complete, "files", attachment), "payload")
+  await writeFile(path.join(complete, "README.md"), "# REAL-01\n")
+  await writeFile(path.join(complete, "meta.json"), meta("OTHER"))
+
+  const challenges = await adapter.acquireChallenges({ root })
+
+  // The complete copy became canonical with zero platform round-trips; the old order would have
+  // deleted it first and re-downloaded everything.
+  expect(detailCalls).toBe(0)
+  expect(downloads).toBe(0)
+  expect(challenges.map((item) => item.slug)).toEqual(["REAL-01"])
+  expect(challenges[0]!.category).toBe("WEB")
+  // ...then it was moved into the inferred category, payload byte-for-byte...
+  expect(await readFile(path.join(root, "challenges", "WEB", "REAL-01", "files", attachment), "utf8"))
+    .toBe("payload")
+  // ...and only then was the broken copy removed.
+  expect(await readdir(path.join(root, "challenges"))).toEqual(["WEB"])
+})
+
+test("deletes nothing when no local copy verifies complete (M23-b)", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-nodelete-"))
+  roots.push(root)
+  let detailCalls = 0
+  const attachment = "joomla-6.1.2-full-package.tar.gz.zip"
+  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
+    if (url.pathname === `${PREFIX}/ctf/exercise`) {
+      detailCalls += 1
+      // Non-retryable business failure: re-materialization cannot rescue the copies this cycle.
+      return envelope({}, "40002", "题目暂不可用")
+    }
+    return Response.json({ code: "40400" }, { status: 404 })
+  }) as typeof fetch, instant)
+
+  // Copy A: manifest recorded but its file is missing. Copy B: legacy meta with no manifest at
+  // all. Neither passes verification, so neither may be deleted.
+  const broken = path.join(root, "challenges", "WEB", "REAL-01")
+  await mkdir(broken, { recursive: true })
+  await writeFile(path.join(broken, "meta.json"), `${JSON.stringify({
+    category: "WEB",
+    platform: {
+      adapter: "xihulunjian",
+      challenge_id: "10701",
+      options: { exercise_id: "10701", attachments: [attachment] },
+    },
+  }, undefined, 2)}\n`)
+  const legacy = path.join(root, "challenges", "OTHER", "REAL-01-old")
+  await mkdir(legacy, { recursive: true })
+  await writeFile(path.join(legacy, "meta.json"), `${JSON.stringify({
+    category: "OTHER",
+    platform: { adapter: "xihulunjian", challenge_id: "10701", options: { exercise_id: "10701" } },
+  }, undefined, 2)}\n`)
+
+  const challenges = await adapter.acquireChallenges({ root })
+  expect(challenges).toEqual([])
+  // Re-materialization was attempted exactly once and failed non-retriably...
+  expect(detailCalls).toBe(1)
+  // ...yet both local copies survived untouched, ready for a later successful sync.
+  expect((await readdir(path.join(root, "challenges"))).sort()).toEqual(["OTHER", "WEB"])
+  expect(await readFile(path.join(broken, "meta.json"), "utf8")).toContain("10701")
+  expect(await readFile(path.join(legacy, "meta.json"), "utf8")).toContain("10701")
 })

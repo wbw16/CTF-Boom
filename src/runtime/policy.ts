@@ -147,7 +147,9 @@ export async function resolveTaskPath(
   if (access === "write") {
     if (zone !== "work" || segments.length < 2)
       throw new Error(`Boom policy denied write outside work/: ${requested}`)
-    if (segments[1] === ".boom" || relative === "work/RESULT.json")
+    // Host-owned subtrees agents must never rewrite: work/.boom/**, work/RESULT.json, and the
+    // IDA proxy archive work/ida/** (its results plus index.jsonl manifest).
+    if (segments[1] === ".boom" || segments[1] === "ida" || relative === "work/RESULT.json")
       throw new Error(`Boom policy denied write to host-owned task state: ${requested}`)
   }
   if (access === "read") {

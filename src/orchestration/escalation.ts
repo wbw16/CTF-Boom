@@ -45,11 +45,18 @@ export const AUTONOMY_THRESHOLDS = {
 /** Attach the in-turn dead-end brake to a solve turn's limits. */
 export function withStallBrake(limits: Limits, challengeBudget: number | undefined): Limits {
   if (typeof challengeBudget !== "number" || !Number.isFinite(challengeBudget) || challengeBudget <= 0) return limits
+  // The threshold is a share of the WHOLE challenge budget, not of the current turn, so late
+  // continuations do not acquire a hair-trigger brake. But a followup turn's limits come from the
+  // remaining autonomy allowance R, and once R < 25% of the original budget B the raw share would
+  // exceed everything the turn can spend — the brake could never fire again (a mathematical dead
+  // zone). So the share is additionally capped at this turn's actual token cap, while the absolute
+  // floor of 500 tokens keeps tiny budgets from making the brake trip on the first message.
+  const capped = typeof limits.tokens === "number" && Number.isFinite(limits.tokens)
+    ? Math.min(Math.floor(challengeBudget * AUTONOMY_THRESHOLDS.stalledInTurnBudgetRatio), Math.floor(limits.tokens))
+    : Math.floor(challengeBudget * AUTONOMY_THRESHOLDS.stalledInTurnBudgetRatio)
   return {
     ...limits,
-    stalledInTurnTokens: Math.floor(
-      challengeBudget * AUTONOMY_THRESHOLDS.stalledInTurnBudgetRatio,
-    ),
+    stalledInTurnTokens: Math.max(500, capped),
   }
 }
 

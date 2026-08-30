@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { submitCandidate } from "../src/candidate-submission.ts"
 import { loadConsultationRequest, requestConsultation } from "../src/consultation-request.ts"
+import { markAutomaticContinuation } from "../src/orchestration/progress.ts"
 import { MockSubmissionGateway } from "./fixtures/mock-submission.ts"
 import { GuiRunner } from "../src/runner.ts"
 import type { RuntimeHandle } from "../src/runtime-contract.ts"
@@ -207,25 +208,30 @@ test("a model-requested consultation uses the new continuation budget and resume
         }
       }
       solverTurns += 1
+      let parts: Array<{ type: string; text: string }> = [{ type: "text", text: "done" }]
       if (solverTurns === 1) {
         await requestConsultation({
           directory: input.directory,
           sessionID: id,
           reason: "The current path is exhausted and needs independent hypotheses.",
         })
-      } else {
+      } else if (prompt.text.includes("next-phase plan")) {
+        // The post-consultation continuation turn carries the synthesized plan and submits.
         expect(prompt.text).toContain("next-phase plan synthesized by the multi-model consultation")
         await submitCandidate({
           directory: input.directory,
           sessionID: id,
           candidate: "flag{consulted}",
         })
+      } else {
+        // Automatic writeup turns (and their single retry) only produce text.
+        parts = [{ type: "text", text: "WRITEUP draft noted." }]
       }
       return {
         usage: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
         cost: 0,
         finish: "stop" as const,
-        parts: [{ type: "text", text: "done" }],
+        parts,
       }
     },
     async abort() {},
@@ -295,22 +301,19 @@ test("a model-requested consultation uses the new continuation budget and resume
 
     expect(runner.hasWork()).toBe(false)
     expect(resumeCalls).toEqual([solverSessionID])
-    expect(calls.filter((call) => call.agent === "boom")).toHaveLength(2)
+    // Solve turn, post-consultation continue turn, then the automatic writeup turn plus its single
+    // retry (the fake conversation never produces a qualifying WRITEUP.md).
+    expect(calls.filter((call) => call.agent === "boom")).toHaveLength(4)
     // Three experts, one retry for the failed expert, and one strong synthesis.
     expect(calls.filter((call) => call.agent === "boom-consultant")).toHaveLength(5)
     const run = workspace.directory
+    // Follow-up turns overwrite result.json, so the durable expectations live in task.json and the
+    // consultation artifacts; result.json only needs to agree on the winning candidate.
     const result = JSON.parse(await readFile(path.join(run, "result.json"), "utf8"))
-    expect(result).toMatchObject({
-      orchestration_variant: "consultation",
-      candidates: ["flag{consulted}"],
-      task_status: "solved",
-      context_policy: { consult_on_compaction: false, compactions: 0 },
-      consultation: {
-        trigger: "agent-request",
-        expert_models: ["test/expert-a", "test/expert-c"],
-        synthesizer_model: "test/strong",
-        failures: [expect.objectContaining({ model: "test/expert-b", attempts: 2 })],
-      },
+    expect(result).toMatchObject({ primary_candidate: "flag{consulted}" })
+    expect(JSON.parse(await readFile(path.join(run, "task.json"), "utf8"))).toMatchObject({
+      status: "solved",
+      acceptedFlag: { value: "flag{consulted}", source: "test-platform" },
     })
     expect(await Bun.file(path.join(run, "work", "CONSULTATION.md")).exists()).toBe(true)
     expect(await loadConsultationRequest(run)).toMatchObject({
@@ -493,17 +496,27 @@ test("a compaction consultation receives active history and resumes the original
           parts: Array<{ type: string; text: string }>
         }>((resolve) => { resolveFirstPrompt = resolve })
       }
-      expect(prompt.text).toContain("next-phase plan synthesized by the multi-model consultation")
-      await submitCandidate({
-        directory: path.join(root, "runs", "compact-me", (await readdir(path.join(root, "runs", "compact-me")))[0]!),
-        sessionID: originalSessionID,
-        candidate: "flag{resumed}",
-      })
+      if (prompt.text.includes("next-phase plan")) {
+        // The post-compaction continuation turn carries the synthesized plan and submits.
+        expect(prompt.text).toContain("next-phase plan synthesized by the multi-model consultation")
+        await submitCandidate({
+          directory: path.join(root, "runs", "compact-me", (await readdir(path.join(root, "runs", "compact-me")))[0]!),
+          sessionID: originalSessionID,
+          candidate: "flag{resumed}",
+        })
+        return {
+          usage: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+          cost: 0,
+          finish: "stop" as const,
+          parts: [{ type: "text", text: "submitted" }],
+        }
+      }
+      // Automatic writeup turns (and their single retry) only produce text.
       return {
         usage: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
         cost: 0,
         finish: "stop" as const,
-        parts: [{ type: "text", text: "submitted" }],
+        parts: [{ type: "text", text: "WRITEUP draft noted." }],
       }
     },
     async abort() {
@@ -605,7 +618,9 @@ test("a compaction consultation receives active history and resumes the original
 
     expect(runner.hasWork()).toBe(false)
     expect(resumeCalls).toEqual([originalSessionID])
-    expect(calls.filter((call) => call.agent === "boom")).toHaveLength(2)
+    // Solve turn, post-consultation continue turn, then the automatic writeup turn plus its single
+    // retry (the fake conversation never produces a qualifying WRITEUP.md).
+    expect(calls.filter((call) => call.agent === "boom")).toHaveLength(4)
     const consultationCalls = calls.filter((call) => call.agent === "boom-consultant")
     expect(consultationCalls).toHaveLength(3)
     for (const call of consultationCalls) {
@@ -613,12 +628,17 @@ test("a compaction consultation receives active history and resumes the original
       expect(call.prompt).toContain("stream 7")
     }
     const [runID] = await readdir(path.join(root, "runs", "compact-me"))
-    const result = JSON.parse(await readFile(path.join(root, "runs", "compact-me", runID!, "result.json"), "utf8"))
-    expect(result).toMatchObject({
-      candidates: ["flag{resumed}"],
-      task_status: "solved",
-      consultation: { trigger: "compaction" },
+    // Follow-up turns overwrite result.json, so durable expectations live in task.json.
+    const runDirectory = path.join(root, "runs", "compact-me", runID!)
+    expect(JSON.parse(await readFile(path.join(runDirectory, "result.json"), "utf8")))
+      .toMatchObject({ primary_candidate: "flag{resumed}" })
+    const compactTask = JSON.parse(await readFile(path.join(runDirectory, "task.json"), "utf8"))
+    expect(compactTask).toMatchObject({
+      status: "solved",
+      acceptedFlag: { value: "flag{resumed}", source: "test-platform" },
     })
+    // Solve turn, post-compaction continue turn, writeup turn, writeup retry.
+    expect(compactTask.turns).toHaveLength(4)
   } finally {
     await runner.close()
   }
@@ -665,11 +685,13 @@ test("a manual consultation with no successful experts falls back to a new solve
             }
             solverCalls += 1
             if (solverCalls === 1) expect(prompt.text).toContain("Start a fresh solver turn")
-            await submitCandidate({
-              directory: input.directory,
-              sessionID,
-              candidate: "flag{manual-fallback}",
-            })
+            if (!prompt.text.includes("# Writeup turn")) {
+              await submitCandidate({
+                directory: input.directory,
+                sessionID,
+                candidate: "flag{manual-fallback}",
+              })
+            }
             return {
               usage: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
               cost: 0,
@@ -726,7 +748,8 @@ test("a manual consultation with no successful experts falls back to a new solve
 
     expect(runner.hasWork()).toBe(false)
     expect(consultantCalls).toBe(4)
-    expect(solverCalls).toBe(1)
+    // Initial solve turn + consultation-fallback solver turn + automatic writeup turn.
+    expect(solverCalls).toBe(3)
     const [runID] = await readdir(path.join(root, "runs", "manual-fallback"))
     const result = JSON.parse(await readFile(
       path.join(root, "runs", "manual-fallback", runID!, "result.json"),
@@ -736,6 +759,304 @@ test("a manual consultation with no successful experts falls back to a new solve
       stop: "completed",
       candidates: ["flag{manual-fallback}"],
     })
+  } finally {
+    await runner.close()
+  }
+})
+
+test("a hot-switch request arriving during turn wind-down still queues its followup", async () => {
+  const interpreter = Bun.which("python3")
+  if (!interpreter) return
+  const directory = await mkdtemp(path.join(os.tmpdir(), "boom-runner-late-switch-"))
+  temporary.push(directory)
+  const root = path.join(directory, "ctf")
+  const source = path.join(root, "challenges", "late-switch")
+  await mkdir(source, { recursive: true })
+  await writeFile(path.join(source, "README.md"), "Return flag{late}")
+
+  // The switch lands while the first turn is already winding down inside the platform submission:
+  // runChallenge has resolved, so outcome.stop stays "completed" and only the pendingSwitch field
+  // carries the request. The gate must still queue the switched followup and clear the request.
+  const challenge = {
+    slug: "late-switch",
+    directory: source,
+    description: "Return flag{late}",
+    files: [],
+    flagFormat: "flag\\{[^}]+\\}",
+    platform: { adapter: "test-platform", challengeID: "late-switch-1" },
+  }
+  const workspace = await prepareWorkspace(root, challenge, "task")
+  // Suppress the one-shot autonomy continuation so the followup count stays deterministic.
+  await markAutomaticContinuation(workspace.directory)
+
+  const prompts: Array<{ agent: string; model: string; text: string }> = []
+  let solverTurns = 0
+  let submissionReached = false
+  let releaseSubmission: (() => void) | undefined
+  const submissionGate = new Promise<void>((resolve) => { releaseSubmission = resolve })
+  const handle: RuntimeHandle = {
+    backend: "fake",
+    version: "test",
+    capabilities: {
+      eventStreaming: true,
+      toolCalls: true,
+      reasoning: false,
+      attachments: true,
+      web: false,
+      cancellation: true,
+      providerManagement: false,
+      providerOAuth: false,
+      compaction: false,
+      compactionHooks: false,
+    },
+    agent: {
+      async createConversation(input) {
+        const id = `conversation-${solverTurns + 1}`
+        return {
+          id,
+          async events() {
+            return { async *[Symbol.asyncIterator]() {} }
+          },
+          async prompt(prompt) {
+            prompts.push({ agent: prompt.agent, model: prompt.model, text: prompt.text })
+            if (prompt.agent !== "boom") throw new Error(`unexpected agent prompt: ${prompt.agent}`)
+            solverTurns += 1
+            if (solverTurns === 1)
+              await submitCandidate({
+                directory: input.directory,
+                sessionID: id,
+                candidate: "flag{late}",
+              })
+            return {
+              usage: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+              cost: 0,
+              finish: "stop" as const,
+              parts: [{ type: "text", text: "done" }],
+            }
+          },
+          async abort() {},
+        }
+      },
+    },
+    close() {},
+  }
+  let submissionCalls = 0
+  const runner = new GuiRunner(root, async () => handle, {
+    async submitFlagWithRetry() {
+      submissionCalls += 1
+      submissionReached = true
+      await submissionGate
+      return {
+        adapter: "test-platform",
+        verdict: "rejected" as const,
+        detail: "wrong value",
+        submittedAt: new Date().toISOString(),
+      }
+    },
+  })
+  try {
+    await runner.enqueue({
+      challenges: [challenge],
+      model: "openai/old",
+      modelPolicy: { economy: "openai/old", strong: "openai/old" },
+      consultModels: [],
+      blindReview: false,
+      limits: { tokens: 100_000, repeats: 5, timeout: 60_000 },
+      flagFormat: "flag\\{[^}]+\\}",
+      pythonInterpreter: interpreter,
+      workspaces: { "late-switch": workspace.runID },
+    })
+    for (let attempt = 0; attempt < 500 && !submissionReached; attempt += 1)
+      await Bun.sleep(10)
+    expect(submissionReached).toBe(true)
+
+    const switched = await runner.applyLiveModelSettings({
+      economyModel: "openai/old",
+      strongModel: "openai/next",
+      consultModels: [],
+      blindReview: false,
+      consultOnCompaction: false,
+      network: "allow",
+    })
+    expect(switched.active).toBe(1)
+    releaseSubmission?.()
+    for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1)
+      await Bun.sleep(10)
+    expect(runner.hasWork()).toBe(false)
+
+    const solvePrompts = prompts.filter((item) => item.agent === "boom")
+    // The stranded request was consumed exactly once: the followup runs on the switched model and
+    // carries the hot-swap handoff hint.
+    expect(solvePrompts.map((item) => item.model)).toEqual(["openai/old", "openai/next"])
+    expect(solvePrompts[1]?.text).toContain("Model hot-swap: openai/old -> openai/next")
+    expect(solvePrompts).toHaveLength(2)
+
+    const [runID] = await readdir(path.join(root, "runs", "late-switch"))
+    const run = path.join(root, "runs", "late-switch", runID!)
+    expect(JSON.parse(await readFile(path.join(run, "task.json"), "utf8"))).toMatchObject({
+      turns: [
+        { model: "openai/old", stop: "completed" },
+        { model: "openai/next" },
+      ],
+    })
+    // The rejected candidate entered the ledger once per live platform response.
+    expect(submissionCalls).toBe(1)
+    const ledger = JSON.parse(
+      await readFile(path.join(root, "competition", "submissions", "late-switch.json"), "utf8"),
+    )
+    expect(ledger.attempts).toEqual([
+      expect.objectContaining({
+        value: "late",
+        verdict: "rejected",
+        detail: expect.stringContaining("[attempt 1]"),
+      }),
+    ])
+    // The evaluated candidate slot is marked consumed so a later turn cannot re-offer it.
+    expect(typeof JSON.parse(await readFile(path.join(run, "work", "RESULT.json"), "utf8")).consumedAt)
+      .toBe("string")
+  } finally {
+    await runner.close()
+  }
+})
+
+test("a late hot switch on an accepted flag defers to the writeup and reports the stranded request", async () => {
+  const interpreter = Bun.which("python3")
+  if (!interpreter) return
+  const directory = await mkdtemp(path.join(os.tmpdir(), "boom-runner-late-switch-accepted-"))
+  temporary.push(directory)
+  const root = path.join(directory, "ctf")
+  const source = path.join(root, "challenges", "late-switch-accepted")
+  await mkdir(source, { recursive: true })
+  await writeFile(path.join(source, "README.md"), "Return flag{late}")
+
+  const challenge = {
+    slug: "late-switch-accepted",
+    directory: source,
+    description: "Return flag{late}",
+    files: [],
+    flagFormat: "flag\\{[^}]+\\}",
+    platform: { adapter: "test-platform", challengeID: "late-switch-accepted-1" },
+  }
+  const workspace = await prepareWorkspace(root, challenge, "task")
+  await markAutomaticContinuation(workspace.directory)
+
+  const prompts: Array<{ agent: string; model: string; text: string }> = []
+  let solverTurns = 0
+  let submissionReached = false
+  let releaseSubmission: (() => void) | undefined
+  const submissionGate = new Promise<void>((resolve) => { releaseSubmission = resolve })
+  const handle: RuntimeHandle = {
+    backend: "fake",
+    version: "test",
+    capabilities: {
+      eventStreaming: true,
+      toolCalls: true,
+      reasoning: false,
+      attachments: true,
+      web: false,
+      cancellation: true,
+      providerManagement: false,
+      providerOAuth: false,
+      compaction: false,
+      compactionHooks: false,
+    },
+    agent: {
+      async createConversation(input) {
+        const id = `conversation-${solverTurns + 1}`
+        return {
+          id,
+          async events() {
+            return { async *[Symbol.asyncIterator]() {} }
+          },
+          async prompt(prompt) {
+            prompts.push({ agent: prompt.agent, model: prompt.model, text: prompt.text })
+            if (prompt.agent !== "boom") throw new Error(`unexpected agent prompt: ${prompt.agent}`)
+            solverTurns += 1
+            if (solverTurns === 1)
+              await submitCandidate({
+                directory: input.directory,
+                sessionID: id,
+                candidate: "flag{late}",
+              })
+            else
+              await writeFile(
+                path.join(input.directory, "work", "WRITEUP.md"),
+                "# Writeup\n\nRead challenge/README.md; the supplied value reproduces.\n\nFlag: flag{late}\n",
+              )
+            return {
+              usage: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+              cost: 0,
+              finish: "stop" as const,
+              parts: [{ type: "text", text: "done" }],
+            }
+          },
+          async abort() {},
+        }
+      },
+    },
+    close() {},
+  }
+  const runner = new GuiRunner(root, async () => handle, {
+    async submitFlagWithRetry() {
+      submissionReached = true
+      await submissionGate
+      return {
+        adapter: "test-platform",
+        verdict: "accepted" as const,
+        detail: "accepted by test platform",
+        submittedAt: new Date().toISOString(),
+      }
+    },
+  })
+  try {
+    await runner.enqueue({
+      challenges: [challenge],
+      model: "openai/old",
+      modelPolicy: { economy: "openai/old", strong: "openai/old" },
+      consultModels: [],
+      blindReview: false,
+      limits: { tokens: 100_000, repeats: 5, timeout: 60_000 },
+      flagFormat: "flag\\{[^}]+\\}",
+      pythonInterpreter: interpreter,
+      workspaces: { "late-switch-accepted": workspace.runID },
+    })
+    for (let attempt = 0; attempt < 500 && !submissionReached; attempt += 1)
+      await Bun.sleep(10)
+    expect(submissionReached).toBe(true)
+
+    await runner.applyLiveModelSettings({
+      economyModel: "openai/old",
+      strongModel: "openai/next",
+      consultModels: [],
+      blindReview: false,
+      consultOnCompaction: false,
+      network: "allow",
+    })
+    releaseSubmission?.()
+    for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1)
+      await Bun.sleep(10)
+    expect(runner.hasWork()).toBe(false)
+
+    // The switch must not hijack the solved task into a doomed solve turn: the mandatory writeup
+    // runs instead and the task still reaches its archived end state.
+    expect(prompts.map((item) => item.model)).toEqual(["openai/old", "openai/old"])
+    expect(prompts[1]?.text).toContain("Generate work/WRITEUP.md offline")
+    const [runID] = await readdir(path.join(root, "runs", "late-switch-accepted"))
+    const run = path.join(root, "runs", "late-switch-accepted", runID!)
+    expect(JSON.parse(await readFile(path.join(run, "task.json"), "utf8"))).toMatchObject({
+      status: "archived",
+      acceptedFlag: { value: "flag{late}" },
+    })
+    // The stranded request is reported loudly instead of dying silently.
+    const events = (await readFile(path.join(run, "work", "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    const warning = events.find((event) => event.status === "model.switch.not-applied")
+    expect(warning).toBeDefined()
+    expect(warning.text).toContain("切换请求未能生效")
+    expect(warning.text).toContain("该题已有被接受的 flag")
+    expect(warning.text).toContain("openai/next")
   } finally {
     await runner.close()
   }

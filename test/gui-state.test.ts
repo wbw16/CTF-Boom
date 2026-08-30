@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { existsSync } from "node:fs"
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -409,5 +410,28 @@ describe("GUI live task detail", () => {
     const challenge = liveState(accepted, pending).challenges[0]!
     expect(displayFlagRun(withRunDetail(challenge, pending), pending)?.id).toBe("accepted")
     expect(candidateValues(accepted)[0]).toBe("flag{right}")
+  })
+})
+
+describe("GUI state durability", () => {
+  test("quarantines a corrupt state file instead of silently wiping it", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "boom-gui-state-"))
+    const previous = process.env.BOOM_HOME
+    process.env.BOOM_HOME = home
+    try {
+      const target = path.join(home, "gui-state.json")
+      const corrupt = '{"version":2,"roots":{"broken":'
+      await writeFile(target, corrupt, "utf8")
+      expect(loadRootGuiState(path.join(home, "any-root"))).rejects.toThrow("GUI state")
+      const entries = await readdir(home)
+      const backup = entries.find((name) => name.startsWith("gui-state.json.corrupt-"))
+      expect(backup).toBeDefined()
+      expect(await readFile(path.join(home, backup!), "utf8")).toBe(corrupt)
+      expect(existsSync(target)).toBe(false)
+      // The quarantined store behaves like a fresh install on the next load.
+      expect(await loadRootGuiState(path.join(home, "any-root"))).toMatchObject({ challenges: {} })
+    } finally {
+      process.env.BOOM_HOME = previous
+    }
   })
 })

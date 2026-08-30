@@ -3,6 +3,7 @@ import path from "node:path"
 import {
   loadChallenge,
   recognizedChallengeCategory,
+  resolveChallengeCatalog,
   type Challenge,
   type ChallengeCategory,
 } from "./challenge.ts"
@@ -86,6 +87,10 @@ const MIN_REQUEST_GAP_MS = 700
 const RATE_LIMIT_CODE = "40001"
 const RATE_LIMIT_RETRIES = 4
 const RATE_LIMIT_BASE_DELAY_MS = 1_500
+/** Hard ceiling for one platform API request so a hung connection cannot stall the chain forever. */
+const REQUEST_TIMEOUT_MS = 12_000
+/** Attachments come from CDN storage; allow slower transfers than API calls. */
+const DOWNLOAD_TIMEOUT_MS = 60_000
 
 function object(value: unknown): JsonObject | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -149,6 +154,18 @@ function identifier(value: unknown, label: string) {
 
 function safeErrorBody(value: string) {
   return value.replace(/[\0\r\n]+/g, " ").slice(0, 2_000)
+}
+
+/**
+ * The environment and answer endpoints want a numeric exercise ID on the wire. `Number("")` is 0
+ * and a malformed ID is NaN, so validate before sending: an accidental null/NaN must fail loudly
+ * with the offending challenge ID rather than silently address the wrong (or no) challenge.
+ */
+function numericExerciseId(exerciseId: string) {
+  const parsed = Number(exerciseId)
+  if (!exerciseId.trim() || !Number.isInteger(parsed))
+    throw new Error(`西湖论剑题目 ID 非法，拒绝发送非整数 exerciseId: ${JSON.stringify(exerciseId)}`)
+  return parsed
 }
 
 /** Transport failures may clear on the next paced attempt; API/business validation errors will not. */
@@ -332,6 +349,20 @@ function attachmentsOf(value: unknown): Array<{ name: string; url: string }> {
 export class XihulunjianRateLimitError extends Error {}
 
 /**
+ * Raised only when the platform's structured response confirms the candidate answer itself is
+ * wrong ({@link isIncorrectFlagResponse} on the answer endpoint). The verdict is definitive and
+ * downstream duplicate gates treat "rejected" as final, so every uncertain failure — timeouts,
+ * exhausted 5xx retries, malformed envelopes — must stay a plain error and propagate instead of
+ * being squeezed into this class by message-text guessing (H3).
+ */
+export class FlagRejectedError extends Error {
+  constructor(public readonly detail: string) {
+    super(detail)
+    this.name = "FlagRejectedError"
+  }
+}
+
+/**
  * The answer endpoint overloads business code 40001: on a normal incorrect answer it returns
  * `提交flag错误，请重新提交` with HTTP 200, rather than the usual rate-limit message. Retrying that
  * response would resubmit the same wrong flag and consume the platform quota each time.
@@ -483,6 +514,9 @@ export class XihulunjianPlatformAdapter {
         return await this.throttle(() => this.attempt(method, endpoint, options))
       } catch (error) {
         lastError = error
+        // A definitive verdict is final even if its message text happens to look transient
+        // (e.g. "当前还有500次提交机会"); only genuine transport/rate-limit errors retry.
+        if (error instanceof FlagRejectedError) throw error
         if (!(error instanceof XihulunjianRateLimitError) && !retryablePlatformError(error)) throw error
       }
     }
@@ -506,11 +540,15 @@ export class XihulunjianPlatformAdapter {
     const body = options.body === undefined ? undefined : JSON.stringify(options.body)
     if (body !== undefined) headers.set("Content-Type", "application/json")
 
+    // Compose the caller's signal with a hard timeout: either one aborting cancels the request,
+    // and no response (or stalled body) can outlive REQUEST_TIMEOUT_MS.
+    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
     const response = await this.fetcher(url, {
       method,
       headers,
       ...(body === undefined ? {} : { body }),
-      signal: options.signal,
+      signal,
       redirect: "error",
     })
     const bytes = await boundedBytes(response, MAX_RESPONSE_BYTES)
@@ -533,14 +571,25 @@ export class XihulunjianPlatformAdapter {
     if (!response.ok)
       throw new Error(`西湖论剑接口 ${method} ${endpoint} 失败 (${response.status}): ${safeErrorBody(raw)}`)
     if (!envelope) throw new Error(`西湖论剑接口 ${method} ${endpoint} 返回结构异常`)
-    if (code !== SUCCESS_CODE)
+    if (code !== SUCCESS_CODE) {
+      // Structurally confirmed wrong answer: the only failure shape that becomes a definitive
+      // "rejected" verdict. HTTP-layer failures above keep plain errors so a 5xx body that merely
+      // contains words like「系统错误」can never masquerade as a verdict after retries exhaust.
+      if (isIncorrectFlagResponse(endpoint, message)) throw new FlagRejectedError(message)
       throw new Error(
         `西湖论剑接口 ${method} ${endpoint} 返回业务失败 (code=${code ?? "缺失"}): ${message}`,
       )
+    }
     return envelope.data
   }
 
-  /** Flatten `分类[].corpus[]` into Boom's flat preview list. */
+  /**
+   * Flatten `分类[].corpus[]` into Boom's flat preview list.
+   *
+   * One malformed group or challenge entry (a bad ID, an unexpected shape) must not abort the
+   * whole catalog sync, so each group — and each entry inside it — is processed independently:
+   * bad items are skipped and reported through `warnings` as `{groupID?, error}` (M23-a).
+   */
   private async exerciseList(signal?: AbortSignal) {
     const data = await this.call("GET", "/ctf/exercise-list", { signal })
     if (!Array.isArray(data)) throw new Error("西湖论剑题目列表结构异常")
@@ -552,30 +601,40 @@ export class XihulunjianPlatformAdapter {
       solved?: boolean
       group?: { id: string; name: string }
     }> = []
+    const warnings: Array<{ groupID?: string; error: unknown }> = []
     for (const raw of data) {
       const group = object(raw)
       if (!group) continue
-      const groupID = identifier(group.id, "分类 ID")
-      const groupName = text(group.name) ?? groupID
-      const corpus = Array.isArray(group.corpus) ? group.corpus : []
-      for (const entry of corpus) {
-        const item = object(entry)
-        if (!item) continue
-        // A challenge that is not yet open cannot be fetched or solved; batched releases mean the
-        // list must be re-read later rather than treated as complete.
-        if (item.isOpen === false) continue
-        const challengeID = identifier(item.id, "题目 ID")
-        previews.push({
-          id: challengeID,
-          challengeID,
-          title: text(item.name) ?? challengeID,
-          category: groupName,
-          ...(typeof item.hasSolved === "boolean" ? { solved: item.hasSolved } : {}),
-          group: { id: groupID, name: groupName },
-        })
+      try {
+        const groupID = identifier(group.id, "分类 ID")
+        const groupName = text(group.name) ?? groupID
+        const corpus = Array.isArray(group.corpus) ? group.corpus : []
+        for (const entry of corpus) {
+          const item = object(entry)
+          if (!item) continue
+          // A challenge that is not yet open cannot be fetched or solved; batched releases mean the
+          // list must be re-read later rather than treated as complete.
+          if (item.isOpen === false) continue
+          try {
+            const challengeID = identifier(item.id, "题目 ID")
+            previews.push({
+              id: challengeID,
+              challengeID,
+              title: text(item.name) ?? challengeID,
+              category: groupName,
+              ...(typeof item.hasSolved === "boolean" ? { solved: item.hasSolved } : {}),
+              group: { id: groupID, name: groupName },
+            })
+          } catch (error) {
+            // A sibling challenge with a valid ID must still survive one broken entry.
+            warnings.push({ ...(text(group.id) ? { groupID: text(group.id)! } : {}), error })
+          }
+        }
+      } catch (error) {
+        warnings.push({ ...(text(group.id) ? { groupID: text(group.id)! } : {}), error })
       }
     }
-    return previews
+    return { previews, warnings }
   }
 
   /** Read one challenge's detail. Never starts an environment; that is an explicit separate step. */
@@ -607,7 +666,7 @@ export class XihulunjianPlatformAdapter {
 
   /** Start a challenge environment. Asynchronous: the caller must then poll for readiness. */
   async buildEnvironment(exerciseId: string, signal?: AbortSignal) {
-    await this.call("POST", "/ctf/build-exercise-env", { body: { exerciseId: Number(exerciseId) }, signal })
+    await this.call("POST", "/ctf/build-exercise-env", { body: { exerciseId: numericExerciseId(exerciseId) }, signal })
   }
 
   /**
@@ -615,7 +674,7 @@ export class XihulunjianPlatformAdapter {
    * caller but must never mask the solving outcome, and must never block slot release.
    */
   async recoverEnvironment(exerciseId: string, signal?: AbortSignal) {
-    await this.call("POST", "/ctf/recover-exercise-env", { body: { exerciseId: Number(exerciseId) }, signal })
+    await this.call("POST", "/ctf/recover-exercise-env", { body: { exerciseId: numericExerciseId(exerciseId) }, signal })
   }
 
   /**
@@ -740,9 +799,25 @@ export class XihulunjianPlatformAdapter {
   }
 
   /**
+   * The completeness check a local copy must pass before it may be trusted (and kept): the meta
+   * must record an attachment manifest (one without it predates the incremental sync) and every
+   * recorded file must still be on disk. This is exactly the verification {@link reconcileExisting}
+   * applies to every candidate copy before choosing and deleting.
+   */
+  private async copyCompleteness(copy: { directory: string; meta: JsonObject }) {
+    const options = object(object(copy.meta.platform)?.options)
+    const recorded = Array.isArray(options?.attachments)
+      ? options!.attachments.filter((name): name is string => typeof name === "string")
+      : undefined
+    if (recorded === undefined) return false
+    const present = new Set(await this.localAttachmentNames(copy.directory))
+    return recorded.every((name) => present.has(name))
+  }
+
+  /**
    * Reconcile an already-materialized challenge against the current catalog entry using local data
    * only: no platform detail call, no attachment download.  Returns the challenge, or undefined
-   * when the local copy is unusable and the caller must re-materialize it from the platform.
+   * when no local copy is usable and the caller must re-materialize it from the platform.
    *
    * This is what keeps periodic re-syncs cheap: the platform rate-limits detail reads (three
    * back-to-back requests trigger 40001) and attachments are large, so an unchanged challenge must
@@ -753,8 +828,9 @@ export class XihulunjianPlatformAdapter {
     item: { challengeID: string; title: string; category?: string; solved?: boolean }
     copies: Array<{ directory: string; category: ChallengeCategory; meta: JsonObject }>
   }): Promise<Challenge | undefined> {
-    // Prefer the copy that already sits in the freshly inferred category; otherwise a non-OTHER
-    // one; otherwise the first.
+    // Evaluate EVERY copy first — category fit AND completeness — before anything is deleted.
+    // Debris removal below is irreversible, so picking a favorite first and deleting the rest
+    // could destroy the one intact copy when the favorite turns out broken (M23-b).
     const ranked = await Promise.all(input.copies.map(async (copy) => ({
       copy,
       inferred: await inferChallengeCategory(
@@ -762,29 +838,30 @@ export class XihulunjianPlatformAdapter {
         input.item.category,
         await this.localAttachmentNames(copy.directory),
       ),
+      complete: await this.copyCompleteness(copy),
     })))
-    const chosen = ranked.find((entry) => entry.copy.category === entry.inferred)
-      ?? ranked.find((entry) => entry.copy.category !== "OTHER")
-      ?? ranked[0]!
+    // Among VERIFIED-COMPLETE copies only: prefer one already sitting in the freshly inferred
+    // category, then any recognized category, then the first complete one.
+    const complete = ranked.filter((entry) => entry.complete)
+    const chosen = complete.find((entry) => entry.copy.category === entry.inferred)
+      ?? complete.find((entry) => entry.copy.category !== "OTHER")
+      ?? complete[0]
+    // Nothing verifiable survives locally. Delete NOTHING — a complete copy may still appear on a
+    // later sync, and re-materialization needs a platform round-trip that can itself fail — and
+    // let the caller rebuild from scratch.
+    if (!chosen) return undefined
     let canonical = chosen.copy
-    let canonicalCategory = chosen.inferred
-    // A challenge may have several local copies only as debris from a category change; keep one.
+    const canonicalCategory = chosen.inferred
+    // The canonical copy has already passed completeness verification, so pruning the remaining
+    // debris from earlier category derivations cannot lose data anymore.
     for (const copy of input.copies)
       if (path.resolve(copy.directory) !== path.resolve(canonical.directory)) {
         await rm(copy.directory, { recursive: true, force: true })
         await this.pruneCategoryIfEmpty(input.base, copy.directory)
       }
 
-    // The attachment manifest is recorded at materialize time.  A meta without it predates the
-    // incremental sync, so re-materialize once to migrate; a recorded file that has gone missing
-    // means an interrupted download, so re-materialize to restore it.
+    // Completeness was verified during selection; `options` is still needed to merge solve state.
     const options = object(object(canonical.meta.platform)?.options)
-    const recorded = Array.isArray(options?.attachments)
-      ? options!.attachments.filter((name): name is string => typeof name === "string")
-      : undefined
-    if (recorded === undefined) return undefined
-    const present = new Set(await this.localAttachmentNames(canonical.directory))
-    if (recorded.some((name) => !present.has(name))) return undefined
 
     if (canonical.category !== canonicalCategory) {
       const destination = path.join(input.base, canonicalCategory, path.basename(canonical.directory))
@@ -817,9 +894,11 @@ export class XihulunjianPlatformAdapter {
   private async download(url: URL, signal?: AbortSignal) {
     if (url.protocol !== "http:" && url.protocol !== "https:")
       throw new Error(`附件协议不受支持: ${url.protocol}`)
+    const downloadTimeout = AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS)
+    const effectiveSignal = signal ? AbortSignal.any([signal, downloadTimeout]) : downloadTimeout
     const response = await this.fetcher(url, {
       headers: { Accept: "*/*" },
-      signal,
+      signal: effectiveSignal,
       redirect: "follow",
     })
     const bytes = await boundedBytes(response, MAX_ATTACHMENT_BYTES)
@@ -843,11 +922,13 @@ export class XihulunjianPlatformAdapter {
   async acquireChallenges(
     input: { root: string; signal?: AbortSignal; revalidate?: boolean },
   ): Promise<Challenge[]> {
-    const selected = await this.exerciseList(input.signal)
-    const base = path.join(path.resolve(input.root), "challenges")
+    const { previews: selected, warnings: listWarnings } = await this.exerciseList(input.signal)
+    // Materialize into whichever catalog layout the workspace uses (challenges/ or root categories).
+    const base = (await resolveChallengeCatalog(path.resolve(input.root))).directory
     const existing = input.revalidate ? new Map() : await this.scanExisting(base)
 
     const materialized: Challenge[] = []
+    const skipped: Array<{ challengeID: string; title: string; error: unknown }> = []
     const used = new Set<string>()
     for (const item of selected) {
       try {
@@ -933,8 +1014,19 @@ export class XihulunjianPlatformAdapter {
         // in the same release batch. A transport failure is different: propagate it so the outer
         // unattended cycle can retry the whole catalog coherently.
         if (input.signal?.aborted || retryablePlatformError(error)) throw error
+        skipped.push({ challengeID: item.challengeID, title: item.title, error })
       }
     }
+    // Swallowed failures must stay observable: one summary warning names every challenge that was
+    // dropped this cycle, without changing control flow for the ones that succeeded.
+    const describe = (error: unknown) => (error instanceof Error ? error.message : String(error))
+    const notes = [
+      ...listWarnings.map((warning) =>
+        `${warning.groupID ? `分组 ${warning.groupID}` : "未知分组"}: ${describe(warning.error)}`),
+      ...skipped.map((entry) => `题目 ${entry.challengeID}(${entry.title}): ${describe(entry.error)}`),
+    ]
+    if (notes.length > 0)
+      console.warn(`西湖论剑：跳过 ${notes.length} 个无法物化的题目\n  - ${notes.join("\n  - ")}`)
     return materialized
   }
 
@@ -953,7 +1045,7 @@ export class XihulunjianPlatformAdapter {
     const submittedAt = new Date().toISOString()
     try {
       const data = object(await this.call("POST", "/answer-panel/answer", {
-        body: { exerciseId: Number(exerciseId), flag },
+        body: { exerciseId: numericExerciseId(exerciseId), flag },
         signal: input.signal,
       }))
       const correct = data?.isCorrect
@@ -969,11 +1061,12 @@ export class XihulunjianPlatformAdapter {
         submittedAt,
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      // A rejected flag is reported through the envelope's error code, so distinguish a real verdict
-      // from a transport failure: only the latter is worth retrying.
-      if (/flag|答案|错误|incorrect/i.test(message) && !/超时|timeout|ECONN|fetch/i.test(message))
-        return { adapter: this.id, verdict: "rejected", detail: message, submittedAt }
+      // Only a structurally confirmed wrong-answer verdict may be reported as "rejected": the
+      // duplicate gate downstream treats that as final and the flag can never be resubmitted.
+      // Everything else — timeouts, exhausted 5xx retries, envelope anomalies — propagates so
+      // upstream records pending/manual work instead of silently dropping the challenge (H3).
+      if (error instanceof FlagRejectedError)
+        return { adapter: this.id, verdict: "rejected", detail: error.detail, submittedAt }
       throw error
     }
   }

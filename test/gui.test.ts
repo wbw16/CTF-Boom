@@ -8,7 +8,13 @@ import type { RunHistory } from "../src/history.ts"
 import { GuiRunner, type McpServerDetails } from "../src/runner.ts"
 
 type Harness = Awaited<ReturnType<typeof harness>>
-type HarnessOptions = { persistedAutopilot?: boolean }
+type HarnessOptions = {
+  persistedAutopilot?: boolean
+  /** Leave the root empty so startup must initialize runs/ and challenges/. */
+  freshRoot?: boolean
+  /** Put category folders directly under the root without a wrapping challenges/. */
+  categoryRoot?: boolean
+}
 
 async function exists(target: string) {
   return (await stat(target).catch(() => undefined)) !== undefined
@@ -20,29 +26,36 @@ async function harness(options: HarnessOptions = {}) {
   const challenge = path.join(root, "challenges", "alpha")
   const runID = "20260729T010203Z-test"
   const run = path.join(root, "runs", "alpha", runID)
-  await mkdir(path.join(run, "work"), { recursive: true })
-  await mkdir(challenge, { recursive: true })
-  await writeFile(path.join(challenge, "README.md"), "Recover the flag")
-  await writeFile(path.join(challenge, "payload.txt"), "payload")
-  await writeFile(path.join(challenge, "meta.json"), JSON.stringify({
-    service_required: true,
-    custom_field: "preserved",
-  }))
-  await writeFile(path.join(run, "NOTES.md"), "durable note")
-  await writeFile(path.join(run, "work", "artifact.txt"), "artifact")
-  await writeFile(
-    path.join(run, "result.json"),
-    JSON.stringify({
-      run_id: runID,
-      model: "free/test",
-      stop: "completed",
-      tokens: 7,
-      cost: 0,
-      candidates: ["flag{alpha}"],
-      flag_format: "flag\\{[^}]*\\}",
-      reply: "done",
-    }),
-  )
+  if (options.categoryRoot) {
+    await mkdir(path.join(root, "WEB", "login"), { recursive: true })
+    await mkdir(path.join(root, "misc", "packet"), { recursive: true })
+    await writeFile(path.join(root, "WEB", "login", "README.md"), "web task")
+    await writeFile(path.join(root, "misc", "packet", "capture.pcap"), "pcap")
+  } else if (!options.freshRoot) {
+    await mkdir(path.join(run, "work"), { recursive: true })
+    await mkdir(challenge, { recursive: true })
+    await writeFile(path.join(challenge, "README.md"), "Recover the flag")
+    await writeFile(path.join(challenge, "payload.txt"), "payload")
+    await writeFile(path.join(challenge, "meta.json"), JSON.stringify({
+      service_required: true,
+      custom_field: "preserved",
+    }))
+    await writeFile(path.join(run, "NOTES.md"), "durable note")
+    await writeFile(path.join(run, "work", "artifact.txt"), "artifact")
+    await writeFile(
+      path.join(run, "result.json"),
+      JSON.stringify({
+        run_id: runID,
+        model: "free/test",
+        stop: "completed",
+        tokens: 7,
+        cost: 0,
+        candidates: ["flag{alpha}"],
+        flag_format: "flag\\{[^}]*\\}",
+        reply: "done",
+      }),
+    )
+  }
 
   const previousHome = process.env.BOOM_HOME
   process.env.BOOM_HOME = path.join(directory, "home")
@@ -252,6 +265,8 @@ async function harness(options: HarnessOptions = {}) {
     open: false,
     runner,
     startRuntime: false,
+    // Handler tests address the API directly; the dedicated auth suite covers token enforcement.
+    tokenAuth: false,
   })
 
   return {
@@ -320,6 +335,39 @@ describe("GUI HTTP surface", () => {
     }
   })
 
+  test("initializes runs/ and challenges/ when opened on a folder without a workspace", async () => {
+    const one = await harness({ freshRoot: true })
+    try {
+      const response = await request(one, "/api/state")
+      expect(response.status).toBe(200)
+      const state = await response.json() as { challenges: unknown[] }
+      expect(state.challenges).toEqual([])
+      expect(await exists(path.join(one.root, "runs"))).toBe(true)
+      expect(await exists(path.join(one.root, "challenges"))).toBe(true)
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("serves challenges whose category folders sit directly under the root", async () => {
+    const one = await harness({ categoryRoot: true })
+    try {
+      const state = await (await request(one, "/api/state")).json() as {
+        challenges: Array<{ slug: string; category: string; storagePath: string }>
+      }
+      expect(state.challenges.map((item) => [item.category, item.slug])).toEqual([
+        ["WEB", "login"],
+        ["MISC", "packet"],
+      ])
+      expect(state.challenges[0]?.storagePath).toBe("WEB/login")
+      // A root-level catalog must not gain a shadowing empty challenges/ directory.
+      expect(await exists(path.join(one.root, "challenges"))).toBe(false)
+      expect(await exists(path.join(one.root, "runs"))).toBe(true)
+    } finally {
+      await one.close()
+    }
+  })
+
   test("stores an editable 西湖论剑 Server Host outside the challenge root", async () => {
     const one = await harness()
     try {
@@ -372,6 +420,7 @@ describe("GUI HTTP surface", () => {
       open: false,
       runner,
       startRuntime: false,
+      tokenAuth: false,
     })
     try {
       const response = await fetch(new URL("/api/state", started.url))
@@ -488,7 +537,7 @@ describe("GUI HTTP surface", () => {
       expect(initial.challenges[0]).toMatchObject({
         slug: "alpha",
         category: "OTHER",
-        storagePath: "alpha",
+        storagePath: "challenges/alpha",
         serviceRequired: true,
         runs: [{ id: one.runID, notes: "", files: [] }],
       })
@@ -905,7 +954,7 @@ describe("GUI HTTP surface", () => {
       expect(state.challenges).toContainEqual(expect.objectContaining({
         slug: "category-beta",
         category: "CRYPTO",
-        storagePath: "CRYPTO/category-beta",
+        storagePath: "challenges/CRYPTO/category-beta",
       }))
     } finally {
       await one.close()
@@ -1186,6 +1235,68 @@ describe("GUI HTTP surface", () => {
     } finally {
       await one.close()
       await rm(outside, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("GUI token authentication", () => {
+  test("rejects anonymous local callers, seeds the cookie, and accepts the tokened URL", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "boom-gui-auth-"))
+    const root = path.join(directory, "ctf")
+    await Promise.all([
+      mkdir(path.join(root, "challenges"), { recursive: true }),
+      mkdir(path.join(root, "runs"), { recursive: true }),
+    ])
+    const previousHome = process.env.BOOM_HOME
+    process.env.BOOM_HOME = path.join(directory, "home")
+    const runner = new GuiRunner(root, async () => {
+      throw new Error("auth tests must not launch the runtime")
+    })
+    const started = await startGuiServer({
+      root,
+      hostname: "127.0.0.1",
+      port: 0,
+      open: false,
+      runner,
+      startRuntime: false,
+    })
+    try {
+      const base = new URL(started.url)
+      const token = base.searchParams.get("token")
+      expect(token).toBeTruthy()
+      // The token lives beside gui-state.json with operator-only permissions.
+      const tokenPath = path.join(process.env.BOOM_HOME!, ".gui-token")
+      expect(await readFile(tokenPath, "utf8")).toBe(`${token}\n`)
+      const tokenFile = await stat(tokenPath)
+      expect(tokenFile.mode & 0o077).toBe(0)
+
+      // Anonymous API access is rejected.
+      const anonymous = await fetch(new URL("/api/competition", base.origin))
+      expect(anonymous.status).toBe(401)
+
+      // The tokened startup URL authenticates and seeds the strict session cookie.
+      const first = await fetch(started.url)
+      expect(first.status).toBe(200)
+      const setCookie = first.headers.get("set-cookie") ?? ""
+      expect(setCookie).toContain("boom_gui=")
+      expect(setCookie).toContain("HttpOnly")
+
+      // A forged or wrong credential is rejected even on document navigations (401 hint page).
+      const wrong = await fetch(base.origin)
+      expect(wrong.status).toBe(401)
+      const wrongAPI = await fetch(new URL(`/api/competition?token=${"0".repeat(48)}`, base.origin))
+      expect(wrongAPI.status).toBe(401)
+
+      // Header credentials work for local API clients and also seed the cookie.
+      const headered = await fetch(new URL("/api/competition", base.origin), {
+        headers: { "x-boom-token": token! },
+      })
+      expect(headered.status).toBe(200)
+    } finally {
+      await started.close()
+      if (previousHome === undefined) delete process.env.BOOM_HOME
+      else process.env.BOOM_HOME = previousHome
+      await rm(directory, { recursive: true, force: true })
     }
   })
 })

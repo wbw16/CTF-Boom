@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
+import { chmod, lstat, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
@@ -37,6 +37,15 @@ const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/
 const MAX_SECRET = 65_536
 const MAX_AUTH_FILE = 2 * 1024 * 1024
 let mutationTail: Promise<void> = Promise.resolve()
+
+/** Cross-process lock acquisition: short retries before giving up, stale locks broken after 30s. */
+const LOCK_RETRY_DELAY_MS = 50
+const LOCK_RETRY_ATTEMPTS = 20
+const LOCK_STALE_MS = 30_000
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
 
 function object(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -107,7 +116,13 @@ export function parseStoredProviderCredential(value: unknown): StoredProviderCre
   return undefined
 }
 
-function parse(value: unknown): CredentialStore {
+function warnInvalidCredentialEntry(id: string) {
+  // One line on stderr naming the skipped key; a single damaged entry must never brick the store.
+  console.warn(`[boom] 凭据库条目无效，已跳过该条：${id} (${credentialStorePath()})`)
+}
+
+function parse(value: unknown, options: { skipInvalidEntries?: boolean } = {}): CredentialStore {
+  const skipInvalidEntries = options.skipInvalidEntries === true
   const input = object(value)
   if (input?.version === 1) {
     const raw = object(input.apiKeys)
@@ -115,7 +130,13 @@ function parse(value: unknown): CredentialStore {
     const providers: Record<string, StoredProviderCredential> = {}
     for (const [id, key] of Object.entries(raw)) {
       const parsed = parseStoredProviderCredential({ type: "api", key })
-      if (!PROVIDER_ID.test(id) || !parsed) throw new Error("invalid provider credential entry")
+      if (!PROVIDER_ID.test(id) || !parsed) {
+        if (skipInvalidEntries) {
+          warnInvalidCredentialEntry(id)
+          continue
+        }
+        throw new Error("invalid provider credential entry")
+      }
       providers[id] = parsed
     }
     return { version: 2, providers }
@@ -125,14 +146,70 @@ function parse(value: unknown): CredentialStore {
   const providers: Record<string, StoredProviderCredential> = {}
   for (const [id, value] of Object.entries(raw)) {
     const credential = parseStoredProviderCredential(value)
-    if (!PROVIDER_ID.test(id) || !credential) throw new Error("invalid provider credential entry")
+    if (!PROVIDER_ID.test(id) || !credential) {
+      if (skipInvalidEntries) {
+        warnInvalidCredentialEntry(id)
+        continue
+      }
+      throw new Error("invalid provider credential entry")
+    }
     providers[id] = credential
   }
   return { version: 2, providers }
 }
 
+/**
+ * Cross-process mutex for the read-modify-write mutation window.
+ *
+ * `mutationTail` only serializes mutations within one process; two concurrent Boom processes would
+ * still interleave their load→save cycles and silently drop each other's updates. The lock file is
+ * created with O_CREAT|O_EXCL (`wx`, equally atomic on Windows) and carries the owning pid and a
+ * timestamp so a crashed owner's stale lock (mtime older than 30s) can be broken safely — the store
+ * writes themselves stay atomic renames, so a torn takeover cannot corrupt the file.
+ */
+async function acquireCredentialStoreLock(target: string) {
+  const lockFile = `${target}.lock`
+  for (let attempt = 0; attempt < LOCK_RETRY_ATTEMPTS; attempt += 1) {
+    const handle = await open(lockFile, "wx", 0o600).catch((error: NodeJS.ErrnoException) => {
+      if (error?.code === "EEXIST") return undefined
+      throw error
+    })
+    if (handle) {
+      try {
+        await handle.writeFile(
+          `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`,
+          { encoding: "utf8" },
+        )
+      } finally {
+        await handle.close()
+      }
+      return lockFile
+    }
+    const info = await lstat(lockFile).catch(() => undefined)
+    if (info && Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+      await unlink(lockFile).catch(() => {})
+      continue
+    }
+    await delay(LOCK_RETRY_DELAY_MS)
+  }
+  throw new Error("另一个 Boom 进程正在更新凭据，请稍后重试")
+}
+
+async function withCredentialStoreLock<T>(operation: () => Promise<T>): Promise<T> {
+  const target = credentialStorePath()
+  await assertCredentialDirectory(target)
+  await mkdir(path.dirname(target), { recursive: true, mode: 0o700 }).catch(() => {})
+  const lockFile = await acquireCredentialStoreLock(target)
+  try {
+    return await operation()
+  } finally {
+    // Release even when the mutation failed, or every later mutation would hit our own lock.
+    await unlink(lockFile).catch(() => {})
+  }
+}
+
 function mutate(operation: () => Promise<void>) {
-  const result = mutationTail.then(operation, operation)
+  const result = mutationTail.then(() => withCredentialStoreLock(operation))
   mutationTail = result.catch(() => {})
   return result
 }
@@ -165,7 +242,9 @@ export async function loadCredentialStore(): Promise<CredentialStore> {
   if (!info.isFile() || info.isSymbolicLink())
     throw new Error(`Provider credential store is not a real file: ${target}`)
   try {
-    return parse(JSON.parse(await readFile(target, "utf8")))
+    // A single damaged provider entry is skipped with a warning (see `parse`); only whole-file
+    // damage (unreadable JSON, wrong version) keeps the store unavailable.
+    return parse(JSON.parse(await readFile(target, "utf8")), { skipInvalidEntries: true })
   } catch (error) {
     throw new Error(`Failed to read Boom Provider credentials: ${error instanceof Error ? error.message : String(error)}`)
   }

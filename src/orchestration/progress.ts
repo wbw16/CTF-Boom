@@ -25,7 +25,7 @@ export type AutonomyEscalationSummary = {
   id: string
   fingerprint: string
   level: 1 | 2 | 3
-  status: "running" | "completed" | "partial" | "failed" | "cancelled"
+  status: "running" | "completed" | "partial" | "failed" | "cancelled" | "interrupted"
   reason: string
   startedAt: string
   finishedAt?: string
@@ -97,7 +97,7 @@ function parseEscalation(value: unknown): AutonomyEscalationSummary | undefined 
     typeof input.id !== "string" ||
     typeof input.fingerprint !== "string" ||
     ![1, 2, 3].includes(Number(input.level)) ||
-    !["running", "completed", "partial", "failed", "cancelled"].includes(String(input.status)) ||
+    !["running", "completed", "partial", "failed", "cancelled", "interrupted"].includes(String(input.status)) ||
     typeof input.reason !== "string" ||
     typeof input.startedAt !== "string"
   ) return undefined
@@ -199,10 +199,44 @@ export async function loadAutonomyState(directory: string, now = Date.now()) {
     .catch(() => initialState(now))
 }
 
+/**
+ * Startup reconciliation for a hard crash.
+ *
+ * `startEscalation` persists a `running` row before the second opinion begins; if the process dies
+ * mid-escalation, nothing ever writes its terminal status. On restart the epoch usually has moved on,
+ * so the stale row would match `decideAutonomy`'s "an L1 second opinion is already running" filter
+ * forever and permanently disable L1 diagnosis for this workspace. Any `running` record whose
+ * fingerprint no longer matches the current epoch is therefore rewritten to a terminal `interrupted`
+ * state at load time, with a timestamp and an explicit reason.
+ */
+export function closeInterruptedEscalations(state: AutonomyState, now = Date.now()): AutonomyState {
+  const stale = (item: AutonomyEscalationSummary) =>
+    item.status === "running" && item.fingerprint !== state.progressEpoch
+  if (!state.escalations.some(stale)) return state
+  return {
+    ...state,
+    escalations: state.escalations.map((item) =>
+      stale(item)
+        ? {
+            ...item,
+            status: "interrupted" as const,
+            finishedAt: new Date(now).toISOString(),
+            reason: `${item.reason} — process restart left this escalation unfinished`.slice(0, 2_000),
+          }
+        : item,
+    ),
+  }
+}
+
 export async function loadOrCreateAutonomyState(directory: string, now = Date.now()) {
   const target = await autonomyPath(directory)
   const info = await lstat(target).catch(() => undefined)
-  if (info?.isFile() && !info.isSymbolicLink()) return loadAutonomyState(directory, now)
+  if (info?.isFile() && !info.isSymbolicLink()) {
+    const loaded = await loadAutonomyState(directory, now)
+    // Atomic write habit preserved: saveAutonomyState lands through tmp-file + rename.
+    const reconciled = closeInterruptedEscalations(loaded, now)
+    return reconciled === loaded ? loaded : saveAutonomyState(directory, reconciled)
+  }
   return saveAutonomyState(directory, initialState(now))
 }
 

@@ -18,6 +18,8 @@ import {
 
 type OpenAIResponsesDriverOptions = ProviderHTTPClientOptions & {
   pricing?: ProviderModelPricing
+  /** Optional output ceiling forwarded as `max_output_tokens` when the model declares one. */
+  maxOutputTokens?: number
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -92,6 +94,9 @@ export class OpenAIResponsesProviderDriver implements NativeProviderDriver {
         input: inputItems(request.messages),
         stream: true,
         store: false,
+        ...(this.#options.maxOutputTokens !== undefined
+          ? { max_output_tokens: Math.max(1, Math.floor(this.#options.maxOutputTokens)) }
+          : {}),
         ...(request.tools.length ? {
           tools: request.tools.map((tool) => ({
             type: "function",

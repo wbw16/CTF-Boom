@@ -40,13 +40,36 @@ function boomHome() {
   return path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
 }
 
+/** Hard ceiling for one compiler/tool invocation so an ignored SIGTERM cannot hang startup. */
+const RUN_TIMEOUT_MS = 120_000
+const RUN_KILL_GRACE_MS = 3_000
+
 async function run(command: string[]) {
   const child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "pipe" })
-  const [code, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
+  let escalate: ReturnType<typeof setTimeout> | undefined
+  const timer = setTimeout(() => {
+    child.kill()
+    escalate = setTimeout(() => {
+      try {
+        child.kill("SIGKILL")
+      } catch {
+        // Already exited between the two signals.
+      }
+    }, RUN_KILL_GRACE_MS)
+  }, RUN_TIMEOUT_MS)
+  let code: number | undefined
+  let stdout = ""
+  let stderr = ""
+  try {
+    ;[code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+  } finally {
+    clearTimeout(timer)
+    if (escalate !== undefined) clearTimeout(escalate)
+  }
   if (code !== 0)
     throw new Error(
       `Failed to build the Boom desktop client (${command[0]} exited ${code}): ` +

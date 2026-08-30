@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import path from "node:path"
-import { discoverChallenges, loadAnswers, type Challenge } from "./challenge.ts"
+import { discoverChallenges, loadAnswers, prepareWorkspaceRoot, type Challenge } from "./challenge.ts"
 import { launchDesktopClient } from "./desktop.ts"
 import {
   GuiArgumentError,
@@ -62,7 +62,7 @@ function usage(code = 1): never {
     "  version                  print the installed version",
     "",
     "Run options:",
-    "  --root <dir>             challenge root (default: ./ctf)",
+    "  --root <dir>             workspace root (default: current directory)",
     `  --strong-model <p/m>     solver model (default: ${DEFAULTS.model})`,
     `  --economy-model <p/m>    bounded second-opinion model (default: ${DEFAULTS.model})`,
     "  --model <p/m>            alias for --strong-model",
@@ -78,10 +78,11 @@ function usage(code = 1): never {
     "  --no-network             run fully offline: refuse web tools and isolate bash/boom-exec",
     "",
     "The main solver may request consultation itself; context compaction also triggers one.",
-    "With no slugs, run processes every challenge under <root>/challenges.",
+    "With no slugs, run processes every challenge under the workspace root",
+    "(<root>/challenges or category folders such as WEB/PWN/MISC directly inside <root>).",
     "",
     "GUI options:",
-    "  --root <dir>       challenge root (default: ./ctf)",
+    "  --root <dir>       workspace root (default: current directory)",
     "  --port <n>         local API port (default: 0, chooses a free port)",
     "  --native           open the macOS desktop client (default on macOS)",
     "  --browser          open the compatibility browser interface",
@@ -150,7 +151,7 @@ async function gui(argv: string[]) {
 
 function parse(argv: string[]): Args {
   const args: Args = {
-    root: path.resolve("ctf"),
+    root: process.cwd(),
     model: DEFAULTS.model,
     economyModel: DEFAULTS.model,
     strongModel: DEFAULTS.model,
@@ -286,6 +287,8 @@ async function doctor() {
 
 async function run(argv: string[]) {
   const args = parse(argv)
+  // Opening on a folder that has no workspace yet still leaves runs/ and challenges/ behind.
+  await prepareWorkspaceRoot(args.root)
   const all = await discoverChallenges(args.root)
   const challenges = args.only.length === 0
     ? all
@@ -293,7 +296,7 @@ async function run(argv: string[]) {
   const missing = args.only.filter((slug) => !all.some((challenge) => challenge.slug === slug))
   if (missing.length > 0) throw new Error(`No such challenge(s): ${missing.join(", ")}`)
   if (challenges.length === 0)
-    throw new Error(`No challenges found under ${path.join(args.root, "challenges")}`)
+    throw new Error(`No challenges found under ${args.root}`)
 
   const answers = await loadAnswers(args.root)
   const runner = new GuiRunner(args.root, undefined, undefined, { network: args.network })
@@ -373,7 +376,7 @@ async function main() {
   if (command === undefined || command === "-h" || command === "--help") usage(0)
   if (command === "doctor") return doctor()
   if (command === "evaluate") {
-    let root = path.resolve("ctf")
+    let root = process.cwd()
     for (let index = 0; index < argv.length; index += 1) {
       if (argv[index] === "--root" && argv[index + 1]) root = path.resolve(argv[++index]!)
       else usage()

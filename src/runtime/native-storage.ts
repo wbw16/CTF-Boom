@@ -180,11 +180,34 @@ export class NativeMessageLedger {
     const file = path.join(directory, "messages.jsonl")
     await assertRealFile(file)
     const source = await readFile(file, "utf8").catch(() => "")
-    const entries = source.split("\n").filter(Boolean).map((line, index) => {
+    const lines = source.split("\n")
+    let lastContentLine = -1
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      if (lines[index] !== "") {
+        lastContentLine = index
+        break
+      }
+    }
+    const entries: NativeLedgerEntry[] = []
+    let offset = 0
+    for (const [index, line] of lines.entries()) {
+      const lineStart = offset
+      offset += Buffer.byteLength(line) + 1
+      if (line === "") continue
       let value: unknown
       try {
         value = JSON.parse(line)
       } catch {
+        // A crash can tear the final append mid-write. Skip a torn *tail* — the last non-empty
+        // line without its terminating newline — so the "recoverable" ledger stays recoverable,
+        // and warn with the byte offset. Corruption anywhere earlier still fails loudly: data
+        // integrity wins over silently dropping records.
+        if (index === lastContentLine && !source.endsWith("\n")) {
+          console.warn(
+            `[boom] 消息账本尾部存在未完整写入的行，已跳过（offset ${lineStart}）: ${file}`,
+          )
+          break
+        }
         throw new Error(`Invalid Boom Native message ledger JSON at line ${index + 1}`)
       }
       const item = value as Partial<NativeLedgerEntry>
@@ -192,8 +215,8 @@ export class NativeMessageLedger {
         item.version !== 1 || typeof item.id !== "string" || typeof item.timestamp !== "string" ||
         !item.message || typeof item.message !== "object"
       ) throw new Error(`Invalid Boom Native message ledger entry at line ${index + 1}`)
-      return item as NativeLedgerEntry
-    })
+      entries.push(item as NativeLedgerEntry)
+    }
     return new NativeMessageLedger(file, entries)
   }
 

@@ -79,7 +79,7 @@ describe("durable task metadata", () => {
 
       await rejectTaskFlag(directory, "flag{wrong}")
       expect((await loadTaskRecord(directory))?.rejectedFlags).toEqual(["flag{wrong}"])
-      expect(await Bun.file(path.join(directory, "NOTES.md")).text()).toContain("用户已确认错误")
+      expect(await Bun.file(path.join(directory, "NOTES.md")).text()).toContain("user confirmed incorrect")
 
       await archiveTask(directory)
       const rawTask = await Bun.file(path.join(directory, "task.json")).text()

@@ -20,13 +20,31 @@ function bounded(text: string): { output: string; truncated: boolean } {
   }
 }
 
+/** Unicode scalar values only: beyond 0x10FFFF, or inside the surrogate block, no character exists. */
+function decodeCodePoint(value: number): string | undefined {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0x10ffff) return undefined
+  if (value >= 0xd800 && value <= 0xdfff) return undefined
+  return String.fromCodePoint(value)
+}
+
 function decodeEntities(text: string): string {
-  const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " }
-  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (_match, entity: string) => {
-    if (entity.startsWith("#x")) return String.fromCodePoint(Number.parseInt(entity.slice(2), 16))
-    if (entity.startsWith("#")) return String.fromCodePoint(Number.parseInt(entity.slice(1), 10))
-    return named[entity.toLowerCase()] ?? `&${entity};`
-  })
+  try {
+    const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " }
+    return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, entity: string) => {
+      // An out-of-range numeric entity (e.g. &#x110000;) names no character: keep the entity text
+      // verbatim instead of letting fromCodePoint's RangeError disable the whole webfetch tool.
+      const normalized = entity.toLowerCase()
+      if (normalized.startsWith("#x"))
+        return decodeCodePoint(Number.parseInt(normalized.slice(2), 16)) ?? match
+      if (normalized.startsWith("#"))
+        return decodeCodePoint(Number.parseInt(normalized.slice(1), 10)) ?? match
+      return named[normalized] ?? match
+    })
+  } catch {
+    // Defensive backstop for anything the validation above misses: rendering must degrade to the
+    // untouched original text, never fail.
+    return text
+  }
 }
 
 function htmlText(html: string): string {

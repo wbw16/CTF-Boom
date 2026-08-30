@@ -144,6 +144,33 @@ describe("M3 Network Broker", () => {
 })
 
 describe("M3 native Web tools", () => {
+  test("keeps out-of-range numeric entities harmless instead of disabling webfetch", async () => {
+    const directory = await workspace()
+    const broker = createBoomNetworkBroker({
+      resolver: publicResolver,
+      transport: async () => ({
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" } as Record<string, string>,
+        body: Buffer.from(
+          "<html><body><p>&#x110000;</p><p>&#xD800;</p><p>flag&#65;&#x42;&amp;done</p></body></html>",
+        ),
+      }),
+    })
+    const host = createBoomToolHost(await loadBoomToolRegistry(RESOURCE_ROOT), { networkBroker: broker })
+    const fetched = await host.execute({
+      name: "webfetch",
+      arguments: { url: "https://example.com/", format: "text" },
+      directory,
+      profileID: "solver",
+      sessionID: "web-tools-entities",
+    })
+    // Entities naming no Unicode scalar value stay verbatim instead of throwing a RangeError.
+    expect(fetched.output).toContain("&#x110000;")
+    expect(fetched.output).toContain("&#xD800;")
+    // In-range entities keep decoding normally.
+    expect(fetched.output).toContain("flagAB&done")
+  })
+
   test("formats brokered HTML and delegates bounded search through the configured provider", async () => {
     const directory = await workspace()
     const broker = createBoomNetworkBroker({

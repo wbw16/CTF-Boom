@@ -169,19 +169,44 @@ function normalizeRoot(value: unknown): RootGuiState {
   return { settings: normalizeSettings(input.settings), challenges }
 }
 
+/**
+ * Move an unreadable state file aside so the next save cannot silently destroy confirmed flags and
+ * archived challenge state, then fail loudly. Mirrors the mcp-config/provider-config strategy.
+ */
+async function quarantineCorruptState(target: string, reason: string): Promise<never> {
+  const backup = `${target}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`
+  const moved = await rename(target, backup)
+    .then(() => true)
+    .catch(() => false)
+  throw new Error(
+    `Failed to read the GUI state file at ${target}: ${reason}. ` +
+      (moved
+        ? `The corrupt file was preserved at ${backup}; inspect or delete it, then retry.`
+        : "Automatic quarantine failed; move the file aside manually before retrying."),
+  )
+}
+
 async function loadFile(): Promise<StateFile> {
-  const raw = await readFile(statePath(), "utf8").catch(() => undefined)
+  const target = statePath()
+  const raw = await readFile(target, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined
+    throw error
+  })
   if (raw === undefined) return { version: 2, roots: {} }
+  let parsed: Partial<StateFile>
   try {
-    const parsed = JSON.parse(raw) as Partial<StateFile>
-    const roots: Record<string, RootGuiState> = {}
-    if (parsed.roots && typeof parsed.roots === "object") {
-      for (const [root, state] of Object.entries(parsed.roots)) roots[path.resolve(root)] = normalizeRoot(state)
-    }
-    return { version: 2, roots }
-  } catch {
-    return { version: 2, roots: {} }
+    parsed = JSON.parse(raw) as Partial<StateFile>
+  } catch (error) {
+    return await quarantineCorruptState(
+      target,
+      error instanceof Error ? error.message : String(error),
+    )
   }
+  if (!parsed || typeof parsed !== "object" || !parsed.roots || typeof parsed.roots !== "object")
+    return await quarantineCorruptState(target, "expected an object with a roots map")
+  const roots: Record<string, RootGuiState> = {}
+  for (const [root, state] of Object.entries(parsed.roots)) roots[path.resolve(root)] = normalizeRoot(state)
+  return { version: 2, roots }
 }
 
 async function saveFile(file: StateFile) {

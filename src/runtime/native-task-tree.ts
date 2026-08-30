@@ -15,6 +15,7 @@ import {
   billableRuntimeUsage,
   cloneRuntimeUsage,
   emptyRuntimeUsage,
+  NativeProviderFailure,
 } from "./native-provider.ts"
 import { atomicJson, NativeEventBus, sanitizeNativeState } from "./native-storage.ts"
 
@@ -33,6 +34,13 @@ export const DEFAULT_NATIVE_KERNEL_LIMITS: NativeKernelLimits = {
   maxTaskDepth: 2,
   maxConcurrency: 4,
 }
+
+/**
+ * Hard ceiling on how long a step may queue for a concurrency slot. Generous by design (a busy
+ * local match keeps all slots legitimately busy), but bounded so a provider that accepts a slot
+ * and then hangs cannot deadlock the whole task tree until process exit.
+ */
+const SEMAPHORE_WAIT_TIMEOUT_MS = 600_000
 
 export type NativeTaskState = "queued" | "running" | "completed" | "failed" | "cancelled"
 
@@ -58,6 +66,9 @@ export class NativeBudgetExceeded extends Error {
   }
 }
 
+/** Sentinel name for a concurrency-slot wait that exceeded its deadline. */
+const SLOT_TIMEOUT = "BoomSlotTimeout"
+
 class Semaphore {
   #active = 0
   #waiters: Array<{
@@ -65,11 +76,12 @@ class Semaphore {
     resolve: (release: () => void) => void
     reject: (error: unknown) => void
     abort: () => void
+    timer?: ReturnType<typeof setTimeout>
   }> = []
 
   constructor(readonly limit: number) {}
 
-  acquire(signal: AbortSignal): Promise<() => void> {
+  acquire(signal: AbortSignal, waitTimeoutMs = SEMAPHORE_WAIT_TIMEOUT_MS): Promise<() => void> {
     signal.throwIfAborted()
     if (this.#active < this.limit) {
       this.#active += 1
@@ -83,8 +95,22 @@ class Semaphore {
         abort: () => {
           const index = this.#waiters.indexOf(waiter)
           if (index >= 0) this.#waiters.splice(index, 1)
+          if (waiter.timer !== undefined) clearTimeout(waiter.timer)
           reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"))
         },
+        timer: undefined as ReturnType<typeof setTimeout> | undefined,
+      }
+      // A queued caller must not be pinned forever by a hung slot holder; the rejection is
+      // distinguishable from abort so runActive can map it to a retryable failure.
+      if (waitTimeoutMs > 0) {
+        waiter.timer = setTimeout(() => {
+          const index = this.#waiters.indexOf(waiter)
+          if (index >= 0) this.#waiters.splice(index, 1)
+          signal.removeEventListener("abort", waiter.abort)
+          const error = new Error(`Timed out after ${Math.round(waitTimeoutMs / 1_000)}s waiting for a provider concurrency slot`)
+          error.name = SLOT_TIMEOUT
+          reject(error)
+        }, waitTimeoutMs)
       }
       signal.addEventListener("abort", waiter.abort, { once: true })
       this.#waiters.push(waiter)
@@ -99,6 +125,7 @@ class Semaphore {
       const next = this.#waiters.shift()
       if (next) {
         next.signal.removeEventListener("abort", next.abort)
+        if (next.timer !== undefined) clearTimeout(next.timer)
         next.resolve(this.#release())
       } else this.#active -= 1
     }
@@ -265,7 +292,20 @@ export class NativeTaskCoordinator {
 
   async runActive<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
     const combined = AbortSignal.any([this.signal, signal])
-    const release = await this.#semaphore.acquire(combined)
+    let release: (() => void) | undefined
+    try {
+      release = await this.#semaphore.acquire(combined)
+    } catch (error) {
+      // Abort rejections keep their identity; a slot-wait timeout becomes a retryable provider
+      // failure so the step re-enters the normal retry/backoff path instead of failing the turn.
+      if (combined.aborted || !(error instanceof Error) || error.name !== SLOT_TIMEOUT) throw error
+      throw new NativeProviderFailure({
+        name: SLOT_TIMEOUT,
+        message: error.message,
+        category: "network",
+        retryable: true,
+      })
+    }
     try {
       combined.throwIfAborted()
       return await operation()

@@ -33,7 +33,9 @@ function inside(base: string, target: string) {
  * from "producing files without writing notes".
  */
 export async function latestArtifactWrite(directory: string) {
-  const root = await realpath(directory)
+  // A vanished workspace is a race, not a failure: report "nothing written" instead of throwing.
+  const root = await realpath(directory).catch(() => undefined)
+  if (!root) return 0
   const work = path.join(root, "work")
   let newest = 0
   const visit = async (current: string) => {
@@ -53,7 +55,10 @@ export async function latestArtifactWrite(directory: string) {
 }
 
 export async function discoverKeyArtifacts(directory: string) {
-  const root = await realpath(directory)
+  // TOCTOU tolerance: every stat below can lose the race against a concurrent workspace cleanup, so
+  // each one degrades to "skip this entry" (or "empty inventory" for the root) instead of throwing.
+  const root = await realpath(directory).catch(() => undefined)
+  if (!root) return []
   const work = path.join(root, "work")
   const output: ArtifactRef[] = []
   const visit = async (current: string) => {
@@ -63,14 +68,18 @@ export async function discoverKeyArtifacts(directory: string) {
       if (entry.isSymbolicLink()) continue
       if (entry.isDirectory()) { await visit(target); continue }
       if (!entry.isFile()) continue
-      const canonical = await realpath(target)
-      if (!inside(work, canonical)) continue
-      const info = await lstat(canonical)
+      const canonical = await realpath(target).catch(() => undefined)
+      if (!canonical || !inside(work, canonical)) continue
+      const info = await lstat(canonical).catch(() => undefined)
+      if (!info) continue
       if (info.size > 100_000_000) continue
+      const digest = await sha256(canonical).catch(() => undefined)
+      // The file disappeared mid-hash: it is gone, so there is nothing to report.
+      if (digest === undefined) continue
       output.push({
         path: path.relative(root, canonical).split(path.sep).join("/"),
         description: `solver artifact (${info.size} bytes)`,
-        sha256: await sha256(canonical),
+        sha256: digest,
       })
       if (output.length >= 2_000) return
     }

@@ -8,7 +8,7 @@ import {
 } from "./command-executor.ts"
 import { CANDIDATE_SUBMISSION_PATH, submitCandidate } from "./candidate-submission.ts"
 import { CONSULTATION_REQUEST_PATH, requestConsultation } from "./consultation-request.ts"
-import { loadTaskEnvironment } from "./environment.ts"
+import { loadTaskEnvironment, type ExecutionMode } from "./environment.ts"
 import { executeBoomFileTool, type BoomFileToolName } from "./runtime/file-tools.ts"
 import {
   assertBoomPolicy,
@@ -34,6 +34,16 @@ export type BoomToolName =
   | "ctf-consult"
   | "ctf-submit"
 const MAX_VISIBLE_OUTPUT_BYTES = 32_768
+
+/**
+ * Same isolation ladder as command-executor: managed < isolated < static-only. The task binding is
+ * the ceiling; a requested mode must rank at or above it.
+ */
+const EXECUTION_MODE_RANK: Record<ExecutionMode, number> = {
+  managed: 0,
+  isolated: 1,
+  "static-only": 2,
+}
 
 export type BoomToolResult = {
   title: string
@@ -80,6 +90,13 @@ async function executeCommand(
   const mode = requestedMode === "managed" || requestedMode === "isolated" || requestedMode === "static-only"
     ? requestedMode
     : binding.executionMode
+  // Enforce the isolation ceiling at this boundary too, before the request reaches the command
+  // executor: managed under isolated loses the container boundary, and isolated under static-only
+  // would void the no-challenge-execution promise and its allowlist.
+  if (EXECUTION_MODE_RANK[mode] < EXECUTION_MODE_RANK[binding.executionMode])
+    throw new Error(
+      `Execution mode ceiling violated: task binding is ${binding.executionMode}, requested mode is ${requestedMode}; a request cannot lower isolation below the task's bound execution mode`,
+    )
   const purpose = input.purpose === "install" ? "install" : "analysis"
   const timeoutMs = Math.max(100, Math.min(300_000, finite(input.timeoutMs, 30_000)))
   const requestedMaxOutputBytes = Math.max(1_024, Math.min(1_000_000, finite(input.maxOutputBytes, MAX_VISIBLE_OUTPUT_BYTES)))
