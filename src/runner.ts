@@ -66,16 +66,16 @@ import {
 } from "./competition/policy.ts"
 import { EnvironmentPool, type EnvironmentLease } from "./competition/environments.ts"
 import {
+  DEFAULT_MAX_SUBMISSIONS_PER_CHALLENGE,
   gateSubmission,
   loadSubmissionLedger,
   recordAttempt,
   saveSubmissionLedger,
 } from "./competition/submissions.ts"
-import { loadCompetitionAdapter } from "./competition/adapter.ts"
 import {
-  MAX_SUBMISSIONS_PER_CHALLENGE,
-  XIHULUNJIAN_ADAPTER_ID,
-} from "./xihulunjian-platform-adapter.ts"
+  findPlatformAdapterEntry,
+  loadCompetitionAdapter,
+} from "./platform/registry.ts"
 import {
   BOOM_CONTEXT_LIMIT,
   loadProviderStore,
@@ -742,7 +742,7 @@ export class GuiRunner {
   private executions = new Set<Promise<void>>()
   private concurrency = 1
   /**
-   * Competition scheduling state. The platform allows only three challenge environments at once and
+   * Competition scheduling state. The active platform caps concurrent challenge environments and
    * the match is short, so admission is resource-aware rather than a single global concurrency cap.
    */
   private competition: CompetitionSettings = DEFAULT_COMPETITION_SETTINGS
@@ -824,16 +824,15 @@ export class GuiRunner {
     return this.environments
   }
 
-  /** The fixed 西湖论剑 adapter, when an AccessKey is configured. */
-  private async competitionAdapter() {
-    const adapter = await loadCompetitionAdapter()
-    return adapter
+  /** The active competition platform adapter, when its AccessKey is configured. */
+  private async competitionAdapter(platformId?: string) {
+    return await loadCompetitionAdapter(platformId ?? this.competition.platformId)
   }
 
   /**
-   * Candidate submission is deliberately single-platform in the product build. A supplied adapter
-   * is accepted only as a test fixture so the runner's verdict state machine can remain unit-tested
-   * without making a live 西湖论剑 request.
+   * Candidate submission goes through the challenge's registered platform adapter. A supplied test
+   * adapter is accepted only as a fixture so the runner's verdict state machine can remain
+   * unit-tested without making a live platform request.
    */
   private async submitCandidateToPlatform(input: {
     challenge: Challenge
@@ -843,13 +842,14 @@ export class GuiRunner {
     /** Invoked after every live adapter response; each response consumes a platform submission. */
     onAttempt?: (result: FlagSubmissionResult, attempt: number) => Promise<void> | void
   }): Promise<FlagSubmissionResult> {
-    if (input.challenge.platform?.adapter === XIHULUNJIAN_ADAPTER_ID) {
-      const adapter = await this.competitionAdapter().catch(() => undefined)
+    const platformEntry = findPlatformAdapterEntry(input.challenge.platform?.adapter)
+    if (platformEntry) {
+      const adapter = await this.competitionAdapter(platformEntry.id).catch(() => undefined)
       if (!adapter) {
         return {
-          adapter: XIHULUNJIAN_ADAPTER_ID,
+          adapter: platformEntry.id,
           verdict: "pending",
-          detail: "西湖论剑 AccessKey 未配置；等待人工确认",
+          detail: `${platformEntry.displayName} AccessKey 未配置；等待人工确认`,
           submittedAt: new Date().toISOString(),
         }
       }
@@ -865,24 +865,23 @@ export class GuiRunner {
         } catch (error) {
           if (attempt === 2) {
             return {
-              adapter: XIHULUNJIAN_ADAPTER_ID,
+              adapter: platformEntry.id,
               verdict: "pending",
-              detail: `西湖论剑提交失败；等待人工确认：${errorText(error)}`,
+              detail: `${platformEntry.displayName}提交失败；等待人工确认：${errorText(error)}`,
               submittedAt: new Date().toISOString(),
             }
           }
         }
       }
       return last ?? {
-        adapter: XIHULUNJIAN_ADAPTER_ID,
+        adapter: platformEntry.id,
         verdict: "pending",
         detail: "自动提交已取消；等待人工确认",
         submittedAt: new Date().toISOString(),
       }
     }
 
-    // Kept unreachable in normal product setup: no UI, API route, or CLI command can configure a
-    // generic adapter. It only supports the repository's injected unit-test fakes.
+    // Challenges without a registered platform adapter fall through to injected unit-test fakes.
     if (this.testPlatformAdapters) {
       const result = await this.testPlatformAdapters.submitFlagWithRetry({ root: this.root, ...input }, {
         retryDelayMs: this.platformSubmissionRetryDelayMs,
@@ -893,7 +892,7 @@ export class GuiRunner {
     return {
       adapter: "manual",
       verdict: "pending",
-      detail: "未配置西湖论剑题目；等待人工确认",
+      detail: "题目未接入比赛平台；等待人工确认",
       submittedAt: new Date().toISOString(),
     }
   }
@@ -2880,10 +2879,14 @@ export class GuiRunner {
         // The ledger is durable, so restarting mid-match cannot reset the count.
         let ledger = await loadSubmissionLedger(this.root, job.challenge.slug).catch(() =>
           ({ version: 1 as const, slug: job.challenge.slug, attempts: [] }))
+        const platformAdapter = await this.competitionAdapter(
+          findPlatformAdapterEntry(job.challenge.platform?.adapter)?.id,
+        ).catch(() => undefined)
         const gate = gateSubmission({
           ledger,
           candidate: outcome.primaryCandidate,
-          maxSubmissions: MAX_SUBMISSIONS_PER_CHALLENGE,
+          maxSubmissions: platformAdapter?.limits.maxSubmissionsPerChallenge
+            ?? DEFAULT_MAX_SUBMISSIONS_PER_CHALLENGE,
         })
         if (!gate.allowed) {
           job.platformSubmission = {

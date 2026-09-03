@@ -1,20 +1,25 @@
 /**
  * Reclassify already-synced local challenges into keyword-derived category folders.
  *
- * The 西湖论剑 platform gives no per-challenge category, so the folder is derived from the
+ * Platforms that give no per-challenge category (e.g. DASCTF) get their folder derived from the
  * challenge name (folder name) using the same rules the sync adapter uses.  By default it only
  * prints what would move; pass --apply to actually move folders and rewrite meta.json.
  *
- *   bun scripts/classify-challenges.ts [--root ./xihulunjian-ctf] [--apply]
+ *   bun scripts/classify-challenges.ts --root ./ctf-workspace [--apply]
  */
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { recognizedChallengeCategory } from "../src/challenge.ts"
-import { inferChallengeCategory } from "../src/xihulunjian-platform-adapter.ts"
+import { inferChallengeCategory } from "../src/platform/adapters/dasctf.ts"
 
 const argv = process.argv.slice(2)
 const rootIndex = argv.indexOf("--root")
-const root = path.resolve(rootIndex >= 0 && argv[rootIndex + 1] ? argv[rootIndex + 1]! : "xihulunjian-ctf")
+const rootValue = rootIndex >= 0 ? argv[rootIndex + 1] : undefined
+if (!rootValue) {
+  console.error("用法: bun scripts/classify-challenges.ts --root <挑战工作区> [--apply]")
+  process.exit(1)
+}
+const root = path.resolve(rootValue!)
 const apply = argv.includes("--apply")
 
 const base = path.join(root, "challenges")

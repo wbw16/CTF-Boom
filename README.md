@@ -36,7 +36,7 @@ CTF-Boom 是一个以证据为中心的自动化 CTF 解题系统。它把题目
 - **可审计执行**：支持 `managed`、`isolated`、`static-only` 三种执行模式，带命令超时、输出限制、重复调用检测和审计记录。
 - **桌面工作台**：macOS 原生窗口提供题目队列、实时事件、历史记录、证据查看、任务取消、Flag 审核和 Writeup 触发；也提供浏览器兼容模式。
 - **Provider 与凭据隔离**：支持 OpenAI-compatible Chat Completions、OpenAI Responses 和 Anthropic Messages；凭据保存在 Boom 私有存储中，不会隐式继承 OpenCode 配置。
-- **西湖论剑专用接入**：固定适配本场 Agent API，可同步分批放出的赛题、按需申请靶机，并自动提交 Flag。
+- **比赛平台接入**：可插拔的平台适配器（内置 DASCTF Agent API），同步分批放出的赛题、按需申请靶机，并自动提交 Flag。
 - **Boom 托管 MCP**：远程或本地 MCP Server 由 Boom 单独配置、启停和授权，不读取用户全局或题目目录中的 OpenCode MCP 配置。
 
 ## 工作流程
@@ -197,24 +197,25 @@ boom run --root ./ctf \
 
 每个任务都会绑定明确的 Python 环境。Boom 不会在未配置时静默回退到其他解释器。
 
-## 西湖论剑比赛版
+## 比赛平台接入
 
-本分支仅包含西湖论剑 Agent API 的专用适配。默认可直接启动为本地比赛工作台：
+比赛能力（自动拉题、靶机调度、无人值守巡航、Flag 提交）平台无关，平台差异收敛在适配器层；
+当前内置 DASCTF Agent API 适配器（西湖论剑等 agent CTF 赛事使用）。默认可直接启动为本地
+比赛工作台：
 
 ```sh
-./start-gui.sh
+./start-gui.sh   # 默认工作区 ./ctf-workspace，可用 BOOM_ROOT 指定
 ```
 
-脚本会在仓库外的源码目录下创建可写的 `xihulunjian-ctf/` 工作区；如需指定位置，可设置
-`BOOM_ROOT=/absolute/path/to/workspace`。该工作区包含下载附件、运行记录、分析产物和提交台账，
-已被 Git 忽略。
+工作区包含下载附件、运行记录、分析产物和提交台账，已被 Git 忽略。
 
-首次使用请从 **设置 → 西湖论剑控制台** 保存 AccessKey，并配置赛方要求的大模型网关。随后在
+首次使用请从 **设置 → 比赛平台控制台** 保存 AccessKey，并配置赛方要求的大模型网关。随后在
 主界面同步分批赛题并点击 **开始比赛**，Boom 会进入无人值守巡航：自动拉取新题、按需申请靶机、
 调度解题并提交候选 Flag。顶栏集中展示公告、实时排名、运行时与巡航状态、容器使用量，以及可
 一键复制的待确认 Flag 计数。
 
-完整的赛制约束、凭证边界、网关配置和调度策略见 [西湖论剑比赛适配](./docs/XIHULUNJIAN.md)。
+适配器架构与接入新平台的方法见 [比赛平台接入](./docs/PLATFORMS.md)；DASCTF 的赛制约束、
+接口实测偏差、凭证边界和调度策略见 [DASCTF 平台适配](./docs/platforms/dasctf.md)。
 
 ## MCP Server
 
@@ -279,7 +280,8 @@ bun run pack:check
 进一步阅读：
 
 - [运行时架构](./docs/RUNTIME_ARCHITECTURE.md)
-- [西湖论剑比赛适配](./docs/XIHULUNJIAN.md)
+- [比赛平台接入](./docs/PLATFORMS.md)
+- [DASCTF 平台适配](./docs/platforms/dasctf.md)
 - [Provider 手动测试](./docs/M5_MANUAL_PROVIDER_TEST.md)
 - [第三方软件声明](./THIRD_PARTY_NOTICES.md)
 

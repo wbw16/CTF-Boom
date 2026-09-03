@@ -21,6 +21,8 @@ export type GuiSettings = {
 }
 
 export type CompetitionSettings = {
+  /** Adapter id of the competition platform this root syncs challenges from. */
+  platformId?: string
   /** Platform rule: how many challenge environments may exist at once. */
   remoteSlots: number
   /** How often unattended mode checks for new released challenges. */
@@ -67,7 +69,20 @@ export type CompetitionState = {
   unavailable?: boolean
 }
 
-export type XihulunjianNotice = {
+/** One competition platform adapter as listed by `GET /api/platform`. */
+export type PlatformSummary = {
+  id: string
+  displayName: string
+  defaultServerHost: string
+  credential: { configured: boolean; serverHost: string }
+}
+
+export type PlatformRegistry = {
+  active: PlatformSummary
+  platforms: PlatformSummary[]
+}
+
+export type PlatformNotice = {
   id: number
   title: string
   content?: string
@@ -76,7 +91,7 @@ export type XihulunjianNotice = {
   userName?: string
 }
 
-export type XihulunjianNoticeDetail = XihulunjianNotice & {
+export type PlatformNoticeDetail = PlatformNotice & {
   isFile: boolean
   files: Array<{ name: string; url: string; ext?: string }>
   url?: string

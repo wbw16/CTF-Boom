@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-西湖论剑手动拉题脚本(比赛应急用,独立于 GUI 进程运行)。
+DASCTF 平台手动拉题脚本(比赛应急用,独立于 GUI 进程运行)。
 
-是 src/xihulunjian-platform-adapter.ts 中 `acquireChallenges` 的忠实移植:
+是 src/platform/adapters/dasctf.ts 中 `acquireChallenges` 的忠实移植:
 
   GET {serverHost}/slab-match/api/v1/agent/ctf/exercise-list        分批题目列表
   GET {serverHost}/slab-match/api/v1/agent/ctf/exercise?id=<id>     单题详情
@@ -23,12 +23,13 @@
     HTTP 429 / 业务码 40001 按指数退避重试。
 
 用法:
-  python3 scripts/fetch-xihulunjian-challenges.py                 # 默认 root=xihulunjian-ctf
-  python3 scripts/fetch-xihulunjian-challenges.py --gap-ms 2500   # 与 GUI 抢限流时放慢
-  python3 scripts/fetch-xihulunjian-challenges.py --redownload    # 强制重下已存在附件
+  python3 scripts/fetch-dasctf-challenges.py --root ./ctf-workspace
+  python3 scripts/fetch-dasctf-challenges.py --root ./ctf-workspace --gap-ms 2500   # 与 GUI 抢限流时放慢
+  python3 scripts/fetch-dasctf-challenges.py --root ./ctf-workspace --redownload    # 强制重下已存在附件
 
-凭证来源与 GUI 一致: 环境变量 BOOM_XIHULUNJIAN_ACCESS_KEY 优先,否则
-$BOOM_HOME/xihulunjian.json(默认 ~/.config/boom/xihulunjian.json)。
+凭证来源与 GUI 一致: 环境变量 BOOM_DASCTF_ACCESS_KEY(旧名 BOOM_XIHULUNJIAN_ACCESS_KEY
+仍接受)优先,否则 $BOOM_HOME/platforms/dasctf.json(旧文件 ~/.config/boom/xihulunjian.json
+仍接受;默认 ~/.config/boom/platforms/dasctf.json)。
 """
 
 from __future__ import annotations
@@ -53,7 +54,9 @@ API_PREFIX = "/slab-match/api/v1/agent"
 SUCCESS_CODE = "00000"
 RATE_LIMIT_CODE = "40001"
 DEFAULT_SERVER_HOST = "https://pro.dasctf.com"
-ADAPTER_ID = "xihulunjian"
+ADAPTER_ID = "dasctf"
+# 比赛时期的旧适配器 ID,旧 meta.json 以此标记归属。
+LEGACY_ADAPTER_IDS = ("dasctf", "xihulunjian")
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 128 * 1024 * 1024
 
@@ -136,12 +139,12 @@ def numeric(value):
 
 def identifier(value, label):
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
-        raise ValueError(f"西湖论剑接口返回的{label}为空")
+        raise ValueError(f"DASCTF 接口返回的{label}为空")
     found = str(value).strip()
     if not found:
-        raise ValueError(f"西湖论剑接口返回的{label}为空")
+        raise ValueError(f"DASCTF 接口返回的{label}为空")
     if len(found) > 256 or re.search(r"[\0/:]", found):
-        raise ValueError(f"西湖论剑接口返回的{label}非法: {found}")
+        raise ValueError(f"DASCTF 接口返回的{label}非法: {found}")
     return found
 
 
@@ -183,7 +186,7 @@ def slugify(value):
     normalized = re.sub(r"[\0-\x1f/\\:]+", "-", normalized).replace("..", "-")
     trimmed = re.sub(r"^\.+|\.+$", "", normalized)[:160]
     if not trimmed or trimmed in (".", ".."):
-        raise ValueError("西湖论剑题目名无法生成合法 slug")
+        raise ValueError("DASCTF 题目名无法生成合法 slug")
     return trimmed
 
 
@@ -335,10 +338,10 @@ def _read_bounded(stream, maximum, what):
     return b"".join(chunks)
 
 
-class XihulunjianClient:
+class DasctfClient:
     def __init__(self, server_host, access_key, gap_ms=DEFAULT_GAP_MS, timeout=30):
         if not access_key or not access_key.strip():
-            raise SystemExit("西湖论剑未配置 AccessKey(检查 BOOM_XIHULUNJIAN_ACCESS_KEY 或 ~/.config/boom/xihulunjian.json)")
+            raise SystemExit("DASCTF 平台未配置 AccessKey(检查 BOOM_DASCTF_ACCESS_KEY、旧名 BOOM_XIHULUNJIAN_ACCESS_KEY,或 ~/.config/boom/platforms/dasctf.json / 旧 ~/.config/boom/xihulunjian.json)")
         self.base = server_host.rstrip("/")
         self.access_key = access_key.strip()
         self.gap = gap_ms / 1000
@@ -362,16 +365,16 @@ class XihulunjianClient:
         try:
             with _OPENER.open(request, timeout=self.timeout) as response:
                 status = response.status
-                raw = _read_bounded(response, MAX_RESPONSE_BYTES, "西湖论剑响应")
+                raw = _read_bounded(response, MAX_RESPONSE_BYTES, "DASCTF 响应")
         except urllib.error.HTTPError as error:
             status = error.code
             try:
-                raw = _read_bounded(error, MAX_RESPONSE_BYTES, "西湖论剑响应")
+                raw = _read_bounded(error, MAX_RESPONSE_BYTES, "DASCTF 响应")
             except Exception:
                 raw = b""
         except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError,
                 http.client.HTTPException, OSError) as error:
-            raise PlatformError(f"西湖论剑接口 {method} {endpoint} 传输失败: {error}", retryable=True) from error
+            raise PlatformError(f"DASCTF 接口 {method} {endpoint} 传输失败: {error}", retryable=True) from error
 
         body = raw.decode("utf-8", "replace")
         try:
@@ -383,15 +386,15 @@ class XihulunjianClient:
         message = (text(envelope.get("message")) if envelope else None) or "无描述"
         if status == 429 or code == RATE_LIMIT_CODE:
             raise PlatformError(
-                f"西湖论剑接口 {method} {endpoint} 触发限流 ({status}/{code or '-'}): {message}", retryable=True)
+                f"DASCTF 接口 {method} {endpoint} 触发限流 ({status}/{code or '-'}): {message}", retryable=True)
         if status >= 400:
             snippet = re.sub(r"[\0\r\n]+", " ", body)[:400]
             retryable = status in (408, 425) or status >= 500
-            raise PlatformError(f"西湖论剑接口 {method} {endpoint} 失败 ({status}): {snippet}", retryable=retryable)
+            raise PlatformError(f"DASCTF 接口 {method} {endpoint} 失败 ({status}): {snippet}", retryable=retryable)
         if not envelope:
-            raise PlatformError(f"西湖论剑接口 {method} {endpoint} 返回结构异常: {body[:200]}", retryable=False)
+            raise PlatformError(f"DASCTF 接口 {method} {endpoint} 返回结构异常: {body[:200]}", retryable=False)
         if code != SUCCESS_CODE:
-            raise PlatformError(f"西湖论剑接口 {method} {endpoint} 返回业务失败 (code={code or '缺失'}): {message}",
+            raise PlatformError(f"DASCTF 接口 {method} {endpoint} 返回业务失败 (code={code or '缺失'}): {message}",
                                 retryable=False)
         return envelope.get("data")
 
@@ -413,7 +416,7 @@ class XihulunjianClient:
     def exercise_list(self):
         data = self.call("GET", "/ctf/exercise-list")
         if not isinstance(data, list):
-            raise PlatformError("西湖论剑题目列表结构异常", retryable=False)
+            raise PlatformError("DASCTF 题目列表结构异常", retryable=False)
         open_items, closed = [], []
         for raw in data:
             group = obj(raw)
@@ -446,7 +449,7 @@ class XihulunjianClient:
     def exercise_detail(self, exercise_id):
         data = obj(self.call("GET", "/ctf/exercise", query={"exerciseId": exercise_id}))
         if not data:
-            raise PlatformError(f"西湖论剑题目 {exercise_id} 详情结构异常", retryable=False)
+            raise PlatformError(f"DASCTF 题目 {exercise_id} 详情结构异常", retryable=False)
         endpoint_type = text(data.get("endpointType"))
         endpoints_raw = data.get("endpoints")
         endpoint = select_endpoint(endpoints_raw)
@@ -536,7 +539,7 @@ def assert_owned(directory, challenge_id):
     except (OSError, ValueError):
         return True
     owner = obj(metadata.get("platform")) if metadata else None
-    if owner and (owner.get("adapter") != ADAPTER_ID or str(owner.get("challenge_id") or "") != challenge_id):
+    if owner and (owner.get("adapter") not in LEGACY_ADAPTER_IDS or str(owner.get("challenge_id") or "") != challenge_id):
         print(f"  ! 跳过 {directory}: 不属于 {ADAPTER_ID}/{challenge_id}")
         return False
     return True
@@ -544,7 +547,7 @@ def assert_owned(directory, challenge_id):
 
 def remove_stale_copies(challenges_base, challenge_id, current):
     """同题换了分类目录时,删除旧分类下的副本;否则 GUI 的 slug 去重会直接抛错。
-    只删除 platform.adapter=xihulunjian 且 challenge_id 相同的目录。"""
+    只删除 platform.adapter 属于 dasctf/xihulunjian 且 challenge_id 相同的目录。"""
     try:
         entries = sorted(os.listdir(challenges_base))
     except OSError:
@@ -571,31 +574,39 @@ def remove_stale_copies(challenges_base, challenge_id, current):
                     owner = obj(obj(json.load(handle)).get("platform"))
             except (OSError, ValueError):
                 continue
-            if owner and owner.get("adapter") == ADAPTER_ID and str(owner.get("challenge_id") or "") == challenge_id:
+            if owner and owner.get("adapter") in LEGACY_ADAPTER_IDS and str(owner.get("challenge_id") or "") == challenge_id:
                 import shutil
                 print(f"  - 移除旧分类副本: {candidate}")
                 shutil.rmtree(candidate, ignore_errors=True)
 
 
 def load_credentials():
-    access_key = os.environ.get("BOOM_XIHULUNJIAN_ACCESS_KEY", "").strip()
+    """凭证解析与 GUI 一致: 环境变量优先(旧名仍接受),
+    然后依次读 $BOOM_HOME/platforms/dasctf.json 与旧 $BOOM_HOME/xihulunjian.json。"""
+    for env_name in ("BOOM_DASCTF_ACCESS_KEY", "BOOM_XIHULUNJIAN_ACCESS_KEY"):
+        access_key = os.environ.get(env_name, "").strip()
+        if access_key:
+            return access_key, DEFAULT_SERVER_HOST, env_name
     home = os.environ.get("BOOM_HOME") or os.path.join(os.path.expanduser("~"), ".config", "boom")
-    path = os.path.join(home, "xihulunjian.json")
-    stored = {}
-    try:
-        with open(path, encoding="utf-8") as handle:
-            stored = obj(json.load(handle)) or {}
-    except (OSError, ValueError) as error:
-        if not access_key:
-            raise SystemExit(f"无法读取西湖论剑凭证 {path}: {error}")
-    access_key = access_key or (stored.get("accessKey") or "").strip()
-    server_host = (stored.get("serverHost") or "").strip() or DEFAULT_SERVER_HOST
-    return access_key, server_host
+    for file_name in (os.path.join("platforms", "dasctf.json"), "xihulunjian.json"):
+        path = os.path.join(home, file_name)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                stored = obj(json.load(handle)) or {}
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"无法读取 DASCTF 凭证 {path}: {error}")
+        access_key = (stored.get("accessKey") or "").strip()
+        if access_key:
+            server_host = (stored.get("serverHost") or "").strip() or DEFAULT_SERVER_HOST
+            return access_key, server_host, path
+    return "", "", ""
 
 
 def main():
-    parser = argparse.ArgumentParser(description="手动拉取西湖论剑最新题目(不影响正在运行的 GUI/解题)")
-    parser.add_argument("--root", default="xihulunjian-ctf", help="比赛根目录(默认 xihulunjian-ctf)")
+    parser = argparse.ArgumentParser(description="手动拉取 DASCTF 平台最新题目(不影响正在运行的 GUI/解题)")
+    parser.add_argument("--root", required=True, help="比赛根目录(例如 ./ctf-workspace)")
     parser.add_argument("--gap-ms", type=int, default=DEFAULT_GAP_MS,
                         help=f"相邻 API 请求最小间隔毫秒(默认 {DEFAULT_GAP_MS};与 GUI 抢限流时可调大)")
     parser.add_argument("--redownload", action="store_true", help="强制重新下载已存在的附件(默认跳过非空文件)")
@@ -603,18 +614,19 @@ def main():
                         help="单附件大小上限 MB(默认 128 与适配器一致;MISC-01 等超大附件需显式调大)")
     args = parser.parse_args()
 
-    access_key, server_host = load_credentials()
+    access_key, server_host, credential_source = load_credentials()
     root = os.path.abspath(args.root)
     challenges_base = os.path.join(root, "challenges")
 
-    print("== 西湖论剑手动拉题 ==")
+    print("== DASCTF 手动拉题 ==")
+    print(f"凭证   : {credential_source}")
     print(f"server : {server_host}")
     print(f"root   : {root}")
     print(f"间隔   : {args.gap_ms}ms,限流重试 {RATE_LIMIT_RETRIES} 次(指数退避)")
     print("只读拉题: 不会启动/回收靶机,不会提交 flag,不写 runs/ relay/ competition/")
     print()
 
-    client = XihulunjianClient(server_host, access_key, gap_ms=args.gap_ms)
+    client = DasctfClient(server_host, access_key, gap_ms=args.gap_ms)
     try:
         open_items, closed = client.exercise_list()
     except PlatformError as error:

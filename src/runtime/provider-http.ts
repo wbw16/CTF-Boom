@@ -145,25 +145,8 @@ export function anthropicProviderBaseURL(value: string) {
  */
 export const EXACT_ENDPOINT_MARKER = "!"
 
-/**
- * 西湖论剑为每个参赛者分配一个不可再拼接的网关根地址。识别这个稳定的 URL 形状，
- * 让界面可以直接接受赛方给出的地址；`!` 仍保留为其他固定端点的通用兼容标记。
- */
-function isXihulunjianGatewayRoot(value: string) {
-  try {
-    const url = new URL(value)
-    return url.protocol === "https:" &&
-      url.hostname === "llm-gateway.dasctf.com" &&
-      /^\/llm-gateway\/proxy\/e\/[^/]+\/?$/.test(url.pathname) &&
-      !url.search && !url.hash
-  } catch {
-    return false
-  }
-}
-
 export function isExactEndpoint(baseURL: string) {
-  const trimmed = baseURL.trimEnd()
-  return trimmed.endsWith(EXACT_ENDPOINT_MARKER) || isXihulunjianGatewayRoot(trimmed)
+  return baseURL.trimEnd().endsWith(EXACT_ENDPOINT_MARKER)
 }
 
 /** The URL to call, with the exact-endpoint marker removed. */

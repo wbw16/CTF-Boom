@@ -3,12 +3,12 @@ import { mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:f
 import os from "node:os"
 import path from "node:path"
 import {
+  DasctfPlatformAdapter,
   FlagRejectedError,
   inferChallengeCategory,
-  innerFlagValue,
   selectEndpoint,
-  XihulunjianPlatformAdapter,
-} from "../src/xihulunjian-platform-adapter.ts"
+} from "../src/platform/adapters/dasctf.ts"
+import { unwrapFlagValue } from "../src/platform/adapter.ts"
 
 const PREFIX = "/slab-match/api/v1/agent"
 const roots: string[] = []
@@ -79,7 +79,7 @@ test("accepts both attachment shapes and marks local-only challenges", async () 
       isNeedCheck: false,
     },
   }
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise`)
       return envelope(details[url.searchParams.get("exerciseId")!])
@@ -105,7 +105,7 @@ test("materializes challenges without starting environments and never leaks the 
   const calls: string[] = []
   let cdnAuthHeader: string | null = "unset"
 
-  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input, init) => {
+  const adapter = new DasctfPlatformAdapter("ak_secret", (async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init)
     const url = new URL(request.url)
     calls.push(`${request.method} ${url.pathname}`)
@@ -149,7 +149,7 @@ test("materializes challenges without starting environments and never leaks the 
   expect(meta).toMatchObject({
     category: "PWN",
     service_required: true,
-    platform: { adapter: "xihulunjian", challenge_id: "10662", options: { exercise_id: "10662", score: 50 } },
+    platform: { adapter: "dasctf", challenge_id: "10662", options: { exercise_id: "10662", score: 50 } },
   })
   expect(await readFile(path.join(root, "challenges", "PWN", "shopping", "files", "a.zip")))
     .toEqual(Buffer.from([1, 2, 3]))
@@ -158,7 +158,7 @@ test("materializes challenges without starting environments and never leaks the 
 test("skips one malformed released challenge without blocking the rest of its release batch", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-"))
   roots.push(root)
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise-list`) {
       return envelope([{
@@ -197,7 +197,7 @@ test("skips one malformed released challenge without blocking the rest of its re
 test("builds, polls, and reports a ready environment", async () => {
   const calls: string[] = []
   let polls = 0
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input, init) => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init)
     const url = new URL(request.url)
     calls.push(`${request.method} ${url.pathname}`)
@@ -237,7 +237,7 @@ test("builds, polls, and reports a ready environment", async () => {
 
 test("submits only the value inside the flag wrapper", async () => {
   const bodies: unknown[] = []
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input, init) => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async (input, init) => {
     const request = input instanceof Request ? input : new Request(String(input), init)
     bodies.push(await request.json())
     return envelope({ isCorrect: true })
@@ -249,20 +249,20 @@ test("submits only the value inside the flag wrapper", async () => {
     description: "",
     files: [],
     flagFormat: "",
-    platform: { adapter: "xihulunjian", challengeID: "10662" },
+    platform: { adapter: "dasctf", challengeID: "10662" },
   }
   const result = await adapter.submitFlag({
     challenge,
     workspace: { directory: "/tmp/run", runID: "r1", extracted: [] },
     candidate: "DASCTF{p0p_cha1n}",
   })
-  expect(result).toMatchObject({ adapter: "xihulunjian", verdict: "accepted" })
+  expect(result).toMatchObject({ adapter: "dasctf", verdict: "accepted" })
   // The rules require submitting only the contents of the braces.
   expect(bodies[0]).toEqual({ exerciseId: 10662, flag: "p0p_cha1n" })
 })
 
 test("maps an explicit incorrect verdict to rejected", async () => {
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () =>
+  const adapter = new DasctfPlatformAdapter("ak_test", (async () =>
     envelope({ isCorrect: false })) as unknown as typeof fetch, instant)
   const result = await adapter.submitFlag({
     challenge: {
@@ -271,7 +271,7 @@ test("maps an explicit incorrect verdict to rejected", async () => {
       description: "",
       files: [],
       flagFormat: "",
-      platform: { adapter: "xihulunjian", challengeID: "10662" },
+      platform: { adapter: "dasctf", challengeID: "10662" },
     },
     workspace: { directory: "/tmp/run", runID: "r1", extracted: [] },
     candidate: "flag{wrong}",
@@ -281,7 +281,7 @@ test("maps an explicit incorrect verdict to rejected", async () => {
 
 test("does not retry an incorrect flag reported with the overloaded 40001 code", async () => {
   let calls = 0
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async () => {
     calls += 1
     // The live answer endpoint sends this HTTP 200 business failure with code 40001, which is
     // also used as the general rate-limit code on other endpoints.
@@ -295,7 +295,7 @@ test("does not retry an incorrect flag reported with the overloaded 40001 code",
       description: "",
       files: [],
       flagFormat: "",
-      platform: { adapter: "xihulunjian", challengeID: "10663" },
+      platform: { adapter: "dasctf", challengeID: "10663" },
     },
     workspace: { directory: "/tmp/run", runID: "r1", extracted: [] },
     candidate: "DASCTF{ni_cai?}",
@@ -306,7 +306,7 @@ test("does not retry an incorrect flag reported with the overloaded 40001 code",
 })
 
 test("never assumes success when the verdict field is missing", async () => {
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () =>
+  const adapter = new DasctfPlatformAdapter("ak_test", (async () =>
     envelope({ unexpected: true })) as unknown as typeof fetch, instant)
   const result = await adapter.submitFlag({
     challenge: {
@@ -315,7 +315,7 @@ test("never assumes success when the verdict field is missing", async () => {
       description: "",
       files: [],
       flagFormat: "",
-      platform: { adapter: "xihulunjian", challengeID: "10662" },
+      platform: { adapter: "dasctf", challengeID: "10662" },
     },
     workspace: { directory: "/tmp/run", runID: "r1", extracted: [] },
     candidate: "flag{unknown}",
@@ -324,17 +324,17 @@ test("never assumes success when the verdict field is missing", async () => {
 })
 
 test("strips flag wrappers deterministically", () => {
-  expect(innerFlagValue("DASCTF{abc}")).toBe("abc")
-  expect(innerFlagValue("flag{a b}")).toBe("a b")
-  expect(innerFlagValue("  bare_value  ")).toBe("bare_value")
+  expect(unwrapFlagValue("DASCTF{abc}")).toBe("abc")
+  expect(unwrapFlagValue("flag{a b}")).toBe("a b")
+  expect(unwrapFlagValue("  bare_value  ")).toBe("bare_value")
   // A nested closing brace must not truncate the payload.
-  expect(innerFlagValue("DASCTF{a{b}c}")).toBe("a{b}c")
-  expect(innerFlagValue("DASCTF{}")).toBe("")
+  expect(unwrapFlagValue("DASCTF{a{b}c}")).toBe("a{b}c")
+  expect(unwrapFlagValue("DASCTF{}")).toBe("")
 })
 
 test("reads announcement summaries and their full content", async () => {
   const calls: string[] = []
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     calls.push(`${url.pathname}${url.search}`)
     if (url.pathname === `${PREFIX}/match/notice/now-list`) return envelope([{
@@ -380,7 +380,7 @@ test("reads announcement summaries and their full content", async () => {
 
 test("uses the configured platform root for read-only dashboard calls", async () => {
   let requested = ""
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async (input) => {
     requested = input instanceof Request ? input.url : String(input)
     return envelope({ stagePoint: 200, stageRank: 3 })
   }) as typeof fetch, instant, "https://contest.example.test/agent/")
@@ -457,7 +457,7 @@ test("re-syncs unchanged challenges without detail calls or re-downloads", async
   let detailCalls = 0
   let downloads = 0
   let solved = false
-  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_secret", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST(solved))
     if (url.pathname === `${PREFIX}/ctf/exercise`) {
@@ -500,7 +500,7 @@ test("re-downloads when a recorded attachment has gone missing", async () => {
   roots.push(root)
   let detailCalls = 0
   let downloads = 0
-  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_secret", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
     if (url.pathname === `${PREFIX}/ctf/exercise`) {
@@ -530,7 +530,7 @@ test("migrates a legacy local copy once, then re-classifies and de-duplicates it
   const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-legacy-"))
   roots.push(root)
   let detailCalls = 0
-  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_secret", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
     if (url.pathname === `${PREFIX}/ctf/exercise`) {
@@ -547,7 +547,7 @@ test("migrates a legacy local copy once, then re-classifies and de-duplicates it
   await writeFile(path.join(legacy, "README.md"), "# REAL-01\n")
   await writeFile(path.join(legacy, "meta.json"), `${JSON.stringify({
     category: "OTHER",
-    platform: { adapter: "xihulunjian", challenge_id: "10701", options: { exercise_id: "10701" } },
+    platform: { adapter: "dasctf", challenge_id: "10701", options: { exercise_id: "10701" } },
   }, undefined, 2)}\n`)
 
   const migrated = await adapter.acquireChallenges({ root })
@@ -567,7 +567,7 @@ test("moves a misfiled complete copy to the attachment-derived category without 
   const root = await mkdtemp(path.join(os.tmpdir(), "boom-xihu-move-"))
   roots.push(root)
   let detailCalls = 0
-  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_secret", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
     detailCalls += 1
@@ -582,7 +582,7 @@ test("moves a misfiled complete copy to the attachment-derived category without 
   await writeFile(path.join(legacy, "meta.json"), `${JSON.stringify({
     category: "OTHER",
     platform: {
-      adapter: "xihulunjian",
+      adapter: "dasctf",
       challenge_id: "10701",
       options: { exercise_id: "10701", attachments: ["joomla-6.1.2-full-package.tar.gz.zip"] },
     },
@@ -605,7 +605,7 @@ test("revalidate forces a full re-pull of an unchanged challenge", async () => {
   roots.push(root)
   let detailCalls = 0
   let downloads = 0
-  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_secret", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
     if (url.pathname === `${PREFIX}/ctf/exercise`) {
@@ -637,7 +637,7 @@ function submissionChallenge(challengeID: string) {
     description: "",
     files: [],
     flagFormat: "",
-    platform: { adapter: "xihulunjian", challengeID },
+    platform: { adapter: "dasctf", challengeID },
   }
 }
 
@@ -645,7 +645,7 @@ const SUBMISSION_WORKSPACE = { directory: "/tmp/run", runID: "r1", extracted: []
 
 test("throws on an exhausted 5xx whose body merely contains 错误 instead of a verdict (H3)", async () => {
   let calls = 0
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async () => {
     calls += 1
     // A gateway failure whose body text would have matched the old message regex and permanently
     // gated this flag as "rejected" downstream.
@@ -664,7 +664,7 @@ test("throws on an exhausted 5xx whose body merely contains 错误 instead of a 
 test("reports the structurally confirmed wrong answer as rejected with its own detail (H3)", async () => {
   let calls = 0
   const detail = "提交flag错误，请重新提交（当前还有9次提交机会）"
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async () => {
     calls += 1
     return envelope(null, "40001", detail)
   }) as unknown as typeof fetch, instant)
@@ -674,7 +674,7 @@ test("reports the structurally confirmed wrong answer as rejected with its own d
     workspace: SUBMISSION_WORKSPACE,
     candidate: "DASCTF{nope}",
   })
-  expect(result).toMatchObject({ adapter: "xihulunjian", verdict: "rejected", detail })
+  expect(result).toMatchObject({ adapter: "dasctf", verdict: "rejected", detail })
   // A definitive verdict is final: no rate-limit retries may burn quota behind it.
   expect(calls).toBe(1)
 })
@@ -688,7 +688,7 @@ test("classifies FlagRejectedError by construction and never from message text (
 
 test("propagates a timeout as an error instead of a verdict (H3)", async () => {
   let calls = 0
-  const adapter = new XihulunjianPlatformAdapter("ak_test", (async () => {
+  const adapter = new DasctfPlatformAdapter("ak_test", (async () => {
     calls += 1
     // What AbortSignal.timeout produces when REQUEST_TIMEOUT_MS elapses.
     throw new DOMException("The signal timed out.", "TimeoutError")
@@ -709,7 +709,7 @@ test("skips broken groups and entries without aborting the catalog sync (M23-a)"
   const warnings: string[] = []
   console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")) }
   try {
-    const adapter = new XihulunjianPlatformAdapter("ak_test", (async (input) => {
+    const adapter = new DasctfPlatformAdapter("ak_test", (async (input) => {
       const url = new URL(input instanceof Request ? input.url : String(input))
       if (url.pathname === `${PREFIX}/ctf/exercise-list`) {
         return envelope([
@@ -759,12 +759,12 @@ test("promotes the verified-complete copy to canonical before deleting anything 
   const meta = (category: string) => `${JSON.stringify({
     category,
     platform: {
-      adapter: "xihulunjian",
+      adapter: "dasctf",
       challenge_id: "10701",
       options: { exercise_id: "10701", attachments: [attachment] },
     },
   }, undefined, 2)}\n`
-  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_secret", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
     if (url.pathname === `${PREFIX}/ctf/exercise`) {
@@ -811,7 +811,7 @@ test("deletes nothing when no local copy verifies complete (M23-b)", async () =>
   roots.push(root)
   let detailCalls = 0
   const attachment = "joomla-6.1.2-full-package.tar.gz.zip"
-  const adapter = new XihulunjianPlatformAdapter("ak_secret", (async (input) => {
+  const adapter = new DasctfPlatformAdapter("ak_secret", (async (input) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname === `${PREFIX}/ctf/exercise-list`) return envelope(REAL_LIST())
     if (url.pathname === `${PREFIX}/ctf/exercise`) {
@@ -829,7 +829,7 @@ test("deletes nothing when no local copy verifies complete (M23-b)", async () =>
   await writeFile(path.join(broken, "meta.json"), `${JSON.stringify({
     category: "WEB",
     platform: {
-      adapter: "xihulunjian",
+      adapter: "dasctf",
       challenge_id: "10701",
       options: { exercise_id: "10701", attachments: [attachment] },
     },
@@ -838,7 +838,7 @@ test("deletes nothing when no local copy verifies complete (M23-b)", async () =>
   await mkdir(legacy, { recursive: true })
   await writeFile(path.join(legacy, "meta.json"), `${JSON.stringify({
     category: "OTHER",
-    platform: { adapter: "xihulunjian", challenge_id: "10701", options: { exercise_id: "10701" } },
+    platform: { adapter: "dasctf", challenge_id: "10701", options: { exercise_id: "10701" } },
   }, undefined, 2)}\n`)
 
   const challenges = await adapter.acquireChallenges({ root })

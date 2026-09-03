@@ -13,20 +13,18 @@ import {
 import { useApp } from "../context"
 import { api, patchJSON, postJSON, putJSON } from "../api"
 import { Modal } from "../ui"
-import type { CompetitionState, GuiSettings } from "../types"
-
-type XihulunjianStatus = {
-  credential: { configured: boolean; serverHost: string }
-}
+import type { CompetitionState, GuiSettings, PlatformRegistry, PlatformSummary } from "../types"
 
 /**
- * The only competition screen in this build. Its API intentionally has no adapter IDs, manifests,
- * or OpenAPI parameters: all actions target the dedicated 西湖论剑 Agent API.
+ * The competition console. Platform identity (display name, default host, credential state) comes
+ * from the adapter registry via `GET /api/platform`; every action targets the selected platform's
+ * `/api/platform/:id/*` routes, so this screen stays identical for every built-in adapter.
  */
 export function CompetitionDialog() {
   const { data, toast, refresh, closeDialog, openDialog } = useApp()
   const [competition, setCompetition] = useState<CompetitionState | null>(null)
-  const [connection, setConnection] = useState<XihulunjianStatus | null>(null)
+  const [platforms, setPlatforms] = useState<PlatformSummary[]>([])
+  const [platform, setPlatform] = useState<PlatformSummary | null>(null)
   const [accessKey, setAccessKey] = useState("")
   const [serverHost, setServerHost] = useState("")
   const [refreshIntervalMinutes, setRefreshIntervalMinutes] = useState(10)
@@ -35,12 +33,13 @@ export function CompetitionDialog() {
 
   const load = useCallback(async () => {
     try {
-      const [nextConnection, nextCompetition] = await Promise.all([
-        api<XihulunjianStatus>("/api/xihulunjian"),
+      const [registry, nextCompetition] = await Promise.all([
+        api<PlatformRegistry>("/api/platform"),
         api<CompetitionState>("/api/competition"),
       ])
-      setConnection(nextConnection)
-      setServerHost(nextConnection.credential.serverHost)
+      setPlatforms(registry.platforms)
+      setPlatform(registry.active)
+      setServerHost(registry.active.credential.serverHost)
       if (!nextCompetition.unavailable) {
         setCompetition(nextCompetition)
         setRefreshIntervalMinutes(nextCompetition.settings.refreshIntervalMinutes ?? 10)
@@ -64,10 +63,31 @@ export function CompetitionDialog() {
     return () => window.clearInterval(timer)
   }, [])
 
-  const saveAccessKey = async () => {
+  const selectPlatform = async (id: string) => {
+    if (!data || !platforms.some((item) => item.id === id)) return
     setBusy(true)
     try {
-      await putJSON("/api/xihulunjian/credential", { value: accessKey })
+      await patchJSON<{ settings: GuiSettings }>("/api/settings", {
+        ...data.settings,
+        competition: { ...data.settings.competition, platformId: id },
+      })
+      const next = platforms.find((item) => item.id === id)!
+      setPlatform(next)
+      setServerHost(next.credential.serverHost)
+      await refresh()
+      await load()
+    } catch (error) {
+      toast((error as Error).message, "error")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const saveAccessKey = async () => {
+    if (!platform) return
+    setBusy(true)
+    try {
+      await putJSON(`/api/platform/${platform.id}/credential`, { value: accessKey })
       setAccessKey("")
       toast(accessKey.trim() ? "AccessKey 已安全保存" : "AccessKey 已清除")
       await load()
@@ -79,11 +99,12 @@ export function CompetitionDialog() {
   }
 
   const saveServerHost = async () => {
+    if (!platform) return
     setBusy(true)
     try {
-      const saved = await putJSON<{ serverHost: string }>("/api/xihulunjian/server-host", { value: serverHost })
+      const saved = await putJSON<{ serverHost: string }>(`/api/platform/${platform.id}/server-host`, { value: serverHost })
       setServerHost(saved.serverHost)
-      toast("西湖论剑 Server Host 已保存")
+      toast(`${platform.displayName} Server Host 已保存`)
       await load()
     } catch (error) {
       toast((error as Error).message, "error")
@@ -93,9 +114,10 @@ export function CompetitionDialog() {
   }
 
   const sync = async () => {
+    if (!platform) return
     setBusy(true)
     try {
-      const result = await postJSON<{ challenges: string[] }>("/api/xihulunjian/sync", {})
+      const result = await postJSON<{ challenges: string[] }>(`/api/platform/${platform.id}/sync`, {})
       toast(`已同步 ${result.challenges.length} 道已开放赛题`)
       await refresh()
     } catch (error) {
@@ -153,13 +175,13 @@ export function CompetitionDialog() {
   }
 
   const activeEnvironments = competition?.environments.used ?? 0
-  const remotelyConfigured = connection?.credential.configured ?? false
+  const remotelyConfigured = platform?.credential.configured ?? false
   const autopilot = competition?.autopilot
 
   return (
     <Modal
-      title="西湖论剑控制台"
-      subtitle="专用接入 · 自动拉题 · 赛方大模型网关"
+      title="比赛平台控制台"
+      subtitle="平台接入 · 自动拉题 · 比赛 LLM 网关"
       icon={<Timer size={17} />}
       onClose={closeDialog}
       wide
@@ -184,8 +206,23 @@ export function CompetitionDialog() {
         <section className="competition-card competition-connection">
           <div className="competition-card-head">
             <span className="competition-card-icon"><Server size={16} /></span>
-            <div><h3>平台接入</h3><p>配置西湖论剑 Agent API 地址与 AccessKey</p></div>
+            <div><h3>平台接入</h3><p>配置{platform ? ` ${platform.displayName}` : ""}平台 API 地址与 AccessKey</p></div>
           </div>
+          {platforms.length > 1 ? (
+            <label className="competition-field">
+              <span>比赛平台</span>
+              <select
+                className="input"
+                value={platform?.id ?? ""}
+                disabled={busy}
+                onChange={(event) => void selectPlatform(event.target.value)}
+              >
+                {platforms.map((item) => (
+                  <option key={item.id} value={item.id}>{item.displayName}</option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           <label className="competition-field">
             <span>Server Host</span>
             <input
@@ -193,7 +230,7 @@ export function CompetitionDialog() {
               type="url"
               value={serverHost}
               onChange={(event) => setServerHost(event.target.value)}
-              placeholder="https://pro.dasctf.com"
+              placeholder={platform?.defaultServerHost ?? "https://"}
               autoComplete="url"
               spellCheck={false}
             />
@@ -212,8 +249,8 @@ export function CompetitionDialog() {
           </label>
           <p className="competition-note"><ShieldCheck size={14} /> 仅以 0600 权限保存在本机，不进入题目目录或运行工作区。</p>
           <div className="competition-actions">
-            <button type="button" className="btn" disabled={busy} onClick={() => void saveServerHost()}><Server size={15} />保存地址</button>
-            <button type="button" className="btn" disabled={busy} onClick={() => void saveAccessKey()}><KeyRound size={15} />保存凭证</button>
+            <button type="button" className="btn" disabled={busy || !platform} onClick={() => void saveServerHost()}><Server size={15} />保存地址</button>
+            <button type="button" className="btn" disabled={busy || !platform} onClick={() => void saveAccessKey()}><KeyRound size={15} />保存凭证</button>
             <button type="button" className="btn btn-primary" disabled={busy || !remotelyConfigured} onClick={() => void sync()}><CloudDownload size={15} />同步已开放题目</button>
           </div>
           <p className="competition-footnote">赛题会分批放出；每次放题后可再次同步，已有题目不会被覆盖。</p>
@@ -234,7 +271,7 @@ export function CompetitionDialog() {
               <input className="input" type="number" min={1} max={3} value={remoteSlots} onChange={(event) => setRemoteSlots(Number(event.target.value) || 1)} />
             </label>
           </div>
-          <div className="competition-rule"><CircleAlert size={14} />线上容器最多 3 个；可按机器承载能力选择 1–3 个。</div>
+          <div className="competition-rule"><CircleAlert size={14} />多数平台最多允许 3 个线上容器；可按平台限制与机器承载能力选择 1–3 个。</div>
           <div className="competition-actions">
             <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void saveCapacity()}>保存自动化设置</button>
             <button
@@ -250,13 +287,13 @@ export function CompetitionDialog() {
         <section className="competition-card competition-gateway">
           <div className="competition-card-head">
             <span className="competition-card-icon"><Cpu size={16} /></span>
-            <div><h3>赛方大模型网关</h3><p>通过已有 Provider 转发全部 LLM 流量</p></div>
+            <div><h3>比赛大模型网关</h3><p>通过已有 Provider 转发全部 LLM 流量</p></div>
             <span className="competition-status">手动确认</span>
           </div>
-          <div className="competition-rule"><CircleAlert size={14} />赛方地址本身就是完整接口；不要附加 <code>/v1</code> 或 <code>/chat/completions</code>。</div>
+          <div className="competition-rule"><CircleAlert size={14} />赛方网关地址本身就是完整接口；不要附加 <code>/v1</code> 或 <code>/chat/completions</code>，并在地址末尾加 <code>!</code> 标记固定端点。</div>
           <ol className="competition-steps">
             <li>打开 <b>Provider 与模型</b>，编辑你正在使用的 Provider（无需新建比赛专用 Provider）。</li>
-            <li>将 Base URL 直接改为赛方网关地址；不要添加 <code>/v1</code>，Boom 会自动适配完整端点。</li>
+            <li>将 Base URL 改为赛方网关地址，末尾加 <code>!</code>；Boom 不会再为它拼接任何路径。</li>
             <li>保留该 Provider 的 API Key 与所需 Model ID，再将 Economy、Strong（以及启用时的 Vision）选择为对应模型。</li>
           </ol>
           <div className="competition-actions">

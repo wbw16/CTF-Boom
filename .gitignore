@@ -23,6 +23,8 @@ benchmarks/
 docs/
 
 # start-gui.sh 的默认本地比赛工作区；其中会包含下载附件、运行记录与提交台账。
+/ctf-workspace/
+# 西湖论剑比赛时期的本地工作区（历史遗留目录）。
 /xihulunjian-ctf/
 
 # 本地数据备份与一次性解题中间产物。

@@ -21,8 +21,8 @@ import {
   rejectedValues,
   saveSubmissionLedger,
 } from "../src/competition/submissions.ts"
-import { clearCompetitionAdapterCache, loadCompetitionAdapter } from "../src/competition/adapter.ts"
-import { XihulunjianPlatformAdapter } from "../src/xihulunjian-platform-adapter.ts"
+import { clearCompetitionAdapterCache, loadCompetitionAdapter } from "../src/platform/registry.ts"
+import { DasctfPlatformAdapter } from "../src/platform/adapters/dasctf.ts"
 
 const roots: string[] = []
 
@@ -302,26 +302,26 @@ test("stops submitting once a flag was accepted", async () => {
 
 test("concurrent first adapter loads share one construction instead of a fake undefined", async () => {
   const previousHome = process.env.BOOM_HOME
-  const previousKey = process.env.BOOM_XIHULUNJIAN_ACCESS_KEY
+  const previousKey = process.env.BOOM_DASCTF_ACCESS_KEY
   const home = await mkdtemp(path.join(os.tmpdir(), "boom-adapter-cache-"))
   roots.push(home)
   process.env.BOOM_HOME = home
-  process.env.BOOM_XIHULUNJIAN_ACCESS_KEY = "adapter-cache-fixture"
+  process.env.BOOM_DASCTF_ACCESS_KEY = "adapter-cache-fixture"
   try {
     clearCompetitionAdapterCache()
     // Both calls start in the same tick, i.e. inside the await window of the first load.
     const [first, second] = await Promise.all([loadCompetitionAdapter(), loadCompetitionAdapter()])
 
     // One shared promise means the factory ran exactly once and both awaiters observe it.
-    expect(first).toBeInstanceOf(XihulunjianPlatformAdapter)
+    expect(first).toBeInstanceOf(DasctfPlatformAdapter)
     expect(second).toBe(first)
 
     clearCompetitionAdapterCache()
     const recreated = await loadCompetitionAdapter()
     expect(recreated).not.toBe(first)
   } finally {
-    if (previousKey === undefined) delete process.env.BOOM_XIHULUNJIAN_ACCESS_KEY
-    else process.env.BOOM_XIHULUNJIAN_ACCESS_KEY = previousKey
+    if (previousKey === undefined) delete process.env.BOOM_DASCTF_ACCESS_KEY
+    else process.env.BOOM_DASCTF_ACCESS_KEY = previousKey
     if (previousHome === undefined) delete process.env.BOOM_HOME
     else process.env.BOOM_HOME = previousHome
     clearCompetitionAdapterCache()

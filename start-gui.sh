@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Start Boom's GUI with a ready-to-use local 西湖论剑 workspace.
+# Start Boom's GUI with a ready-to-use local competition workspace.
 set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-root="${BOOM_ROOT:-${project_dir}/xihulunjian-ctf}"
+root="${BOOM_ROOT:-${project_dir}/ctf-workspace}"
 
 # Boom initializes the workspace itself on startup (runs/, plus challenges/ unless
 # category folders such as WEB/PWN/MISC already sit directly inside the root).

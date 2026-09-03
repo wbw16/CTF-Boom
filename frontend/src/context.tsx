@@ -1,5 +1,5 @@
 import { createContext, useContext, type ReactNode } from "react"
-import type { GuiState, RunHistory, XihulunjianNotice } from "./types"
+import type { GuiState, PlatformNotice, PlatformSummary, RunHistory } from "./types"
 import type { ToastItem } from "./ui"
 
 export type DialogName =
@@ -31,7 +31,9 @@ export type AppContextValue = {
   menu: MenuState
   deleteTarget: string | null
   now: number
-  notices: XihulunjianNotice[]
+  notices: PlatformNotice[]
+  /** Active competition platform summary; null until the registry is fetched. */
+  platform: PlatformSummary | null
   unreadNoticeCount: number
   select: (slug: string) => void
   setFilter: (value: string) => void

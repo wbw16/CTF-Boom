@@ -37,11 +37,13 @@ test("uses a marked Base URL verbatim instead of appending a path", () => {
   expect(providerEndpoint(`${GATEWAY}!`, "chat/completions")).toBe(GATEWAY)
 })
 
-test("recognizes the 西湖论剑 gateway root as a complete endpoint without a marker", () => {
+test("never guesses a gateway root without the explicit marker", () => {
+  // Fixed-endpoint detection is domain-agnostic by design: only the trailing `!` opts a URL out
+  // of path joining, so no platform's hostname can be baked into the runtime layer.
   const gateway = "https://llm-gateway.dasctf.com/llm-gateway/proxy/e/token123"
-  expect(isExactEndpoint(gateway)).toBe(true)
-  expect(exactEndpointURL(gateway)).toBe(gateway)
-  expect(providerEndpoint(gateway, "chat/completions")).toBe(gateway)
+  expect(isExactEndpoint(gateway)).toBe(false)
+  expect(exactEndpointURL(`${gateway}!`)).toBe(gateway)
+  expect(providerEndpoint(`${gateway}!`, "chat/completions")).toBe(gateway)
 })
 
 test("accepts a marked Base URL in provider configuration", () => {

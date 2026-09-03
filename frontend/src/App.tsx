@@ -12,7 +12,7 @@ import {
   resolveRunDetail,
   type RunDetailSnapshot,
 } from "./state"
-import type { ChallengeGui, GuiState, RunnerNotification, RunHistory, XihulunjianNotice } from "./types"
+import type { ChallengeGui, GuiState, PlatformNotice, PlatformRegistry, PlatformSummary, RunnerNotification, RunHistory } from "./types"
 import { ToastStack, type ToastItem } from "./ui"
 import { TopBar } from "./TopBar"
 import { Queue } from "./Queue"
@@ -27,11 +27,15 @@ import { DeleteDialog } from "./delete/DeleteDialog"
 
 const REQUEST_TIMEOUT_MS = 10_000
 const EVENT_REPLAY_LIMIT = 2_000
-const READ_NOTICE_STORAGE_KEY = "boom-xihulunjian-read-notice-ids-v1"
+const READ_NOTICE_STORAGE_KEY = "boom-platform-read-notice-ids-v1"
+const LEGACY_READ_NOTICE_STORAGE_KEY = "boom-xihulunjian-read-notice-ids-v1"
 const MAX_REMEMBERED_NOTICE_IDS = 1_000
 
 function loadReadNoticeIDs() {
   try {
+    // Migrate the competition-era key on first read so previously read notices stay read.
+    if (localStorage.getItem(READ_NOTICE_STORAGE_KEY) === null && localStorage.getItem(LEGACY_READ_NOTICE_STORAGE_KEY) !== null)
+      localStorage.setItem(READ_NOTICE_STORAGE_KEY, localStorage.getItem(LEGACY_READ_NOTICE_STORAGE_KEY)!)
     const stored = JSON.parse(localStorage.getItem(READ_NOTICE_STORAGE_KEY) ?? "[]")
     if (!Array.isArray(stored)) return []
     return [...new Set(stored.filter((id): id is number => Number.isSafeInteger(id) && id > 0))]
@@ -70,7 +74,8 @@ export default function App() {
   const [menu, setMenu] = useState<MenuState>(null)
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [now, setNow] = useState(Date.now())
-  const [notices, setNotices] = useState<XihulunjianNotice[]>([])
+  const [notices, setNotices] = useState<PlatformNotice[]>([])
+  const [platform, setPlatform] = useState<PlatformSummary | null>(null)
   const [readNoticeIDs, setReadNoticeIDs] = useState<number[]>(loadReadNoticeIDs)
   const toastID = useRef(0)
   const dataRef = useRef<GuiState | null>(null)
@@ -301,7 +306,11 @@ export default function App() {
 
   const refreshNotices = useCallback(async () => {
     try {
-      const result = await api<{ notices: XihulunjianNotice[] }>("/api/xihulunjian/notices", {
+      const registry = await api<PlatformRegistry>("/api/platform", {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      })
+      setPlatform(registry.active)
+      const result = await api<{ notices: PlatformNotice[] }>(`/api/platform/${registry.active.id}/notices`, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
       setNotices(result.notices)
@@ -548,6 +557,7 @@ export default function App() {
     deleteTarget,
     now,
     notices,
+    platform,
     unreadNoticeCount,
     select,
     setFilter,

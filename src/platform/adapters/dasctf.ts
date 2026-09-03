@@ -6,25 +6,33 @@ import {
   resolveChallengeCatalog,
   type Challenge,
   type ChallengeCategory,
-} from "./challenge.ts"
-import type { Workspace } from "./workspace.ts"
-import { XIHULUNJIAN_DEFAULT_SERVER_HOST } from "./xihulunjian-config.ts"
+} from "../../challenge.ts"
+import {
+  unwrapFlagValue,
+  type PlatformAdapter,
+  type PlatformEndpoint,
+  type PlatformNotice,
+  type PlatformNoticeDetail,
+  type PlatformOverview,
+  type PlatformSubmissionInput,
+  type PlatformSubmissionResult,
+} from "../adapter.ts"
 
 /**
- * 西湖论剑 "AI Agent API" adapter.
+ * DASCTF "AI Agent API" adapter — the platform behind 西湖论剑-style agent CTF matches.
  *
- * This profile is hand-written rather than declarative because the API does not fit the
- * declarative manifest mappers in three ways, all verified against the live service:
+ * This client is hand-written rather than declarative because the API does not fit declarative
+ * manifest mappers in three ways, all verified against the live service:
  *
  * 1. Every response is wrapped in `{code, message, data}` where only `code === "00000"` means
- *    success. HTTP 200 alone is not success, so the declarative engine's status-only check would
- *    silently treat business failures as empty data.
- * 2. The challenge list is two levels deep (category -> `corpus[]`); the declarative item mapper
+ *    success. HTTP 200 alone is not success, so a status-only check would silently treat business
+ *    failures as empty data.
+ * 2. The challenge list is two levels deep (category -> `corpus[]`); a declarative item mapper
  *    selects a single array.
  * 3. `attachment` is a single object when present but an empty array when absent, so one field has
  *    two different JSON types.
  *
- * See docs/XIHULUNJIAN.md for the recorded deviations from docs/api_doc.md.
+ * See docs/platforms/dasctf.md for the recorded deviations from the platform's api_doc.md.
  */
 
 type JsonObject = Record<string, unknown>
@@ -34,44 +42,22 @@ const SUCCESS_CODE = "00000"
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 const MAX_ATTACHMENT_BYTES = 128 * 1024 * 1024
 
-/** A fixed identity makes mixed-platform challenge roots impossible in this competition build. */
-export const XIHULUNJIAN_ADAPTER_ID = "xihulunjian"
+export const DASCTF_ADAPTER_ID = "dasctf"
+/**
+ * The adapter was originally shipped as the fixed "xihulunjian" competition build. Challenge
+ * meta.json files from that era still carry the old id, so it remains an accepted alias for
+ * ownership checks and registry lookups.
+ */
+export const DASCTF_LEGACY_ADAPTER_ID = "xihulunjian"
 
-export type XihulunjianSubmissionResult = {
-  adapter: typeof XIHULUNJIAN_ADAPTER_ID
-  verdict: "accepted" | "rejected" | "pending"
-  detail: string
-  submittedAt: string
-}
-
-export type XihulunjianSubmissionInput = {
-  challenge: Challenge
-  workspace: Workspace
-  candidate: string
-  signal?: AbortSignal
-}
-
-export type XihulunjianNotice = {
-  id: number
-  title: string
-  content?: string
-  createdAt?: string
-  createdTime?: number
-  userName?: string
-}
-
-export type XihulunjianNoticeDetail = XihulunjianNotice & {
-  isFile: boolean
-  files: Array<{ name: string; url: string; ext?: string }>
-  url?: string
-}
+export const DASCTF_DEFAULT_SERVER_HOST = "https://pro.dasctf.com"
 
 /**
  * Boom's own guard, deliberately far below the platform's hard limit of 50 attempts per challenge.
  * The rules forbid flag brute-forcing outright, so the useful ceiling is "a few genuine candidates",
  * not "as many as the platform tolerates".
  */
-export const MAX_SUBMISSIONS_PER_CHALLENGE = 15
+export const DASCTF_MAX_SUBMISSIONS_PER_CHALLENGE = 15
 
 /** How long to wait for an asynchronously provisioned environment before giving up on this attempt. */
 const ENVIRONMENT_POLL_TIMEOUT_MS = 3 * 60_000
@@ -129,7 +115,7 @@ function noticeFiles(value: unknown) {
   })
 }
 
-function notice(value: unknown): XihulunjianNotice | undefined {
+function notice(value: unknown): PlatformNotice | undefined {
   const data = object(value)
   const id = noticeID(data?.id)
   if (!id) return undefined
@@ -145,10 +131,10 @@ function notice(value: unknown): XihulunjianNotice | undefined {
 
 function identifier(value: unknown, label: string) {
   if ((typeof value !== "string" && typeof value !== "number") || !String(value).trim())
-    throw new Error(`西湖论剑接口返回的${label}为空`)
+    throw new Error(`DASCTF 接口返回的${label}为空`)
   const found = String(value).trim()
   if (found.length > 256 || /[\0/:]/.test(found))
-    throw new Error(`西湖论剑接口返回的${label}非法: ${found}`)
+    throw new Error(`DASCTF 接口返回的${label}非法: ${found}`)
   return found
 }
 
@@ -164,7 +150,7 @@ function safeErrorBody(value: string) {
 function numericExerciseId(exerciseId: string) {
   const parsed = Number(exerciseId)
   if (!exerciseId.trim() || !Number.isInteger(parsed))
-    throw new Error(`西湖论剑题目 ID 非法，拒绝发送非整数 exerciseId: ${JSON.stringify(exerciseId)}`)
+    throw new Error(`DASCTF 题目 ID 非法，拒绝发送非整数 exerciseId: ${JSON.stringify(exerciseId)}`)
   return parsed
 }
 
@@ -178,7 +164,7 @@ function retryablePlatformError(error: unknown) {
 async function boundedBytes(response: Response, maximum: number) {
   const declared = Number(response.headers.get("content-length") ?? 0)
   if (Number.isFinite(declared) && declared > maximum)
-    throw new Error(`西湖论剑响应超过 ${maximum} 字节上限`)
+    throw new Error(`DASCTF 响应超过 ${maximum} 字节上限`)
   if (!response.body) return new Uint8Array()
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
@@ -188,7 +174,7 @@ async function boundedBytes(response: Response, maximum: number) {
       const next = await reader.read()
       if (next.done) break
       size += next.value.byteLength
-      if (size > maximum) throw new Error(`西湖论剑响应超过 ${maximum} 字节上限`)
+      if (size > maximum) throw new Error(`DASCTF 响应超过 ${maximum} 字节上限`)
       chunks.push(next.value)
     }
   } catch (error) {
@@ -206,32 +192,14 @@ async function boundedBytes(response: Response, maximum: number) {
   return joined
 }
 
-/**
- * Strip the flag wrapper so only the inner value is submitted, per the competition rules
- * ("提交时仅需提交 {} 内内容"). This is deliberately done in code rather than in the solver prompt:
- * the model produces the natural full flag and the wire format stays deterministic. A candidate that
- * is already bare passes through untouched.
- */
-export function innerFlagValue(candidate: string) {
-  const trimmed = candidate.trim()
-  const wrapped = /^[A-Za-z0-9_.-]{1,32}\{(.*)\}$/s.exec(trimmed)
-  return wrapped ? wrapped[1]!.trim() : trimmed
-}
-
-export type XihulunjianEndpoint = {
-  /** `host:port` Boom hands to the solver. */
-  remote?: string
-  /** Full connection matrix rendered into the challenge README for the solver to read. */
-  detail: string
-  expireTime?: number
-}
+export type { PlatformEndpoint as DasctfEndpoint } from "../adapter.ts"
 
 /**
  * Reduce the platform's `endpoints[]` to Boom's single `remote` plus human-readable detail.
  * A proxied endpoint is preferred when the platform marks it, because the direct IP is then
  * usually unreachable from the contest network.
  */
-export function selectEndpoint(endpoints: unknown): XihulunjianEndpoint | undefined {
+export function selectEndpoint(endpoints: unknown): PlatformEndpoint | undefined {
   if (!Array.isArray(endpoints) || endpoints.length === 0) return undefined
   const lines: string[] = []
   let remote: string | undefined
@@ -311,7 +279,7 @@ type ExerciseDetail = {
   category?: string
   solved: boolean
   attachments: Array<{ name: string; url: string }>
-  endpoint?: XihulunjianEndpoint
+  endpoint?: PlatformEndpoint
   needsInit: boolean
   needsCheck: boolean
   /** `none` means the challenge has no target service at all, so it is purely local. */
@@ -346,7 +314,7 @@ function attachmentsOf(value: unknown): Array<{ name: string; url: string }> {
 }
 
 /** Raised only for platform rate limiting, which is retryable; every other failure is not. */
-export class XihulunjianRateLimitError extends Error {}
+export class DasctfRateLimitError extends Error {}
 
 /**
  * Raised only when the platform's structured response confirms the candidate answer itself is
@@ -455,9 +423,11 @@ export function inferChallengeCategory(
   return "OTHER"
 }
 
-export class XihulunjianPlatformAdapter {
-  readonly id = XIHULUNJIAN_ADAPTER_ID
-  readonly name = "西湖论剑"
+export class DasctfPlatformAdapter implements PlatformAdapter {
+  readonly id = DASCTF_ADAPTER_ID
+  readonly displayName = "DASCTF"
+  readonly limits = { maxSubmissionsPerChallenge: DASCTF_MAX_SUBMISSIONS_PER_CHALLENGE }
+  readonly ownedAdapterIds: readonly string[] = [DASCTF_ADAPTER_ID, DASCTF_LEGACY_ADAPTER_ID]
   /** Tail of the serialized request chain; every call waits for the previous one. */
   private pending: Promise<void> = Promise.resolve()
   private lastRequestAt = 0
@@ -467,9 +437,26 @@ export class XihulunjianPlatformAdapter {
     private readonly fetcher: typeof fetch = fetch,
     private readonly sleep: (ms: number) => Promise<void> =
       (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    private readonly serverHost = XIHULUNJIAN_DEFAULT_SERVER_HOST,
+    private readonly serverHost = DASCTF_DEFAULT_SERVER_HOST,
   ) {
-    if (!accessKey.trim()) throw new Error("西湖论剑未配置 AccessKey")
+    if (!accessKey.trim()) throw new Error("DASCTF 平台未配置 AccessKey")
+  }
+
+  /**
+   * Strip the flag wrapper so only the inner value is submitted, per the platform rules
+   * ("提交时仅需提交 {} 内内容"). Done in code rather than in the solver prompt: the model produces
+   * the natural full flag and the wire format stays deterministic.
+   */
+  normalizeFlag(candidate: string) {
+    return unwrapFlagValue(candidate)
+  }
+
+  inferChallengeCategory(
+    name: string,
+    platformCategory?: unknown,
+    attachments?: string[],
+  ): ChallengeCategory {
+    return inferChallengeCategory(name, platformCategory, attachments)
   }
 
   private credential() {
@@ -508,7 +495,7 @@ export class XihulunjianPlatformAdapter {
   ) {
     let lastError: unknown
     for (let attempt = 0; attempt <= RATE_LIMIT_RETRIES; attempt += 1) {
-      if (options.signal?.aborted) throw new Error(`西湖论剑请求被取消: ${endpoint}`)
+      if (options.signal?.aborted) throw new Error(`DASCTF 请求被取消: ${endpoint}`)
       if (attempt > 0) await this.sleep(RATE_LIMIT_BASE_DELAY_MS * 2 ** (attempt - 1))
       try {
         return await this.throttle(() => this.attempt(method, endpoint, options))
@@ -517,7 +504,7 @@ export class XihulunjianPlatformAdapter {
         // A definitive verdict is final even if its message text happens to look transient
         // (e.g. "当前还有500次提交机会"); only genuine transport/rate-limit errors retry.
         if (error instanceof FlagRejectedError) throw error
-        if (!(error instanceof XihulunjianRateLimitError) && !retryablePlatformError(error)) throw error
+        if (!(error instanceof DasctfRateLimitError) && !retryablePlatformError(error)) throw error
       }
     }
     throw lastError
@@ -531,7 +518,7 @@ export class XihulunjianPlatformAdapter {
     const base = new URL(this.serverHost)
     const url = new URL(`${base.pathname.replace(/\/$/, "")}${API_PREFIX}${endpoint}`, base.origin)
     if (url.origin !== base.origin)
-      throw new Error(`西湖论剑请求越出配置的源: ${url.origin}`)
+      throw new Error(`DASCTF 请求越出配置的源: ${url.origin}`)
     for (const [key, value] of Object.entries(options.query ?? {})) url.searchParams.set(key, value)
 
     const headers = new Headers({ Accept: "application/json" })
@@ -565,19 +552,19 @@ export class XihulunjianPlatformAdapter {
     // Most endpoints use 40001 for rate limits. The answer endpoint also uses it for an
     // incorrect flag (with HTTP 200), which is a definitive verdict and must never be retried.
     if (response.status === 429 || (code === RATE_LIMIT_CODE && !isIncorrectFlagResponse(endpoint, message)))
-      throw new XihulunjianRateLimitError(
-        `西湖论剑接口 ${method} ${endpoint} 触发限流 (${response.status}/${code ?? "-"}): ${message}`,
+      throw new DasctfRateLimitError(
+        `DASCTF 接口 ${method} ${endpoint} 触发限流 (${response.status}/${code ?? "-"}): ${message}`,
       )
     if (!response.ok)
-      throw new Error(`西湖论剑接口 ${method} ${endpoint} 失败 (${response.status}): ${safeErrorBody(raw)}`)
-    if (!envelope) throw new Error(`西湖论剑接口 ${method} ${endpoint} 返回结构异常`)
+      throw new Error(`DASCTF 接口 ${method} ${endpoint} 失败 (${response.status}): ${safeErrorBody(raw)}`)
+    if (!envelope) throw new Error(`DASCTF 接口 ${method} ${endpoint} 返回结构异常`)
     if (code !== SUCCESS_CODE) {
       // Structurally confirmed wrong answer: the only failure shape that becomes a definitive
       // "rejected" verdict. HTTP-layer failures above keep plain errors so a 5xx body that merely
       // contains words like「系统错误」can never masquerade as a verdict after retries exhaust.
       if (isIncorrectFlagResponse(endpoint, message)) throw new FlagRejectedError(message)
       throw new Error(
-        `西湖论剑接口 ${method} ${endpoint} 返回业务失败 (code=${code ?? "缺失"}): ${message}`,
+        `DASCTF 接口 ${method} ${endpoint} 返回业务失败 (code=${code ?? "缺失"}): ${message}`,
       )
     }
     return envelope.data
@@ -592,7 +579,7 @@ export class XihulunjianPlatformAdapter {
    */
   private async exerciseList(signal?: AbortSignal) {
     const data = await this.call("GET", "/ctf/exercise-list", { signal })
-    if (!Array.isArray(data)) throw new Error("西湖论剑题目列表结构异常")
+    if (!Array.isArray(data)) throw new Error("DASCTF 题目列表结构异常")
     const previews: Array<{
       id: string
       challengeID: string
@@ -643,7 +630,7 @@ export class XihulunjianPlatformAdapter {
       query: { exerciseId },
       signal,
     }))
-    if (!data) throw new Error(`西湖论剑题目 ${exerciseId} 详情结构异常`)
+    if (!data) throw new Error(`DASCTF 题目 ${exerciseId} 详情结构异常`)
     const endpointType = text(data.endpointType)
     return {
       id: identifier(data.id ?? exerciseId, "题目 ID"),
@@ -699,13 +686,13 @@ export class XihulunjianPlatformAdapter {
       detail = await this.exerciseDetail(exerciseId, options.signal)
       if (!detail.needsCheck && detail.endpoint?.remote) return detail
     }
-    throw new Error(`西湖论剑题目 ${exerciseId} 环境在 ${ENVIRONMENT_POLL_TIMEOUT_MS / 1000}s 内未就绪`)
+    throw new Error(`DASCTF 题目 ${exerciseId} 环境在 ${ENVIRONMENT_POLL_TIMEOUT_MS / 1000}s 内未就绪`)
   }
 
   private slug(value: string) {
     const normalized = value.normalize("NFKC").trim().replace(/[\0-\x1f/\\:]+/g, "-").replace(/\.\./g, "-")
     const trimmed = normalized.replace(/^\.+|\.+$/g, "").slice(0, 160)
-    if (!trimmed || trimmed === "." || trimmed === "..") throw new Error("西湖论剑题目名无法生成合法 slug")
+    if (!trimmed || trimmed === "." || trimmed === "..") throw new Error("DASCTF 题目名无法生成合法 slug")
     return trimmed
   }
 
@@ -735,7 +722,8 @@ export class XihulunjianPlatformAdapter {
       .then((raw) => JSON.parse(raw) as JsonObject)
       .catch(() => undefined)
     const owner = object(metadata?.platform)
-    if (owner && (owner.adapter !== this.id || String(owner.challenge_id ?? "") !== challengeID))
+    const ownerAdapter = typeof owner?.adapter === "string" ? owner.adapter : undefined
+    if (owner && (!this.ownedAdapterIds.includes(ownerAdapter ?? "") || String(owner.challenge_id ?? "") !== challengeID))
       throw new Error(`拒绝覆盖不属于 ${this.id} 的题目目录: ${directory}`)
   }
 
@@ -770,7 +758,7 @@ export class XihulunjianPlatformAdapter {
       .then((raw) => JSON.parse(raw) as JsonObject)
       .catch(() => undefined)
     const owner = object(object(meta)?.platform)
-    if (owner?.adapter !== this.id) return
+    if (!owner || !this.ownedAdapterIds.includes(String(owner.adapter))) return
     const challengeID = String(owner.challenge_id ?? "")
     if (!challengeID) return
     const copies = index.get(challengeID) ?? []
@@ -1026,7 +1014,7 @@ export class XihulunjianPlatformAdapter {
       ...skipped.map((entry) => `题目 ${entry.challengeID}(${entry.title}): ${describe(entry.error)}`),
     ]
     if (notes.length > 0)
-      console.warn(`西湖论剑：跳过 ${notes.length} 个无法物化的题目\n  - ${notes.join("\n  - ")}`)
+      console.warn(`DASCTF：跳过 ${notes.length} 个无法物化的题目\n  - ${notes.join("\n  - ")}`)
     return materialized
   }
 
@@ -1037,10 +1025,10 @@ export class XihulunjianPlatformAdapter {
    * the competition applies no penalty for a wrong flag, which is why Boom submits promptly instead
    * of spending model budget on self-verification first.
    */
-  async submitFlag(input: XihulunjianSubmissionInput): Promise<XihulunjianSubmissionResult> {
+  async submitFlag(input: PlatformSubmissionInput): Promise<PlatformSubmissionResult> {
     const exerciseId = input.challenge.platform?.challengeID
     if (!exerciseId) throw new Error(`题目 ${input.challenge.slug} 缺少平台题目 ID`)
-    const flag = innerFlagValue(input.candidate)
+    const flag = this.normalizeFlag(input.candidate)
     if (!flag) throw new Error("候选 flag 为空")
     const submittedAt = new Date().toISOString()
     try {
@@ -1072,7 +1060,7 @@ export class XihulunjianPlatformAdapter {
   }
 
   /** Current score and rank, used by the match dashboard. Read-only and never blocking. */
-  async overview(signal?: AbortSignal) {
+  async overview(signal?: AbortSignal): Promise<PlatformOverview> {
     const data = object(await this.call("GET", "/answer-panel/overview", { signal }))
     return {
       point: numeric(data?.stagePoint) ?? 0,
@@ -1081,9 +1069,9 @@ export class XihulunjianPlatformAdapter {
   }
 
   /** Announcement summaries, intentionally kept separate from challenge acquisition. */
-  async notices(signal?: AbortSignal): Promise<XihulunjianNotice[]> {
+  async notices(signal?: AbortSignal): Promise<PlatformNotice[]> {
     const data = await this.call("GET", "/match/notice/now-list", { signal })
-    if (!Array.isArray(data)) throw new Error("西湖论剑公告列表结构异常")
+    if (!Array.isArray(data)) throw new Error("DASCTF 公告列表结构异常")
     return data.flatMap((item) => {
       const found = notice(item)
       return found ? [found] : []
@@ -1091,14 +1079,14 @@ export class XihulunjianPlatformAdapter {
   }
 
   /** Full announcement content and any platform-provided attachments. */
-  async noticeDetail(id: number, signal?: AbortSignal): Promise<XihulunjianNoticeDetail> {
-    if (!Number.isSafeInteger(id) || id <= 0) throw new Error("西湖论剑公告 ID 非法")
+  async noticeDetail(id: number, signal?: AbortSignal): Promise<PlatformNoticeDetail> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error("DASCTF 公告 ID 非法")
     const data = object(await this.call("GET", "/match/notice/detail", {
       query: { id: String(id) },
       signal,
     }))
     const base = notice(data)
-    if (!base) throw new Error("西湖论剑公告详情结构异常")
+    if (!base) throw new Error("DASCTF 公告详情结构异常")
     return {
       ...base,
       isFile: data?.isFile === true,

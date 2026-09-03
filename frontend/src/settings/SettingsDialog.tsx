@@ -485,7 +485,7 @@ export function SettingsDialog() {
             onClick={() => void migrateOpenCodeCredentials()}
           />
           <IntegrationCard icon={<Cable size={15} />} title="MCP Server" desc="Boom 保存独立配置并注入隔离的 Boom Runtime，不读取用户或项目 OpenCode 配置。" onClick={() => openDialog("mcp")} />
-          <IntegrationCard icon={<Timer size={15} />} title="西湖论剑控制台" desc="专用接入、AccessKey、自动拉题、线上资源与赛方大模型网关。" onClick={() => openDialog("competition")} />
+          <IntegrationCard icon={<Timer size={15} />} title="比赛平台控制台" desc="平台接入、AccessKey、自动拉题、线上资源与比赛大模型网关。" onClick={() => openDialog("competition")} />
           <IntegrationCard icon={<Shield size={15} />} title="破甲提示词" desc="维护可复用的置顶系统提示词；然后在每个 Provider 模型上选择一项。" onClick={() => openDialog("armor")} />
         </div>
       </section>

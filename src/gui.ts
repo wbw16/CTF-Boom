@@ -44,15 +44,14 @@ import {
   saveEnvironmentStore,
   upsertEnvironmentProfile,
 } from "./environment.ts"
-import { clearCompetitionAdapterCache, loadCompetitionAdapter } from "./competition/adapter.ts"
 import { CompetitionAutopilot, type AutopilotCycleResult } from "./competition/autopilot.ts"
-import { XIHULUNJIAN_ADAPTER_ID } from "./xihulunjian-platform-adapter.ts"
 import {
-  loadXihulunjianAccessKey,
-  saveXihulunjianAccessKey,
-  saveXihulunjianServerHost,
-  xihulunjianCredentialStatus,
-} from "./xihulunjian-config.ts"
+  activePlatformAdapterEntry,
+  clearCompetitionAdapterCache,
+  findPlatformAdapterEntry,
+  loadCompetitionAdapter,
+  platformAdapterSummaries,
+} from "./platform/registry.ts"
 import { normalizeCompetitionSettings } from "./competition/policy.ts"
 import { registerBoomControlPlaneOrigin } from "./runtime.ts"
 
@@ -681,7 +680,7 @@ export async function startGuiServer(options: StartGuiOptions) {
    * abandoned work, confirmed flags, or an irrecoverable task forever.
    */
   const automaticCandidate = async (item: Challenge) => {
-    if (item.platform?.adapter !== XIHULUNJIAN_ADAPTER_ID) return undefined
+    if (!item.platform || !findPlatformAdapterEntry(item.platform.adapter)) return undefined
     if (item.platform.options?.solved === true) return undefined
     const saved = persisted.challenges[item.slug]
     if (saved?.state || saved?.confirmed) return undefined
@@ -760,11 +759,13 @@ export async function startGuiServer(options: StartGuiOptions) {
     return { queued, skipped }
   }
 
-  const synchronizeXihulunjian = async (
+  const synchronizePlatform = async (
     options: { signal?: AbortSignal; automatic?: boolean } = {},
+    platformId?: string,
   ): Promise<AutopilotCycleResult & { slugs: string[] }> => {
-    const adapter = await loadCompetitionAdapter()
-    if (!adapter) throw new HttpError(400, "请先保存西湖论剑 AccessKey")
+    const entry = activePlatformAdapterEntry(platformId ?? persisted.settings.competition.platformId)
+    const adapter = await loadCompetitionAdapter(entry.id)
+    if (!adapter) throw new HttpError(400, `请先保存 ${entry.displayName} AccessKey`)
     const downloaded = await adapter.acquireChallenges({ root, signal: options.signal })
     const admission = options.automatic
       ? await enqueueAutomatically(downloaded)
@@ -772,7 +773,7 @@ export async function startGuiServer(options: StartGuiOptions) {
     const result = { downloaded: downloaded.length, ...admission, slugs: downloaded.map((item) => item.slug) }
     broadcast({
       at: Date.now(),
-      type: "xihulunjian.synced",
+      type: "platform.synced",
       challenges: downloaded.length,
       ...(options.automatic ? { autopilot: result } : {}),
     })
@@ -780,7 +781,7 @@ export async function startGuiServer(options: StartGuiOptions) {
   }
 
   const autopilot = new CompetitionAutopilot({
-    sync: (signal) => exclusive(() => synchronizeXihulunjian({ signal, automatic: true })),
+    sync: (signal) => exclusive(() => synchronizePlatform({ signal, automatic: true })),
     intervalMs: (persisted.settings.competition.refreshIntervalMinutes ?? 10) * 60_000,
     // Unattended mode ends only when the operator stops it. The legacy clock remains readable for
     // old saved state, but it must not silently stop future catalog polling or solve admission.
@@ -992,8 +993,9 @@ export async function startGuiServer(options: StartGuiOptions) {
          */
         if (request.method === "POST" && url.pathname === "/api/competition/autopilot/start") {
           return await exclusive(async () => {
-            if (!await loadXihulunjianAccessKey())
-              throw new HttpError(400, "开始比赛前请先在西湖论剑控制台保存 AccessKey")
+            const activeEntry = activePlatformAdapterEntry(persisted.settings.competition.platformId)
+            if (!await activeEntry.credentials.loadAccessKey())
+              throw new HttpError(400, "开始比赛前请先在比赛平台控制台保存 AccessKey")
             await automaticEnvironmentProfile()
             const current = persisted.settings.competition
             const { deadline: _legacyDeadline, ...withoutDeadline } = current
@@ -1059,74 +1061,78 @@ export async function startGuiServer(options: StartGuiOptions) {
           })
         }
 
-        // This build deliberately exposes one fixed competition integration only.  It has no
-        // manifest editor, OpenAPI importer, adapter IDs, or generic platform routes.
-        if (request.method === "GET" && url.pathname === "/api/xihulunjian/overview") {
-          const adapter = await loadCompetitionAdapter()
-          if (!adapter) throw new HttpError(400, "请先在西湖论剑控制台配置 AccessKey")
-          return json(await adapter.overview(request.signal))
-        }
+        // Competition platform routes. The `:id` segment resolves through the adapter registry,
+        // so one route set serves every built-in platform integration.
+        if (request.method === "GET" && url.pathname === "/api/platform")
+          return json(await platformAdapterSummaries(persisted.settings.competition.platformId))
 
-        if (request.method === "GET" && url.pathname === "/api/xihulunjian/notices") {
-          const adapter = await loadCompetitionAdapter()
-          if (!adapter) throw new HttpError(400, "请先在西湖论剑控制台配置 AccessKey")
-          return json({ notices: await adapter.notices(request.signal) })
-        }
+        const platformRoute = /^\/api\/platform\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname)
+        if (platformRoute) {
+          const entry = findPlatformAdapterEntry(platformRoute[1])
+          if (!entry) throw new HttpError(404, `未知的比赛平台: ${platformRoute[1]}`)
+          const rest = platformRoute[2] ?? ""
+          const requireAdapter = async () => {
+            const adapter = await loadCompetitionAdapter(entry.id)
+            if (!adapter) throw new HttpError(400, `请先在比赛平台控制台配置 ${entry.displayName} AccessKey`)
+            return adapter
+          }
 
-        const noticeDetail = /^\/api\/xihulunjian\/notices\/(\d+)$/.exec(url.pathname)
-        if (request.method === "GET" && noticeDetail) {
-          const id = Number(noticeDetail[1])
-          if (!Number.isSafeInteger(id) || id <= 0) throw new HttpError(400, "公告 ID 非法")
-          const adapter = await loadCompetitionAdapter()
-          if (!adapter) throw new HttpError(400, "请先在西湖论剑控制台配置 AccessKey")
-          return json(await adapter.noticeDetail(id, request.signal))
-        }
+          if (request.method === "GET" && rest === "/overview")
+            return json(await (await requireAdapter()).overview(request.signal))
 
-        if (request.method === "GET" && url.pathname === "/api/xihulunjian")
-          return json({ credential: await xihulunjianCredentialStatus() })
+          if (request.method === "GET" && rest === "/notices")
+            return json({ notices: await (await requireAdapter()).notices(request.signal) })
 
-        if (request.method === "PUT" && url.pathname === "/api/xihulunjian/credential") {
-          const input = await body(request)
-          if (typeof input.value !== "string") throw new HttpError(400, "AccessKey 必须是字符串")
-          const accessKey = input.value
-          return await exclusive(async () => {
-            try {
-              const credential = await saveXihulunjianAccessKey(accessKey)
-              clearCompetitionAdapterCache()
-              broadcast({ at: Date.now(), type: "xihulunjian.credential.changed" })
-              return json({ credential })
-            } catch (error) {
-              throw new HttpError(400, error instanceof Error ? error.message : String(error))
-            }
-          })
-        }
+          const noticeDetail = /^\/notices\/(\d+)$/.exec(rest)
+          if (request.method === "GET" && noticeDetail) {
+            const id = Number(noticeDetail[1])
+            if (!Number.isSafeInteger(id) || id <= 0) throw new HttpError(400, "公告 ID 非法")
+            return json(await (await requireAdapter()).noticeDetail(id, request.signal))
+          }
 
-        if (request.method === "PUT" && url.pathname === "/api/xihulunjian/server-host") {
-          const input = await body(request)
-          if (typeof input.value !== "string") throw new HttpError(400, "Server Host 必须是字符串")
-          const serverHost = input.value
-          return await exclusive(async () => {
-            try {
-              const saved = await saveXihulunjianServerHost(serverHost)
-              clearCompetitionAdapterCache()
-              broadcast({ at: Date.now(), type: "xihulunjian.server-host.changed" })
-              return json(saved)
-            } catch (error) {
-              throw new HttpError(400, error instanceof Error ? error.message : String(error))
-            }
-          })
-        }
+          if (request.method === "PUT" && rest === "/credential") {
+            const input = await body(request)
+            if (typeof input.value !== "string") throw new HttpError(400, "AccessKey 必须是字符串")
+            const accessKey = input.value
+            return await exclusive(async () => {
+              try {
+                const credential = await entry.credentials.saveAccessKey(accessKey)
+                clearCompetitionAdapterCache()
+                broadcast({ at: Date.now(), type: "platform.credential.changed" })
+                return json({ credential })
+              } catch (error) {
+                throw new HttpError(400, error instanceof Error ? error.message : String(error))
+              }
+            })
+          }
 
-        if (request.method === "POST" && url.pathname === "/api/xihulunjian/sync") {
-          return await exclusive(async () => {
-            try {
-              const result = await synchronizeXihulunjian()
-              return json({ challenges: result.slugs })
-            } catch (error) {
-              if (error instanceof HttpError) throw error
-              throw new HttpError(400, error instanceof Error ? error.message : String(error))
-            }
-          })
+          if (request.method === "PUT" && rest === "/server-host") {
+            const input = await body(request)
+            if (typeof input.value !== "string") throw new HttpError(400, "Server Host 必须是字符串")
+            const serverHost = input.value
+            return await exclusive(async () => {
+              try {
+                const saved = await entry.credentials.saveServerHost(serverHost)
+                clearCompetitionAdapterCache()
+                broadcast({ at: Date.now(), type: "platform.server-host.changed" })
+                return json(saved)
+              } catch (error) {
+                throw new HttpError(400, error instanceof Error ? error.message : String(error))
+              }
+            })
+          }
+
+          if (request.method === "POST" && rest === "/sync") {
+            return await exclusive(async () => {
+              try {
+                const result = await synchronizePlatform(undefined, entry.id)
+                return json({ challenges: result.slugs })
+              } catch (error) {
+                if (error instanceof HttpError) throw error
+                throw new HttpError(400, error instanceof Error ? error.message : String(error))
+              }
+            })
+          }
         }
 
         if (request.method === "GET" && url.pathname === "/api/environments")

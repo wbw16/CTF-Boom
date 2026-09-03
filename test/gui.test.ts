@@ -368,19 +368,22 @@ describe("GUI HTTP surface", () => {
     }
   })
 
-  test("stores an editable 西湖论剑 Server Host outside the challenge root", async () => {
+  test("stores an editable platform Server Host outside the challenge root", async () => {
     const one = await harness()
     try {
-      const saved = await request(one, "/api/xihulunjian/server-host", "PUT", {
+      const saved = await request(one, "/api/platform/dasctf/server-host", "PUT", {
         value: "https://contest.example.test/agent/",
       })
       expect(saved.status).toBe(200)
       expect(await saved.json()).toEqual({ serverHost: "https://contest.example.test/agent" })
 
-      const status = await request(one, "/api/xihulunjian")
+      const status = await request(one, "/api/platform")
       expect(status.status).toBe(200)
       expect(await status.json()).toMatchObject({
-        credential: { configured: false, serverHost: "https://contest.example.test/agent" },
+        active: {
+          id: "dasctf",
+          credential: { configured: false, serverHost: "https://contest.example.test/agent" },
+        },
       })
     } finally {
       await one.close()
@@ -506,7 +509,7 @@ describe("GUI HTTP surface", () => {
       expect(client).toContain("/api/providers")
       expect(client).toContain("从 OpenCode 迁移凭据")
       expect(client).toContain("/api/mcp")
-      expect(client).toContain("/api/xihulunjian")
+      expect(client).toContain("/api/platform")
       expect(client).not.toContain("/api/platforms")
       expect(client).toContain("/api/armor-prompts")
       expect(client).toContain("Boom Runtime 已应用 Provider 配置并刷新模型目录")

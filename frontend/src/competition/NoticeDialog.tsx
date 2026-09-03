@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import { Bell, ExternalLink, FileText, RefreshCw } from "lucide-react"
 import { api } from "../api"
 import { useApp } from "../context"
-import type { XihulunjianNoticeDetail } from "../types"
+import type { PlatformNoticeDetail } from "../types"
 import { Modal } from "../ui"
 
 function announcementTime(notice: { createdAt?: string; createdTime?: number }) {
@@ -18,9 +18,9 @@ function announcementTime(notice: { createdAt?: string; createdTime?: number }) 
 
 /** Read-only platform announcements, refreshed by the app once a minute. */
 export function NoticeDialog() {
-  const { notices, refreshNotices, markNoticeRead, closeDialog, toast } = useApp()
+  const { notices, platform, refreshNotices, markNoticeRead, closeDialog, toast } = useApp()
   const [selectedID, setSelectedID] = useState<number | null>(null)
-  const [detail, setDetail] = useState<XihulunjianNoticeDetail | null>(null)
+  const [detail, setDetail] = useState<PlatformNoticeDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
 
@@ -36,14 +36,14 @@ export function NoticeDialog() {
   }, [markNoticeRead, selectedID])
 
   useEffect(() => {
-    if (!selectedID) {
+    if (!selectedID || !platform) {
       setDetail(null)
       return
     }
     const controller = new AbortController()
     setLoading(true)
     setDetail(null)
-    void api<XihulunjianNoticeDetail>(`/api/xihulunjian/notices/${selectedID}`, {
+    void api<PlatformNoticeDetail>(`/api/platform/${platform.id}/notices/${selectedID}`, {
       signal: controller.signal,
     })
       .then((next) => {
@@ -56,7 +56,7 @@ export function NoticeDialog() {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [selectedID, toast])
+  }, [platform, selectedID, toast])
 
   const refresh = async () => {
     setRefreshing(true)
@@ -76,7 +76,7 @@ export function NoticeDialog() {
       className="notice-modal"
       footer={
         <>
-          <span className="note">公告由西湖论剑平台提供</span>
+          <span className="note">{`公告由${platform?.displayName ?? "比赛平台"}提供`}</span>
           <button type="button" className="btn btn-tiny" disabled={refreshing} onClick={() => void refresh()}>
             <RefreshCw size={13} className={refreshing ? "spin" : undefined} />刷新
           </button>
@@ -86,7 +86,7 @@ export function NoticeDialog() {
       <div className="notice-layout">
         <aside className="notice-list" aria-label="公告列表">
           {notices.length === 0 ? (
-            <div className="notice-empty">暂无公告。请确认已在西湖论剑控制台配置 AccessKey。</div>
+            <div className="notice-empty">暂无公告。请确认已在比赛平台控制台配置 AccessKey。</div>
           ) : notices.map((notice) => (
             <button
               key={notice.id}

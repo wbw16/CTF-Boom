@@ -21,7 +21,7 @@ import type { CompetitionState, GuiState } from "./types"
 type MatchOverview = { point: number; rank?: number }
 
 export function TopBar() {
-  const { data, unreadNoticeCount, toast, refresh, openDialog, theme, setTheme } = useApp()
+  const { data, platform, unreadNoticeCount, toast, refresh, openDialog, theme, setTheme } = useApp()
   const [competition, setCompetition] = useState<CompetitionState | null>(null)
   const [overview, setOverview] = useState<MatchOverview | null>(null)
 
@@ -47,8 +47,10 @@ export function TopBar() {
   // poll that competes with challenge acquisition. The adapter serializes this with other platform calls.
   useEffect(() => {
     let cancelled = false
+    const platformID = platform?.id
     const read = () => {
-      void api<MatchOverview>("/api/xihulunjian/overview")
+      if (!platformID) return
+      void api<MatchOverview>(`/api/platform/${platformID}/overview`)
         .then((next) => {
           if (!cancelled) setOverview(next)
         })
@@ -60,7 +62,7 @@ export function TopBar() {
       cancelled = true
       clearInterval(timer)
     }
-  }, [])
+  }, [platform?.id])
 
   const pickRoot = useCallback(async () => {
     if (!data) return
@@ -191,10 +193,10 @@ export function TopBar() {
           type="button"
           className="competition-entry"
           onClick={() => openDialog("competition")}
-          title="打开西湖论剑控制台"
+          title="打开比赛平台控制台"
         >
           <Trophy size={14} aria-hidden="true" />
-          <span>西湖论剑控制台</span>
+          <span>比赛控制台</span>
         </button>
         <button
           type="button"
@@ -209,7 +211,7 @@ export function TopBar() {
         </button>
         <span
           className="rank-chip"
-          title="西湖论剑实时排名，每 20 秒更新一次"
+          title={`${platform?.displayName ?? "比赛平台"}实时排名，每 20 秒更新一次`}
           aria-label={`实时排名：${overview?.rank ? `第 ${overview.rank} 名` : "暂未获取"}`}
         >
           <Medal size={14} aria-hidden="true" />

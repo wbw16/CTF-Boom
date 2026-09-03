@@ -1,6 +1,9 @@
-# 西湖论剑比赛适配（competition build）
+# DASCTF 平台适配（内置比赛平台适配器）
 
-本分支 `codex/xihulunjian-adaptation` 是**比赛专用构建**，不保留通用模式的原有行为。
+DASCTF 的 "AI Agent API" 是西湖论剑等 agent CTF 赛事的接入平台。本适配器
+（`src/platform/adapters/dasctf.ts`，适配器 ID `dasctf`）作为内置平台注册在
+`src/platform/registry.ts`；西湖论剑比赛时期的旧 ID `xihulunjian` 仍作为别名接受，
+旧题目 `meta.json` 无需迁移。以下赛制参数为 2026-08 西湖论剑赛事实测。
 
 ## 赛制参数
 
@@ -108,19 +111,20 @@ Base URL `https://pro.dasctf.com`，`{serverHost}/slab-match/api/v1/agent`。
 
 ## 凭证
 
-- 比赛服务器固定为 `https://pro.dasctf.com`；专用构建不提供 Server Host、适配器 ID
-  或 OpenAPI 清单编辑。
-- AccessKey 只由西湖论剑控制台写入；前端只显示是否已配置、不回显明文。
+- 比赛服务器默认 `https://pro.dasctf.com`，可在比赛平台控制台中修改 Server Host；
+  不提供 OpenAPI 清单编辑（声明式适配器引擎已被实测否定，适配器为手写客户端）。
+- AccessKey 只由比赛平台控制台写入；前端只显示是否已配置、不回显明文。
 - 大模型网关 baseURL 作为 provider 配置项，可随时修改，不硬编码。
 
-AccessKey 的落盘位置是 `~/.config/boom/xihulunjian.json`（0600，
-可用 `BOOM_HOME` 改写），由 `src/xihulunjian-config.ts` 管理。若设置
-`BOOM_XIHULUNJIAN_ACCESS_KEY`，该显式环境变量优先。该值不进入题目目录、
-运行工作区或 API 响应。
+AccessKey 的落盘位置是 `~/.config/boom/platforms/dasctf.json`（0600，
+可用 `BOOM_HOME` 改写），由 `src/platform/credentials.ts` 管理。若设置
+`BOOM_DASCTF_ACCESS_KEY`，该显式环境变量优先。比赛时期的
+`BOOM_XIHULUNJIAN_ACCESS_KEY` 与 `~/.config/boom/xihulunjian.json` 仍作为旧来源
+自动读取，写入总是落到新文件。该值不进入题目目录、运行工作区或 API 响应。
 
 ## 使用方式
 
-从 **设置 → 西湖论剑控制台** 完成以下操作：
+从 **设置 → 比赛平台控制台** 完成以下操作：
 
 1. 保存 AccessKey；
 2. 每次放题后点击“同步已开放题目”；
@@ -133,8 +137,10 @@ AccessKey 的落盘位置是 `~/.config/boom/xihulunjian.json`（0600，
 异常、不可用题目或单题入队失败会记录后跳过，不会阻塞后续同步或其他题目的自动解题。点击
 主界面的“停止”会取消后续巡航并停止当前运行，但保留比赛时钟，便于有意恢复。
 
-专用 GUI API 为 `GET /api/xihulunjian`、`PUT /api/xihulunjian/credential` 和
-`POST /api/xihulunjian/sync`；不存在通用 `/api/platforms/*` 路由或 `boom platform` 命令。
+GUI API 为注册表路由 `GET /api/platform`（适配器列表与状态）、
+`PUT /api/platform/dasctf/credential`、`PUT /api/platform/dasctf/server-host` 和
+`POST /api/platform/dasctf/sync` 等；新增平台只需在注册表添加适配器条目，
+路由不变。
 
 ## 调度实现说明
 
@@ -176,15 +182,15 @@ AccessKey 的落盘位置是 `~/.config/boom/xihulunjian.json`（0600，
 - 网关把请求模型映射到 `deepseek-v4-flash`（以响应里的 `model` 字段为准）。
 
 OpenCode 的 `openai-compatible` Provider 会在 Base URL 后拼接 `chat/completions`，
-与这种“根即端点”的网关冲突。Boom 会自动识别西湖论剑网关 URL，并在本机通过受限代理将
-标准 `/v1/chat/completions` 请求透明转发到该根端点；SSE、tool_calls 与 usage 保持原样。
-旧配置末尾的 `!` 仍兼容，但不再需要。
+与这种“根即端点”的网关冲突。Boom 的通用机制是在 Base URL **末尾加 `!` 标记固定端点**，
+并在本机通过受限代理将标准 `/v1/chat/completions` 请求透明转发到该根端点；
+SSE、tool_calls 与 usage 保持原样。识别只依赖 `!` 标记，不绑定任何平台域名。
 
 配置（设置 → Provider 与模型 → 编辑正在使用的 Provider；**无需创建比赛专用
 Provider**）：
 
 - Driver：`openai-compatible`
-- Base URL：直接填写 `https://llm-gateway.dasctf.com/llm-gateway/proxy/e/<token>`，**不要添加** `/v1`、`/chat/completions` 或 `!`
+- Base URL：填写 `https://llm-gateway.dasctf.com/llm-gateway/proxy/e/<token>!`，**不要添加** `/v1` 或 `/chat/completions`，**末尾必须加 `!`**
 - API Key：保留原始上游 Provider 的 API Key（以 `Authorization: Bearer` 发送）；例如百炼 Qwen 使用自己的百炼 API Key
 - Model ID：填写所选上游模型的 ID
 

@@ -575,11 +575,11 @@ assertion failure.
 - 赛方网关根即端点（POST 返回 200，`/chat/completions` 返回 404）
 - 新增精确端点标记 `!`：Base URL 末尾加 `!` 跳过路径拼接
 - Provider 对话框加 hint 提示
-- 比赛控制台自动追加 `!`，用户无需知道
+- 后端按网关 URL 形状嗅探自动判定固定端点（`!` 为通用兜底标记；后在 2026-09 通用化时移除嗅探，仅认 `!`）
 
 ### 真实平台验证结果（2026-08-18）
 
-凭证 `https://pro.dasctf.com`，AccessKey `ak_live_vK3...`，网关 `https://llm-gateway.dasctf.com/llm-gateway/proxy/e/yxzdl_QrHvw1OUov`。
+凭证 `https://pro.dasctf.com`，AccessKey `<redacted>`，网关 `https://llm-gateway.dasctf.com/llm-gateway/proxy/e/<redacted-token>`。
 
 - 题目列表：3 道 → 4 道（分批放题，新增 WEB `UploadKing` 200 分 MEDIUM）
 - 分类名英文（Web/Pwn/Misc），命中 `CATEGORY_ALIASES`
@@ -658,3 +658,34 @@ OTHER 不误动，已正确分类的题目零误动。`scripts/classify-challeng
 `bun test test/` 的 42 个失败里，除既有 EPERM/超时环境问题外均源于此。判断测试
 真伪时先看失败是否涉及子进程 + 文件是否在子目录；非 spawn 类测试（如适配器套件）
 不受影响。升级/回退 Bun 版本即可消除。
+
+
+## 2026-09-02 比赛平台层解耦（platform decoupling）
+
+西湖论剑专用构建被解耦为"通用比赛平台层 + 可插拔适配器"，作为通用版推入 main。
+origin/main（40abce42，通用 V3 基线）是 xhlj 的祖先，因此是**快进推送**，无需 force。
+
+设计（详见 docs/PLATFORMS.md）：
+
+- `src/platform/adapter.ts`：`PlatformAdapter` 接口（提交/公告/环境/限额/normalizeFlag/
+  inferChallengeCategory）+ 通用 `unwrapFlagValue`。
+- `src/platform/registry.ts`：内置注册表。id/别名解析（`xihulunjian` → `dasctf`）、
+  实例缓存（沿用"缓存 Promise 而非值"的并发语义）、`platformAdapterSummaries` 供 GUI。
+- `src/platform/credentials.ts`：通用凭证存储 `$BOOM_HOME/platforms/<id>.json`；
+  env 优先；旧 env/旧文件声明为 legacy 来源自动读取，写入总落新文件。
+- `src/platform/adapters/dasctf.ts`：原 xihulunjian 适配器改名（git mv），id `dasctf`，
+  `ownedAdapterIds` 含旧 id，旧工作区 meta.json 无需迁移。
+- 接线：runner 按题目的 `platform.adapter` 经注册表分发（不再出现具体平台名）；
+  gui 路由通用化为 `/api/platform`、`/api/platform/:id/*`，SSE 事件 `platform.*`；
+  提交闸门用 `adapter.limits.maxSubmissionsPerChallenge`（无适配器时用
+  submissions.ts 的产品默认 15）；policy 增加 `settings.competition.platformId`。
+- **不**恢复声明式 manifest/OpenAPI 引擎（当年因真实 API 塞不进被删，见
+  docs/platforms/dasctf.md 的实测偏差记录）。
+- `provider-http.ts` 移除 `llm-gateway.dasctf.com` 域名嗅探：固定端点只认 `!` 标记，
+  控制台指引改为"末尾加 `!`"。
+
+敏感信息：2026-08-18 的 AccessKey 片段与个人网关 token URL 已从本文件脱敏；
+注意它们仍存在于 origin/xhlj 的历史提交里——若该 remote 公开，应作废该网关 token。
+
+兼容性验证：test/platform-credentials.test.ts 覆盖旧 env/旧文件迁移路径；
+dasctf 适配器测试整体改名保留。

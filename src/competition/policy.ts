@@ -1,15 +1,16 @@
 import type { Challenge } from "../challenge.ts"
 
 /**
- * Competition policy for 西湖论剑: a 3-hour match with three concurrent remote environments.
+ * Competition scheduling policy: a short timed match with a few concurrent remote environments.
  *
  * Everything here is a pure decision function so the scheduling rules can be tested without a
  * runtime, a platform, or a clock. The runner owns the side effects; this module owns the judgement.
  *
- * See docs/XIHULUNJIAN.md for the rules these constants encode.
+ * The defaults encode a 3-hour agent-style CTF (three concurrent target environments, batched
+ * challenge releases); see docs/PLATFORMS.md for how a platform adapter relates to these knobs.
  */
 
-/** Platform rule: at most three challenge environments may exist at once. */
+/** Default remote slots; agent CTF platforms typically allow only three concurrent targets. */
 export const DEFAULT_REMOTE_SLOTS = 3
 
 /**
@@ -54,6 +55,8 @@ const DIFFICULTY_RANK: Record<string, number> = {
 }
 
 export type CompetitionSettings = {
+  /** Adapter id of the competition platform this root syncs challenges from. */
+  platformId?: string
   remoteSlots: number
   /** How often unattended mode checks the platform for newly released challenges. */
   refreshIntervalMinutes?: number
@@ -92,9 +95,13 @@ export function normalizeCompetitionSettings(
   const deadline = typeof input.deadline === "number" && Number.isFinite(input.deadline) && input.deadline > 0
     ? Math.floor(input.deadline)
     : undefined
+  const platformId = typeof input.platformId === "string" && /^[a-z0-9][a-z0-9-]{0,63}$/.test(input.platformId)
+    ? input.platformId
+    : undefined
   return {
-    // The platform permits at most three target environments. Operators may intentionally use
-    // fewer slots, but a higher value would only turn into rejected API requests.
+    ...(platformId === undefined ? {} : { platformId }),
+    // The default platform permits at most three target environments. Operators may intentionally
+    // use fewer slots, but a higher value would only turn into rejected API requests.
     remoteSlots: positive(input.remoteSlots, fallback.remoteSlots, DEFAULT_REMOTE_SLOTS),
     refreshIntervalMinutes: positive(
       input.refreshIntervalMinutes,

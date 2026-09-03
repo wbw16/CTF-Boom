@@ -1,12 +1,12 @@
 import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import path from "node:path"
-import { innerFlagValue } from "../xihulunjian-platform-adapter.ts"
+import { unwrapFlagValue } from "../platform/adapter.ts"
 
 /**
  * Durable per-challenge submission ledger.
  *
- * The competition permits 50 submissions per challenge and forbids brute-forcing outright, so Boom
- * keeps its own far lower ceiling and refuses to resend a value it has already tried. The ledger is
+ * Competition platforms cap submissions per challenge and forbid brute-forcing outright, so Boom
+ * keeps its own low ceiling and refuses to resend a value it has already tried. The ledger is
  * persisted so a process restart mid-match cannot reset the count and walk into the platform's limit.
  *
  * Comparison uses the unwrapped flag value, so `DASCTF{x}` and a bare `x` count as the same attempt.
@@ -27,6 +27,12 @@ export type SubmissionLedger = {
 }
 
 const LEDGER_NAME = "submissions.json"
+
+/**
+ * Product-side anti-brute-force ceiling used when no platform adapter is loaded; a registered
+ * adapter usually supplies its own (lower or platform-informed) limit through `limits`.
+ */
+export const DEFAULT_MAX_SUBMISSIONS_PER_CHALLENGE = 15
 
 function empty(slug: string): SubmissionLedger {
   return { version: 1, slug, attempts: [] }
@@ -110,7 +116,7 @@ export function gateSubmission(input: {
   candidate: string
   maxSubmissions: number
 }): SubmissionGate {
-  const value = innerFlagValue(input.candidate)
+  const value = unwrapFlagValue(input.candidate)
   if (!value) return { allowed: false, reason: "候选 flag 为空" }
   if (input.ledger.attempts.some((attempt) => attempt.verdict === "accepted"))
     return { allowed: false, reason: "该题已有被平台接受的 flag，无需重复提交" }
@@ -124,7 +130,7 @@ export function gateSubmission(input: {
   if (input.ledger.attempts.length >= input.maxSubmissions)
     return {
       allowed: false,
-      reason: `已提交 ${input.ledger.attempts.length} 次，达到 Boom 的每题上限 ${input.maxSubmissions}（平台硬上限为 50，禁止爆破）`,
+      reason: `已提交 ${input.ledger.attempts.length} 次，达到 Boom 的每题上限 ${input.maxSubmissions}，禁止爆破`,
     }
   return { allowed: true, value }
 }
