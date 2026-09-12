@@ -1,23 +1,29 @@
 import { useMemo, useState, type ReactNode } from "react"
 import {
+  Archive,
   Blocks,
   Cable,
   Cpu,
   Flag,
+  FolderOpen,
   Gauge,
   KeyRound,
   Plug,
+  RotateCcw,
   Shield,
   Terminal,
   Timer,
+  Trash2,
 } from "lucide-react"
 import { useApp } from "../context"
+import { chooseDirectory } from "../bridge"
 import { patchJSON, postJSON } from "../api"
 import { Modal, Segmented, Select, Toggle, type SelectOption } from "../ui"
 import type { GuiSettings } from "../types"
 
 const SECTIONS = [
   { id: "models", label: "模型", icon: Cpu },
+  { id: "root", label: "工作目录", icon: FolderOpen },
   { id: "env", label: "运行环境", icon: Terminal },
   { id: "budget", label: "预算与超时", icon: Gauge },
   { id: "flag", label: "Flag 提取", icon: Flag },
@@ -227,6 +233,97 @@ export function SettingsDialog() {
     }
   }
 
+  const [rootDraft, setRootDraft] = useState(() => data?.root ?? "")
+  const [backupName, setBackupName] = useState("")
+  const [workspaceBusy, setWorkspaceBusy] = useState<"" | "root" | "backup" | "clear">("")
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [lastBackup, setLastBackup] = useState("")
+
+  /**
+   * The workspace panel owns the Chinese phrasing of its own refusals: the API answers in one
+   * English sentence, and an operator reading a destructive-action error should not have to
+   * translate it.
+   */
+  const workspaceError = (error: unknown, fallback: string) => {
+    const message = (error as Error)?.message ?? ""
+    if (/Stop active runs/i.test(message)) return "请先停止运行中的任务"
+    if (/Invalid backup name/i.test(message)) return "备份名称只能包含字母、数字、点、下划线和短横线"
+    if (/Backup already exists/i.test(message)) return "同名备份已存在，换一个名称"
+    if (/Cannot run tar/i.test(message)) return "系统里没有可用的 tar，请手动备份该目录"
+    return message || fallback
+  }
+
+  /**
+   * Switching the folder mid-settings closes the panel: the draft above was read from the previous
+   * workspace, and saving it afterwards would copy one workspace's settings onto another.
+   */
+  const switchRoot = async (target: string) => {
+    const next = target.trim()
+    if (!next) {
+      toast("请输入工作目录路径", "error")
+      return
+    }
+    if (next === data?.root) return
+    setWorkspaceBusy("root")
+    try {
+      await postJSON("/api/root", { root: next })
+      await refresh()
+      closeDialog()
+      toast(`工作目录已切换到 ${next}`)
+    } catch (error) {
+      toast(workspaceError(error, "切换工作目录失败"), "error")
+    } finally {
+      setWorkspaceBusy("")
+    }
+  }
+
+  const pickRoot = async () => {
+    const picked = await chooseDirectory({
+      title: "选择 Boom 工作目录",
+      initial: rootDraft.trim() || data?.root || "",
+    })
+    if (picked) await switchRoot(picked)
+  }
+
+  const openFolder = async (kind: "root" | "backups") => {
+    try {
+      await postJSON("/api/open", { kind })
+    } catch (error) {
+      toast(workspaceError(error, "打开目录失败"), "error")
+    }
+  }
+
+  const backupWorkspace = async () => {
+    setWorkspaceBusy("backup")
+    try {
+      const result = await postJSON<{ name: string; path: string; bytes: number }>(
+        "/api/workspace/backup",
+        { name: backupName.trim() },
+      )
+      setLastBackup(result.path)
+      toast(`已备份工作区：${result.name}`)
+      setBackupName("")
+    } catch (error) {
+      toast(workspaceError(error, "备份失败"), "error")
+    } finally {
+      setWorkspaceBusy("")
+    }
+  }
+
+  const clearWorkspace = async () => {
+    setWorkspaceBusy("clear")
+    try {
+      const result = await postJSON<{ removed: string[] }>("/api/workspace/clear", { confirm: true })
+      toast(`已清空工作区：移除 ${result.removed.length} 项 Boom 数据`)
+      setConfirmClear(false)
+      await refresh()
+    } catch (error) {
+      toast(workspaceError(error, "清空工作区失败"), "error")
+    } finally {
+      setWorkspaceBusy("")
+    }
+  }
+
   const consultCount = draft.consultModels.length
   const consultCountClass = consultCount === 0 ? "zero" : consultCount === 1 ? "warn" : "ok"
   const selectedEnv = envOptions.find((option) => option.value === envId)
@@ -375,6 +472,19 @@ export function SettingsDialog() {
             )}
           </div>
           <div className="field">
+            <div className="field-label"><span>产品模式</span></div>
+            <Segmented
+              name="product-mode"
+              value={draft.mode === "pentest" ? "pentest" : "ctf"}
+              onChange={(value) => set("mode", value as GuiSettings["mode"])}
+              options={[
+                { value: "ctf", label: "CTF 解题", desc: "默认解题流程" },
+                { value: "pentest", label: "渗透测试", desc: "授权渗透工作台" },
+              ]}
+            />
+            <p className="field-hint">切换只影响界面入口与后续渗透能力，CTF 解题链路在两种模式下完全一致。</p>
+          </div>
+          <div className="field">
             <div className="field-label"><span className="req">执行模式</span></div>
             <Segmented
               name="execution-mode"
@@ -453,9 +563,9 @@ export function SettingsDialog() {
           checked={draft.tokenBudgetEnabled}
           onChange={(checked) => set("tokenBudgetEnabled", checked)}
           title="启用 token 预算"
-          desc="关闭后不设 token 上限；每轮仍受分钟数、重复调用保护、无活动监测与输出上限约束。"
+          desc="默认关闭：任务不设累计 token/时间上限，并在正常让出或单轮卡死后自动续跑，直到拿到结果或你手动停止。单轮分钟数、重复调用、无活动监测与输出上限仍作为自愈 watchdog；此模式可能持续产生模型调用费用。"
         />
-        <div className="note">repeats 至少为 2；并发上限 32。预算设置只约束新开始的一轮。</div>
+        <div className="note">repeats 至少为 2；并发上限 32。启用 token 预算后，它是本次任务链的累计硬上限；设置只约束新开始的一轮。</div>
       </section>
 
       <section className={`modal-section${section === "flag" ? " active" : ""}`}>
@@ -470,6 +580,102 @@ export function SettingsDialog() {
             spellCheck={false}
           />
           <p className="field-hint">保存时校验正则合法性；非法正则不会被接受。</p>
+        </div>
+      </section>
+
+      <section className={`modal-section${section === "root" ? " active" : ""}`}>
+        <h3 style={{ marginTop: 0 }}>工作目录</h3>
+        <div className="field">
+          <div className="field-label">
+            <span className="req">默认工作目录</span>
+            <span className="tag">下次启动仍打开这里</span>
+          </div>
+          <div className="inline-row">
+            <input
+              className="input mono"
+              placeholder={data?.defaultRoot ?? "~/BoomProject"}
+              spellCheck={false}
+              value={rootDraft}
+              onChange={(event) => setRootDraft(event.target.value)}
+            />
+            <button type="button" className="btn" disabled={workspaceBusy !== ""} onClick={() => void pickRoot()}>
+              选择…
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={workspaceBusy !== "" || rootDraft.trim() === "" || rootDraft.trim() === data?.root}
+              onClick={() => void switchRoot(rootDraft)}
+            >
+              {workspaceBusy === "root" ? "切换中…" : "切换到此目录"}
+            </button>
+          </div>
+          <p className="field-hint">
+            题目（<code>challenges/</code>）、任务（<code>tasks/</code>）和全部运行产物都创建在这里；目录不存在时会自动建好。运行中的任务需要先停止才能切换。
+          </p>
+          <div className="inline-row">
+            <button
+              type="button"
+              className="btn btn-ghost"
+              disabled={workspaceBusy !== "" || !data?.defaultRoot}
+              onClick={() => void switchRoot(data?.defaultRoot ?? "")}
+            >
+              <RotateCcw size={14} /> 恢复默认（{data?.defaultRoot ?? "~/BoomProject"}）
+            </button>
+            <button type="button" className="btn btn-ghost" onClick={() => void openFolder("root")}>
+              <FolderOpen size={14} /> 打开工作目录
+            </button>
+          </div>
+        </div>
+
+        <div className="field">
+          <div className="field-label">
+            <span>备份工作区</span>
+            <span className="tag">tar.gz · 整个工作目录</span>
+          </div>
+          <div className="inline-row">
+            <input
+              className="input mono"
+              placeholder="留空则按「目录名-UTC 时间」命名"
+              spellCheck={false}
+              value={backupName}
+              onChange={(event) => setBackupName(event.target.value)}
+            />
+            <button type="button" className="btn" disabled={workspaceBusy !== ""} onClick={() => void backupWorkspace()}>
+              <Archive size={14} /> {workspaceBusy === "backup" ? "备份中…" : "开始备份"}
+            </button>
+            <button type="button" className="btn btn-ghost" onClick={() => void openFolder("backups")}>
+              打开备份目录
+            </button>
+          </div>
+          <p className="field-hint">
+            归档写到 Boom 数据目录的 <code>backups/</code>，不放在工作区里：清空工作区不会删掉它，下一次备份也不会把上一次装进去。
+          </p>
+          {lastBackup ? <p className="field-hint mono">{lastBackup}</p> : null}
+        </div>
+
+        <div className="field">
+          <div className="field-label">
+            <span>清空工作区</span>
+            <span className="tag">不可撤销</span>
+          </div>
+          <p className="field-hint">
+            删除 <code>challenges/</code>、<code>tasks/</code>、<code>eval/</code> 里的全部题目、任务记录与答案，再重建空的目录骨架；你自己的 writeup、字典等文件保持不动。建议先备份。
+          </p>
+          {confirmClear ? (
+            <div className="inline-row">
+              <button type="button" className="btn btn-danger" disabled={workspaceBusy !== ""} onClick={() => void clearWorkspace()}>
+                <Trash2 size={14} /> {workspaceBusy === "clear" ? "清空中…" : "确认清空（不可撤销）"}
+              </button>
+              <button type="button" className="btn btn-ghost" onClick={() => setConfirmClear(false)}>
+                取消
+              </button>
+            </div>
+          ) : (
+            <button type="button" className="btn btn-danger" disabled={workspaceBusy !== ""} onClick={() => setConfirmClear(true)}>
+              <Trash2 size={14} /> 清空工作区
+            </button>
+          )}
         </div>
       </section>
 

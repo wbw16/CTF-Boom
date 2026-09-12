@@ -1,5 +1,6 @@
 import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { TASKS_DIR } from "./task-layout.ts"
 
 export type Challenge = {
   slug: string
@@ -306,12 +307,12 @@ export async function resolveChallengeCatalog(root: string): Promise<ChallengeCa
 }
 
 /**
- * Create the directories a workspace root needs before Boom opens it: `runs/` always, plus the
+ * Create the directories a workspace root needs before Boom opens it: `tasks/` always, plus the
  * default `challenges/` catalog unless categories already live at the root — creating it there
  * would shadow the root layout on the next open.
  */
 export async function prepareWorkspaceRoot(root: string) {
-  await mkdir(path.join(root, "runs"), { recursive: true })
+  await mkdir(path.join(root, TASKS_DIR), { recursive: true })
   const catalog = await resolveChallengeCatalog(root)
   if (!catalog.atRoot) await mkdir(catalog.directory, { recursive: true })
 }

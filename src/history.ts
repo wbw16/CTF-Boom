@@ -11,6 +11,14 @@ import {
 } from "./session.ts"
 import { parseTaskRecord, taskTotals, type TaskStatus, type TaskTurn } from "./task.ts"
 import { loadTaskEnvironment, type TaskEnvironmentBinding } from "./environment.ts"
+import {
+  EVENTS_FILE,
+  LEGACY_RUNS_DIR,
+  RECORDS_DIR,
+  resolveEventsFile,
+  taskDirectory,
+  taskSlugRoot,
+} from "./task-layout.ts"
 
 export type RunFile = {
   path: string
@@ -301,7 +309,8 @@ function parseEventLines(raw: string, skipLeadingPartial: boolean) {
 }
 
 async function readEvents(directory: string) {
-  return parseEventLines((await readRunText(directory, path.join("work", "events.jsonl"))) ?? "", false)
+  const target = await resolveEventsFile(directory)
+  return parseEventLines((await readRunText(directory, path.relative(directory, target))) ?? "", false)
 }
 
 async function listFiles(directory: string, base = "", output: RunFile[] = []): Promise<RunFile[]> {
@@ -338,7 +347,7 @@ const EVENT_TAIL_BYTES = 262_144
 
 async function readEventTail(directory: string, tail: number): Promise<RunEvent[]> {
   if (!Number.isFinite(tail) || tail <= 0) return []
-  const target = path.join(directory, "work", "events.jsonl")
+  const target = await resolveEventsFile(directory)
   try {
     const info = await lstat(target)
     if (!info.isFile() || info.isSymbolicLink()) return []
@@ -372,6 +381,11 @@ const RUN_WATCHED_PATHS = [
   "task.json",
   "NOTES.md",
   "work",
+  "records",
+  "input",
+  // Legacy task directories: still watched so an unmigrated run refreshes correctly.
+  "challenge",
+  path.join("records", "events.jsonl"),
   path.join("work", "events.jsonl"),
   path.join("work", "WRITEUP.md"),
   path.join("work", "RESULT.json"),
@@ -604,13 +618,41 @@ function assembleRunHistory(runID: string, parts: RunDiskParts, files: RunFile[]
   }
 }
 
+/**
+ * Look up one task directory. New tasks live in `tasks/<slug>/<task-id>/`; the `runs/<slug>/<id>/`
+ * store of earlier versions stays readable so existing workspaces keep their history.
+ */
+export async function taskDirectoryFromRoot(root: string, slug: string, runID: string) {
+  const current = await assertPathWithin(root, taskDirectory(root, slug, runID), true)
+  const currentInfo = await lstat(current).catch(() => undefined)
+  if (currentInfo?.isDirectory() && !currentInfo.isSymbolicLink()) return current
+  const legacy = await assertPathWithin(root, path.join(root, LEGACY_RUNS_DIR, slug, runID), true)
+  const legacyInfo = await lstat(legacy).catch(() => undefined)
+  if (legacyInfo?.isDirectory() && !legacyInfo.isSymbolicLink()) return legacy
+  throw new Error(`No such task: ${slug}/${runID}`)
+}
+
+/** Every task directory of one slug, current tree first, legacy `runs/` store after it. */
+export async function listTaskDirectories(root: string, slug: string) {
+  const directories: string[] = []
+  for (const base of [taskSlugRoot(root, slug), path.join(root, LEGACY_RUNS_DIR, slug)]) {
+    const safe = await assertPathWithin(root, base, true)
+    const entries = await readdir(safe, { withFileTypes: true }).catch(() => [])
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue
+      directories.push(path.join(safe, entry.name))
+    }
+  }
+  return directories
+}
+
 export async function readRunHistory(
   root: string,
   slug: string,
   runID: string,
   options: ReadRunHistoryOptions = {},
 ): Promise<RunHistory> {
-  const directory = await assertPathWithin(root, path.join(root, "runs", slug, runID))
+  const directory = await taskDirectoryFromRoot(root, slug, runID)
   const cacheKey = `${directory}|events=${options.eventTail ?? "all"}`
   const parts = await loadRunParts(cacheKey, directory, options.eventTail)
   const files = options.files === false ? [] : await listFiles(directory)
@@ -622,14 +664,10 @@ export async function readChallengeRuns(
   slug: string,
   options: ReadRunHistoryOptions = {},
 ) {
-  const directory = path.join(root, "runs", slug)
-  const safe = await assertPathWithin(root, directory, true)
-  const entries = await readdir(safe, { withFileTypes: true }).catch(() => [])
   const runs: RunHistory[] = []
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    if (!entry.isDirectory() || entry.name.startsWith(".")) continue
+  for (const directory of await listTaskDirectories(root, slug)) {
     try {
-      runs.push(await readRunHistory(root, slug, entry.name, options))
+      runs.push(await readRunHistory(root, slug, path.basename(directory), options))
     } catch {
       // A symlink escape or unreadable directory is excluded instead of exposing it.
     }
@@ -643,15 +681,19 @@ export async function readChallengeRuns(
 
 export async function appendRunEvent(directory: string, event: RunEvent) {
   const safeDirectory = await canonicalDirectory(directory)
-  const work = path.join(safeDirectory, "work")
-  await mkdir(work).catch((error) => {
+  // The event trail is host-owned evidence, so it lives under `records/`, outside the agent's
+  // writable `work/` tree. Legacy directories keep appending to their existing log.
+  const records = path.join(safeDirectory, RECORDS_DIR)
+  await mkdir(records).catch((error) => {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
   })
-  const workInfo = await lstat(work)
-  if (!workInfo.isDirectory() || workInfo.isSymbolicLink())
-    throw new Error(`Run work path is not a real directory: ${work}`)
-  const safeWork = await assertPathWithin(safeDirectory, work)
-  const target = path.join(safeWork, "events.jsonl")
+  const recordsInfo = await lstat(records)
+  if (!recordsInfo.isDirectory() || recordsInfo.isSymbolicLink())
+    throw new Error(`Run records path is not a real directory: ${records}`)
+  const safeRecords = await assertPathWithin(safeDirectory, records)
+  const target = await resolveEventsFile(safeDirectory).then((resolved) =>
+    resolved.startsWith(`${safeRecords}${path.sep}`) ? resolved : path.join(safeRecords, EVENTS_FILE),
+  )
   const existing = await lstat(target).catch((error) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
     throw error
@@ -659,8 +701,8 @@ export async function appendRunEvent(directory: string, event: RunEvent) {
   if (existing && (!existing.isFile() || existing.isSymbolicLink()))
     throw new Error(`Run event log is not a real file: ${target}`)
 
-  // O_NOFOLLOW closes the check/open race for the final path component. A solving agent controls
-  // work/, so a normal appendFile() must never be allowed to follow an events.jsonl symlink.
+  // O_NOFOLLOW closes the check/open race for the final path component: a legacy log still lived
+  // inside the agent-writable `work/`, and the log is evidence either way.
   const handle = await open(
     target,
     constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW,

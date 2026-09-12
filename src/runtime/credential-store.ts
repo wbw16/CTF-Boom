@@ -1,6 +1,7 @@
 import { chmod, lstat, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { boomHomeDirectory } from "../boom-home.ts"
 
 export type StoredProviderCredential =
   | {
@@ -215,7 +216,7 @@ function mutate(operation: () => Promise<void>) {
 }
 
 export function credentialStorePath() {
-  const home = path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+  const home = boomHomeDirectory()
   return path.join(home, "credentials.json")
 }
 

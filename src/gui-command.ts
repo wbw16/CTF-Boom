@@ -4,7 +4,12 @@ import { startGuiServer } from "./gui.ts"
 export type GuiMode = "native" | "browser" | "headless"
 
 export type GuiCommandOptions = {
-  root: string
+  /**
+   * Explicit workspace root from `--root`. Absent means "reopen the remembered root" (or Boom's
+   * first-run default) — the launch directory is never treated as a workspace, because preparing
+   * one would create runs/ and challenges/ inside whatever folder Boom happened to start from.
+   */
+  root?: string
   port: number
   mode: GuiMode
   help: boolean
@@ -43,7 +48,7 @@ export function parseGuiArgs(
 ): GuiCommandOptions {
   const cwd = environment.cwd ?? process.cwd()
   const platform = environment.platform ?? process.platform
-  let root = cwd
+  let root: string | undefined
   let port = 0
   let explicitMode: GuiMode | undefined
   let help = false
@@ -79,7 +84,7 @@ export async function startGuiLifecycle(
   options: GuiCommandOptions,
   dependencies: {
     startServer?: (options: {
-      root: string
+      root?: string
       hostname: string
       port: number
       open: boolean
@@ -90,11 +95,11 @@ export async function startGuiLifecycle(
 ): Promise<GuiLifecycle> {
   const startServer = dependencies.startServer ?? startGuiServer
   const server = await startServer({
-    root: options.root,
     hostname: "127.0.0.1",
     port: options.port,
     open: options.mode === "browser",
     network: options.network,
+    ...(options.root !== undefined ? { root: options.root } : {}),
   })
   let client: NativeClientProcess | undefined
   let closePromise: Promise<void> | undefined

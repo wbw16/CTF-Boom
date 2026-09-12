@@ -221,6 +221,9 @@ final class BoomAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         case "pickDirectory":
             guard let requestID = body["id"] as? String else { return }
             presentDirectoryPanel(requestID: requestID, body: body)
+        case "pickFiles":
+            guard let requestID = body["id"] as? String else { return }
+            presentFilePanel(requestID: requestID, body: body)
         default:
             return
         }
@@ -260,11 +263,35 @@ final class BoomAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
+    /// Multi-select file panel, used to attach attachment files to a challenge.
+    private func presentFilePanel(requestID: String, body: [String: Any]) {
+        let panel = NSOpenPanel()
+        panel.title = body["title"] as? String ?? "选择文件"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = body["multiple"] as? Bool ?? true
+        panel.canCreateDirectories = false
+        if let initial = body["initial"] as? String, !initial.isEmpty {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: initial, isDirectory: &isDirectory), isDirectory.boolValue {
+                panel.directoryURL = URL(fileURLWithPath: initial)
+            }
+        }
+        panel.beginSheetModal(for: window) { [weak self] response in
+            let paths = response == .OK ? panel.urls.map { $0.path } : []
+            self?.finishPickerRequest(id: requestID, path: paths.first, paths: paths)
+        }
+    }
+
     private func finishDirectoryRequest(id: String, path: String?) {
-        let payload: [String: Any] = ["id": id, "path": path ?? NSNull()]
+        finishPickerRequest(id: id, path: path, paths: [])
+    }
+
+    private func finishPickerRequest(id: String, path: String?, paths: [String]) {
+        let payload: [String: Any] = ["id": id, "path": path ?? NSNull(), "paths": paths]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: data, encoding: .utf8) else { return }
-        webView.evaluateJavaScript("window.__boomNativeDirectoryResult(\(json))")
+        webView.evaluateJavaScript("window.__boomNativePickerResult(\(json))")
     }
 
     func webView(

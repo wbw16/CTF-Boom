@@ -134,6 +134,17 @@ test("never abandons a challenge that already holds a candidate", () => {
   expect(decision.action).toBe("continue")
 })
 
+test("does not apply match-only time budgets before the competition clock starts", () => {
+  expect(decideGiveUp({
+    challenge: challenge({ difficulty: "VERY_EASY" }),
+    settings: settings(),
+    activeMs: 10 * 60 * 60_000,
+    hasCandidate: false,
+    yieldsWithoutProgress: 9,
+    now: NOW,
+  })).toEqual({ action: "continue" })
+})
+
 test("gives up on a challenge that exhausted its time budget without a candidate", () => {
   const decision = decideGiveUp({
     challenge: challenge({ difficulty: "EASY" }),

@@ -36,7 +36,8 @@ async function fixture() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-autonomy-"))
   temporary.push(directory)
   await mkdir(path.join(directory, "work"))
-  await mkdir(path.join(directory, "challenge"))
+  await mkdir(path.join(directory, "records"))
+  await mkdir(path.join(directory, "input"))
   await writeFile(path.join(directory, "NOTES.md"), "# NOTES\n")
   return directory
 }
@@ -169,6 +170,49 @@ describe("M1.5 autonomy progress and escalation", () => {
     })
   })
 
+  test("keeps an unbounded task running after ordinary yields and a used L1 diagnosis", async () => {
+    const directory = await fixture()
+    const now = Date.parse("2026-08-03T00:00:00.000Z")
+    const state = await loadAutonomyState(directory, now)
+    state.automaticContinuationUsedAt = new Date(now).toISOString()
+    state.lastProgressAt = new Date(now).toISOString()
+    expect(decideAutonomy({
+      state,
+      outcome: outcome(),
+      activeSolveMs: 1_000,
+      cumulativeBillable: 100,
+      now,
+    })).toMatchObject({ action: "continue", reason: expect.stringContaining("run-until-complete") })
+
+    state.consecutiveNormalYieldsWithoutDurableProgress = 2
+    const escalation = await startEscalation({
+      directory,
+      fingerprint: state.progressEpoch,
+      level: 1,
+      reason: "test unbounded continuation",
+      now,
+    })
+    await finishEscalation({
+      directory,
+      id: escalation.id,
+      status: "completed",
+      tokens: 10,
+      billable: 10,
+      cost: 0,
+      now: now + 1,
+    })
+    const afterL1 = await loadAutonomyState(directory, now + 2)
+    afterL1.automaticContinuationUsedAt = new Date(now).toISOString()
+    afterL1.consecutiveNormalYieldsWithoutDurableProgress = 2
+    expect(decideAutonomy({
+      state: afterL1,
+      outcome: outcome(),
+      activeSolveMs: 20 * 60_000,
+      cumulativeBillable: 10_000,
+      now: now + 20 * 60_000,
+    })).toMatchObject({ action: "continue", reason: expect.stringContaining("run-until-complete") })
+  })
+
   test("records only hashed artifacts, durable ctf-note changes, and non-repeated successful tools", async () => {
     const directory = await fixture()
     const before = await captureProgressSnapshot(directory)
@@ -203,6 +247,46 @@ describe("M1.5 autonomy progress and escalation", () => {
       now: 4,
     })
     expect(second.events).toEqual([])
+  })
+
+  test("never counts the host's own event trail as durable solver progress", async () => {
+    const directory = await fixture()
+    const before = await captureProgressSnapshot(directory)
+    // The host appends audit events to `records/events.jsonl` on every turn. That file is evidence
+    // about the run, not progress inside it: counting it would keep the stall counter at zero and
+    // silently disable the two-yield escalation cadence.
+    await writeFile(path.join(directory, "records", "events.jsonl"), `${JSON.stringify({ at: 1, type: "status", status: "running" })}\n`)
+    await recordTurnProgress({
+      directory,
+      before,
+      outcome: outcome(),
+      events: [{ at: 1, type: "status", status: "running" }],
+      cumulativeBillable: 100,
+      now: 1_000,
+    })
+    const after = await captureProgressSnapshot(directory)
+    await markAutomaticContinuation(directory, 1_500)
+    await writeFile(path.join(directory, "records", "events.jsonl"), `${JSON.stringify({ at: 2, type: "status", status: "completed" })}\n`)
+    await recordTurnProgress({
+      directory,
+      before: after,
+      outcome: outcome(),
+      events: [{ at: 2, type: "status", status: "completed" }],
+      cumulativeBillable: 200,
+      now: 2_000,
+    })
+
+    const state = await loadAutonomyState(directory, 2_000)
+    expect(state.consecutiveNormalYieldsWithoutDurableProgress).toBe(2)
+    expect(state.meaningfulEvents).toEqual([])
+    expect(decideAutonomy({
+      state,
+      outcome: outcome(),
+      activeSolveMs: 2_000,
+      cumulativeBillable: 200,
+      challengeTokenBudget: 100_000,
+      now: 2_000,
+    })).toMatchObject({ action: "escalate", level: 1, early: true })
   })
 
   test("cools down a failed level for the same progress fingerprint", async () => {
@@ -273,7 +357,7 @@ describe("M1.5 autonomy progress and escalation", () => {
     const interpreter = Bun.which("python3")
     if (!interpreter) return
     const directory = await fixture()
-    await writeFile(path.join(directory, "challenge", "payload.txt"), "payload")
+    await writeFile(path.join(directory, "input", "payload.txt"), "payload")
     const profile = await probePythonEnvironment({ interpreter, displayName: "autonomy test Python" })
     await bindTaskEnvironment({ directory, profile, source: "task-override" })
     const calls: string[] = []
@@ -325,7 +409,7 @@ describe("M1.5 autonomy progress and escalation", () => {
     const workspace = { directory, runID: "task", extracted: [] }
     const challenge = {
       slug: "sample",
-      directory: path.join(directory, "challenge"),
+      directory: path.join(directory, "input"),
       description: "inspect payload",
       files: ["payload.txt"],
       flagFormat: "",

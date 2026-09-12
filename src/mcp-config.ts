@@ -2,6 +2,7 @@ import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import type { RuntimeMcpStatus } from "./runtime-contract.ts"
+import { boomHomeDirectory } from "./boom-home.ts"
 
 export const BOOM_MCP_AGENT_IDS = [
   "boom",
@@ -233,7 +234,7 @@ export function normalizeManagedMcpServer(value: unknown) {
 }
 
 export function mcpStorePath() {
-  const home = path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+  const home = boomHomeDirectory()
   return path.join(home, "mcp.json")
 }
 

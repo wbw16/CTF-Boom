@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "id": "boom-flag-hunt",
+  "mode": "primary",
+  "role": "pentester",
+  "description": "Boom's primary Flag-acquisition agent: solve shared prerequisites, submit candidates immediately, and parallelize only independent remaining paths.",
+  "color": "#F59E0B",
+  "temperature": 0.3,
+  "toolProfile": "pentest-flag-hunt",
+  "output": "freeform"
+}

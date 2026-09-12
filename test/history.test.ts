@@ -8,7 +8,7 @@ import { appendRunEvent, assertPathWithin, readChallengeRuns, readRunHistory } f
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "boom-history-"))
   const makeRun = async (slug: string, id: string) => {
-    const directory = path.join(root, "runs", slug, id)
+    const directory = path.join(root, "tasks", slug, id)
     await mkdir(path.join(directory, "work"), { recursive: true })
     return directory
   }
@@ -311,12 +311,21 @@ describe("history path boundary", () => {
     try {
       const directory = await makeRun("events", "20260729T012200Z-test")
       await writeFile(outside, "unchanged")
-      await symlink(outside, path.join(directory, "work", "events.jsonl"))
+      await mkdir(path.join(directory, "records"), { recursive: true })
+      await symlink(outside, path.join(directory, "records", "events.jsonl"))
 
       await expect(
         appendRunEvent(directory, { at: 1, type: "status", status: "running" }),
       ).rejects.toThrow("not a real file")
       expect(await Bun.file(outside).text()).toBe("unchanged")
+
+      // A symlinked legacy `work/events.jsonl` is never followed either: the trail moves to the
+      // host-owned `records/` file instead of writing through the link.
+      const legacy = await makeRun("legacy-events", "20260729T012300Z-test")
+      await symlink(outside, path.join(legacy, "work", "events.jsonl"))
+      await appendRunEvent(legacy, { at: 2, type: "status", status: "running" })
+      expect(await Bun.file(outside).text()).toBe("unchanged")
+      expect(await Bun.file(path.join(legacy, "records", "events.jsonl")).text()).toContain('"at":2')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

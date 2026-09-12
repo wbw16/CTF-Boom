@@ -7,7 +7,7 @@ export type BoomPolicyDecision = {
   reason: string
 }
 
-export type TaskPathZone = "challenge" | "work" | "task"
+export type TaskPathZone = "input" | "work" | "task"
 
 export type ResolvedTaskPath = {
   root: string
@@ -143,7 +143,10 @@ export async function resolveTaskPath(
 
   const relative = segments.join("/") || "."
   const first = segments[0]
-  const zone: TaskPathZone = first === "challenge" ? "challenge" : first === "work" ? "work" : "task"
+  // `challenge/` is the pre-rename name of the read-only input zone; task directories written by
+  // earlier Boom versions keep working until they are migrated.
+  const zone: TaskPathZone =
+    first === "input" || first === "challenge" ? "input" : first === "work" ? "work" : "task"
   if (access === "write") {
     if (zone !== "work" || segments.length < 2)
       throw new Error(`Boom policy denied write outside work/: ${requested}`)
@@ -153,8 +156,16 @@ export async function resolveTaskPath(
       throw new Error(`Boom policy denied write to host-owned task state: ${requested}`)
   }
   if (access === "read") {
-    if (zone === "work" && segments.length >= 2 && (segments[1] === ".boom" || relative === "work/RESULT.json"))
-      throw new Error(`Boom policy denied read of host-owned task state: ${requested}`)
+    // Agent-visible command logs are deliberately readable: the bash/boom-exec result already
+    // points at `work/.boom/commands/<id>.log`, and a model that cannot open the path it was handed
+    // either repeats the command or gives up. Host-owned metadata (the events ledger, blockers)
+    // stays closed, and writes below remain refused for the whole subtree.
+    if (zone === "work" && segments.length >= 2 && (segments[1] === ".boom" || relative === "work/RESULT.json")) {
+      const commandLog = segments.length === 4 && segments[1] === ".boom" && segments[2] === "commands" &&
+        segments[3]!.endsWith(".log")
+      if (!commandLog)
+        throw new Error(`Boom policy denied read of host-owned task state: ${requested}`)
+    }
   }
   return { root, absolute, relative, zone }
 }

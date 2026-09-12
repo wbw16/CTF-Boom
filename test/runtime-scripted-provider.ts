@@ -66,6 +66,9 @@ function delay(milliseconds: number, signal: AbortSignal) {
 export class ScriptedProvider {
   readonly requests: ScriptedProviderRequest[] = []
   readonly abortedRequests: number[] = []
+  /** Highest number of completion response streams consumed at the same time. */
+  maxConcurrentRequests = 0
+  #concurrentRequests = 0
   #turns: ScriptedProviderTurn[]
   #server: ReturnType<typeof Bun.serve>
 
@@ -129,6 +132,14 @@ export class ScriptedProvider {
     }
 
     const requestIndex = this.requests.length - 1
+    this.#concurrentRequests += 1
+    this.maxConcurrentRequests = Math.max(this.maxConcurrentRequests, this.#concurrentRequests)
+    let finished = false
+    const finishRequest = () => {
+      if (finished) return
+      finished = true
+      this.#concurrentRequests = Math.max(0, this.#concurrentRequests - 1)
+    }
     request.signal.addEventListener("abort", () => this.abortedRequests.push(requestIndex), { once: true })
     const encoder = new TextEncoder()
     const id = `chatcmpl-script-${requestIndex + 1}`
@@ -221,9 +232,14 @@ export class ScriptedProvider {
           controller.close()
         } catch (error) {
           controller.error(error)
+        } finally {
+          finishRequest()
         }
       },
-      cancel: () => { this.abortedRequests.push(requestIndex) },
+      cancel: () => {
+        this.abortedRequests.push(requestIndex)
+        finishRequest()
+      },
     })
     return new Response(stream, {
       headers: {

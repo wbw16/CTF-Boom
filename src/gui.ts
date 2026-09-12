@@ -1,4 +1,4 @@
-import { chmod, copyFile, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { chmod, copyFile, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { randomBytes, timingSafeEqual } from "node:crypto"
 import os from "node:os"
@@ -12,7 +12,18 @@ import {
   type Challenge,
 } from "./challenge.ts"
 import {
+  addChallengeAttachments,
+  createChallengeInCatalog,
+  readAnswer,
+  removeChallengeAttachment,
+  updateChallengeInCatalog,
+} from "./challenge-store.ts"
+import { boomBackupsDirectory } from "./boom-home.ts"
+import {
+  boomHomeDirectory,
+  loadLastGuiRoot,
   loadRootGuiState,
+  saveLastGuiRoot,
   saveRootGuiState,
   type GuiSettings,
   type RootGuiState,
@@ -27,8 +38,10 @@ import {
   assertPathWithin,
   canonicalDirectory,
   readChallengeRuns,
+  taskDirectoryFromRoot,
   type RunHistory,
 } from "./history.ts"
+import { LEGACY_ENGAGEMENTS_DIR, legacyRunsRoot, TASKS_DIR, taskSlugRoot, tasksRoot } from "./task-layout.ts"
 import { GuiRunner, type RunnerNotification } from "./runner.ts"
 import { DEFAULT_SILENCE_MS } from "./session.ts"
 import { CONSULT_EXPERTS } from "./consultation.ts"
@@ -53,6 +66,30 @@ import {
   platformAdapterSummaries,
 } from "./platform/registry.ts"
 import { normalizeCompetitionSettings } from "./competition/policy.ts"
+import {
+  addAsset,
+  addEvidence,
+  addFinding,
+  confirmFlagSubmission,
+  addObservation,
+  confirmFinding,
+  createEngagement,
+  deleteEngagement,
+  listEngagements,
+  listToolRuns,
+  loadEngagement,
+  rejectFinding,
+  rejectFlagSubmission,
+  updateEngagement,
+  type PentestEngagementInput,
+  type PentestToolRun,
+} from "./pentest/store.ts"
+import { PentestToolJobManager, pentestToolInstalled } from "./pentest/tool-jobs.ts"
+import { PentestAgentManager, type PentestActivityEntry } from "./pentest/agent.ts"
+import { parseAgentRunState } from "./pentest/model.ts"
+import { probePentestTools } from "./pentest/environment.ts"
+import { findPentestPreset, findPentestTool, PENTEST_TOOLS } from "./pentest/presets.ts"
+import { normalizeNmapRun } from "./pentest/adapters/nmap.ts"
 import { registerBoomControlPlaneOrigin } from "./runtime.ts"
 
 const PACKAGE_ROOT = path.resolve(import.meta.dir, "..")
@@ -106,7 +143,8 @@ export type GuiRunnerBackend = Pick<
 }
 
 export type StartGuiOptions = {
-  root: string
+  /** Explicit workspace root; absent reopens the remembered root or Boom's first-run default. */
+  root?: string
   hostname?: string
   port?: number
   open?: boolean
@@ -160,8 +198,19 @@ function positive(value: unknown, name: string, minimum = 1) {
   return value
 }
 
+/** Optional free-text field from a request body: absent, null, and "" all mean "not provided". */
+function optionalText(value: unknown, field: string) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== "string") throw new HttpError(400, `${field} must be a string`)
+  const trimmed = value.trim()
+  if (trimmed.length > 20_000) throw new HttpError(400, `${field} is too long`)
+  return trimmed === "" ? undefined : trimmed
+}
+
 function serviceRemote(value: unknown) {
-  if (value === null) return undefined
+  // Absent (create, or a PATCH that does not mention the field) and explicit null (clear) both
+  // mean "no endpoint"; only a non-string, non-null value is a caller mistake.
+  if (value === null || value === undefined) return undefined
   if (typeof value !== "string") throw new HttpError(400, "remote must be a string or null")
   const remote = value.trim()
   if (remote === "") return undefined
@@ -240,6 +289,13 @@ function settingsFrom(input: Record<string, unknown>, fallback: GuiSettings): Gu
       ? input.tokenBudgetEnabled
       : fallback.tokenBudgetEnabled
   const network = input.network === "deny" ? "deny" : "allow"
+  // An explicit mode always wins so the top-bar switch can move in both directions; the fallback
+  // only fills in roots whose saved state predates the mode axis.
+  const mode = input.mode === "pentest" || input.mode === "ctf"
+    ? input.mode
+    : fallback.mode === "pentest"
+      ? "pentest"
+      : "ctf"
   // Local concurrency is a normal runtime setting. Keep the competition admission mirror aligned
   // with it so this specialized panel never creates a second, conflicting local-concurrency knob.
   const competition = {
@@ -247,6 +303,7 @@ function settingsFrom(input: Record<string, unknown>, fallback: GuiSettings): Gu
     localSlots: concurrency,
   }
   return {
+    mode,
     economyModel,
     strongModel,
     visionModel,
@@ -289,6 +346,36 @@ async function staticWebAsset(pathname: string) {
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     },
+  })
+}
+
+/**
+ * Keep the local host alive when a streaming client drops a rejection on the floor.
+ *
+ * Aborting a runtime turn is a normal operation (pause, stop, budget), but the OpenCode SDK's
+ * event-stream reader cancels its body with a bare `void reader.cancel()`. That cancel rejects as
+ * soon as the same abort has already errored the stream, so the rejection belongs to nobody. Bun's
+ * default is to exit the process on an unhandled rejection, which used to kill the whole GUI inside
+ * the pause request that caused the abort: the browser reported a bare connection failure
+ * ("Load failed"), the engagement stayed on "pausing" with no live run to finish it, and the
+ * runtime child was left orphaned.
+ *
+ * A request-serving host must outlive a dependency's dropped rejection, so it logs every one
+ * loudly instead of dying; genuine bugs stay visible in the host log. Installation is idempotent
+ * because one process may host several server instances over its lifetime.
+ */
+const REJECTION_GUARD = Symbol.for("boom.gui.rejectionGuard")
+
+export function guardUnhandledRejections(
+  emitter: { on: (event: string, listener: (reason: unknown, promise: unknown) => void) => unknown } = process,
+  report: (message: string) => void = (message) => console.error(message),
+) {
+  const target = emitter as { [REJECTION_GUARD]?: boolean }
+  if (target[REJECTION_GUARD]) return
+  target[REJECTION_GUARD] = true
+  emitter.on("unhandledRejection", (reason) => {
+    const detail = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)
+    report(`Boom GUI 忽略了未处理的 Promise 拒绝并继续运行：\n${detail}`)
   })
 }
 
@@ -397,8 +484,116 @@ async function openExternal(target: string) {
       : process.platform === "win32"
         ? ["cmd", "/c", "start", "", target]
         : ["xdg-open", target]
-  const processHandle = Bun.spawn(command, { stdin: "ignore", stdout: "ignore", stderr: "ignore" })
+  const processHandle = Bun.spawn(command, {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+    // Spread at call time: Bun snapshots the parent environment at startup, so a child spawned
+    // without an explicit env would miss PATH edits made after Boom started.
+    env: { ...process.env } as Record<string, string>,
+  })
   void processHandle.exited
+}
+
+/**
+ * One workspace archive name: a plain file name, so a typed name can never walk out of the backup
+ * directory. Dots are fine in the middle; a leading one would hide the file, and `..` is refused.
+ */
+function validBackupName(name: string) {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) && !name.includes("..")
+}
+
+/** Readable default name: the workspace folder plus the UTC stamp runs already use. */
+function defaultBackupName(root: string) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")
+  const label = path.basename(path.resolve(root)).replace(/[^A-Za-z0-9._-]/g, "-") || "workspace"
+  return `${label}-${stamp}`
+}
+
+/**
+ * Archive one whole workspace as `$BOOM_HOME/backups/<name>.tar.gz`.
+ *
+ * The backup lives outside the workspace so it survives the "clear workspace" it exists to precede,
+ * and so a later backup never contains an earlier one. A failed or hung `tar` removes its partial
+ * file: a half-written archive that looks complete is worse than no archive.
+ */
+async function createWorkspaceBackup(root: string, name: string) {
+  const directory = boomBackupsDirectory()
+  await mkdir(directory, { recursive: true })
+  const target = path.join(directory, `${name}.tar.gz`)
+  if (await lstat(target).catch(() => undefined)) throw new HttpError(409, "Backup already exists")
+  let child: Bun.Subprocess<"ignore", "ignore", "pipe">
+  try {
+    child = Bun.spawn(["tar", "-czf", target, "-C", root, "."], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+      env: { ...process.env } as Record<string, string>,
+    })
+  } catch {
+    throw new HttpError(500, "Cannot run tar; install it or back the workspace up manually")
+  }
+  const exit = await Promise.race([
+    child.exited,
+    new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), BACKUP_TIMEOUT_MS).unref?.()),
+  ])
+  if (exit === undefined) {
+    child.kill("SIGTERM")
+    await rm(target, { force: true }).catch(() => {})
+    throw new HttpError(500, `Backup timed out after ${Math.round(BACKUP_TIMEOUT_MS / 60_000)} minutes`)
+  }
+  if (exit !== 0) {
+    const detail = await new Response(child.stderr).text().catch(() => "")
+    await rm(target, { force: true }).catch(() => {})
+    throw new HttpError(500, `Backup failed: ${detail.trim() || `tar exited ${exit}`}`)
+  }
+  return { path: target, bytes: (await stat(target)).size }
+}
+
+/** How long one workspace archive may take before Boom kills it and drops the partial file. */
+const BACKUP_TIMEOUT_MS = 30 * 60_000
+
+/** Boom-owned data under a workspace root: the challenge catalog, task trees, and answers. */
+async function workspaceDataTargets(root: string) {
+  const targets = new Set<string>([
+    path.join(root, "challenges"),
+    tasksRoot(root),
+    legacyRunsRoot(root),
+    path.join(root, LEGACY_ENGAGEMENTS_DIR),
+    path.join(root, "eval"),
+  ])
+  // A traditional catalog keeps category folders (WEB/, PWN/, MISC/) directly in the root. Only the
+  // challenge directories inside them are Boom's; the category folder itself may hold other work.
+  const catalog = await resolveChallengeCatalog(root)
+  if (catalog.atRoot) {
+    for (const challenge of await discoverChallenges(root).catch(() => []))
+      targets.add(challenge.sourceDirectory ?? challenge.directory)
+  }
+  return [...targets]
+}
+
+/**
+ * Delete Boom's data from one workspace and rebuild the empty skeleton.
+ *
+ * Operator files that Boom does not own — a writeup, a wordlist, an unrelated folder — are left
+ * where they are: "clear" means "start this workspace over", not "delete whatever is in this folder".
+ */
+async function clearWorkspaceData(root: string) {
+  const removed: string[] = []
+  for (const target of await workspaceDataTargets(root)) {
+    let safe: string
+    try {
+      safe = await assertPathWithin(root, target, true)
+    } catch {
+      continue
+    }
+    const info = await lstat(safe).catch(() => undefined)
+    if (!info) continue
+    await rm(safe, { recursive: true, force: true })
+    removed.push(path.relative(root, safe) || ".")
+  }
+  await prepareWorkspaceRoot(root)
+  return removed
 }
 
 async function copyTree(source: string, destination: string): Promise<void> {
@@ -441,6 +636,14 @@ async function removeTree(root: string, target: string) {
 }
 
 /**
+ * Every store that may hold tasks of one slug: the current `tasks/<slug>/` tree plus the legacy
+ * `runs/<slug>/` store. Callers that delete or inspect all of a challenge's tasks use both.
+ */
+function slugStores(root: string, slug: string) {
+  return [taskSlugRoot(root, slug), path.join(legacyRunsRoot(root), slug)]
+}
+
+/**
  * Opening Boom is intentionally stationary. A saved "running" bit from an earlier process must
  * never synchronize or solve before the operator presses the main "开始比赛" button.
  */
@@ -462,7 +665,7 @@ const GUI_COOKIE = "boom_gui"
 
 /** Directory holding gui-state.json; the GUI token lives beside it under the same BOOM_HOME rule. */
 function boomStateHome() {
-  return path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+  return boomHomeDirectory()
 }
 
 /**
@@ -541,13 +744,74 @@ async function resolveWorkspaceRoot(directory: string) {
 }
 
 /**
+ * The default project folder: `~/BoomProject`, the visible, user-owned home of every task.
+ *
+ * It replaces the hidden `$BOOM_HOME/workspace` of earlier versions, where an operator could not
+ * find, back up, or share their own work. `home` is injectable so tests never touch a real user's
+ * home directory. Exported for tests; the GUI is the only caller.
+ */
+export function defaultProjectRoot(home = os.homedir()) {
+  return path.join(home, "BoomProject")
+}
+
+/** The pre-`~/BoomProject` default, still recognized so its data is never abandoned silently. */
+async function isLegacyDefaultRoot(directory: string) {
+  return path.resolve(directory) === path.join(boomHomeDirectory(), "workspace")
+}
+
+/** True when a workspace root already holds tasks or a challenge catalog worth keeping. */
+async function holdsProjectData(directory: string) {
+  for (const name of [TASKS_DIR, "runs", "engagements", "challenges"]) {
+    const entries = await readdir(path.join(directory, name)).catch(() => [])
+    if (entries.length > 0) return true
+  }
+  return false
+}
+
+/**
+ * Pick the workspace root the GUI opens on: an explicit `--root`, else the root remembered from the
+ * last session, else `~/BoomProject`. The launch directory is deliberately never the fallback —
+ * preparing a workspace there would create `tasks/` and `challenges/` inside whatever folder Boom
+ * happened to start from, in both CTF and pentest mode.
+ */
+export async function resolveInitialWorkspaceRoot(
+  requested: string | undefined,
+  options: { home?: string } = {},
+) {
+  if (requested !== undefined && requested.trim() !== "") {
+    const root = await resolveWorkspaceRoot(path.resolve(requested))
+    await saveLastGuiRoot(root)
+    return root
+  }
+  const remembered = await loadLastGuiRoot()
+  if (remembered !== undefined) {
+    // A remembered root that vanished (unmounted volume, deleted folder) falls through to the
+    // default; existence is checked before preparation, which would otherwise resurrect it as an
+    // empty scaffold. Re-preparing keeps tasks/ and challenges/ present even after manual cleanup.
+    const info = await lstat(remembered).catch(() => undefined)
+    if (info?.isDirectory() && !info.isSymbolicLink()) {
+      // The legacy hidden default is upgraded only when it holds nothing: a user who already solved
+      // tasks there keeps them, everyone else lands in the visible `~/BoomProject`.
+      if (!(await isLegacyDefaultRoot(remembered)) || await holdsProjectData(remembered)) {
+        await prepareWorkspaceRoot(remembered)
+        return canonicalDirectory(remembered)
+      }
+    }
+  }
+  const root = await resolveWorkspaceRoot(defaultProjectRoot(options.home))
+  await saveLastGuiRoot(root)
+  return root
+}
+
+/**
  * Storage whose contents originate from challenges or agents: run workspaces plus every challenge
  * directory. Interpreters inside them are rejected no matter how the path is spelled.
  */
 async function workspaceTaskStorageRoots(workspace: string) {
   const found = await discoverChallenges(workspace)
   return [
-    path.join(workspace, "runs"),
+    tasksRoot(workspace),
+    legacyRunsRoot(workspace),
     ...found.map((item) => item.sourceDirectory ?? item.directory),
   ]
 }
@@ -557,7 +821,9 @@ export async function startGuiServer(options: StartGuiOptions) {
     throw new Error("Boom GUI 前端尚未构建；请先运行 bun run build:web")
   const hostname = options.hostname ?? "127.0.0.1"
   if (!LOOPBACK.has(hostname)) throw new Error(`Boom GUI only listens on loopback, got: ${hostname}`)
-  let root = await resolveWorkspaceRoot(options.root)
+  // Installed before the first request so an aborted turn can never take the host down mid-response.
+  guardUnhandledRejections()
+  let root = await resolveInitialWorkspaceRoot(options.root)
   const loaded = await loadRootGuiState(root)
   let persisted = stationaryRootState(loaded)
   // Persisted settings win at startup; the CLI flag only seeds a root with no saved state yet.
@@ -594,6 +860,45 @@ export async function startGuiServer(options: StartGuiOptions) {
   }
   const unsubscribe = runner.subscribe(broadcast)
 
+  /**
+   * Host-managed penetration tool runs. Completion of a parseable run (nmap XML) triggers
+   * normalization into the engagement's assets/observations and re-broadcasts, so the GUI and
+   * later the agent see structured results without re-reading raw logs.
+   */
+  const pentestToolRunEvent = (slug: string, run: PentestToolRun) => {
+    broadcast({ at: Date.now(), type: "pentest.toolrun.changed", engagement: slug, runId: run.id, status: run.status })
+    if (run.status === "done" && run.parsed === undefined && findPentestTool(run.tool)?.parses === "nmap-xml") {
+      void normalizeNmapRun(root, slug, run)
+        .then((updated) => pentestToolRunEvent(slug, updated))
+        .catch(() => {})
+    }
+  }
+  const pentestJobs = new PentestToolJobManager({
+    onEvent: (event) => pentestToolRunEvent(event.slug, event.run),
+  })
+  // Runs left "running" by a previous process are reaped as orphaned, not silently resumed.
+  void pentestJobs.reapOrphans(root).catch(() => {})
+
+  /**
+   * Agent-driven engagement runs. The manager shares the GUI runner's runtime (one OpenCode child)
+   * and the strong model from settings; every phase change is broadcast so the workspace follows
+   * the run live. The root getter keeps a root switch from stranding a run on the old workspace.
+   *
+   * The optional consumption ceiling reuses the existing budget setting: when it is enabled, each
+   * turn hands the runtime what is left of this manual run's allowance, and exhaustion lands on a
+   * resumable pause instead of a failure. No second billing or budget system is introduced.
+   */
+  const pentestAgents = new PentestAgentManager({
+    root: () => root,
+    ensureRuntime: () => runner.ensureRuntime(),
+    model: () => persisted.settings.strongModel,
+    tokenBudget: () => (persisted.settings.tokenBudgetEnabled ? persisted.settings.tokens : undefined),
+    onEvent: (slug) => {
+      broadcast({ at: Date.now(), type: "pentest.agent.changed", engagement: slug })
+    },
+  })
+  void pentestAgents.reapOrphans().catch(() => {})
+
   const challenges = async () => discoverChallenges(root)
   const challenge = async (slug: string) => {
     const found = (await challenges()).find((item) => item.slug === slug)
@@ -612,6 +917,8 @@ export async function startGuiServer(options: StartGuiOptions) {
       instanceID,
       sequence: snapshotSequence,
       root: stateRoot,
+      // The folder Boom opens on a first launch, so the workbench can name it and offer to return.
+      defaultRoot: defaultProjectRoot(),
       settings: statePersisted.settings,
       models,
       runtime: runner.getRuntimeState(),
@@ -732,7 +1039,7 @@ export async function startGuiServer(options: StartGuiOptions) {
           blindReview: settings.blindReview,
           consultOnCompaction: settings.consultOnCompaction,
           limits: {
-            tokens: settings.tokens,
+            ...(settings.tokenBudgetEnabled ? { tokens: settings.tokens } : {}),
             repeats: settings.repeats,
             timeout: settings.minutes * 60_000,
             silenceMs: DEFAULT_SILENCE_MS,
@@ -912,11 +1219,18 @@ export async function startGuiServer(options: StartGuiOptions) {
             const nextLoaded = await loadRootGuiState(next)
             const nextPersisted = stationaryRootState(nextLoaded)
             autopilot.stop()
+            await pentestJobs.stopAll()
+            await pentestAgents.stopAll()
             runner.setRoot(next)
             runner.setConcurrency(nextPersisted.settings.concurrency)
             runner.setCompetitionSettings?.(nextPersisted.settings.competition)
             root = next
             persisted = nextPersisted
+            // The operator just chose this folder; the next launch should reopen it, not the
+            // previous one (and never the directory Boom happened to be started from).
+            await saveLastGuiRoot(next)
+            await pentestJobs.reapOrphans(root).catch(() => {})
+            await pentestAgents.reapOrphans().catch(() => {})
             await runner.applyLiveModelSettings(nextPersisted.settings)
             broadcast({ at: Date.now(), type: "root.changed" })
             return json(await state())
@@ -943,6 +1257,38 @@ export async function startGuiServer(options: StartGuiOptions) {
             const switches = await runner.applyLiveModelSettings(settings)
             broadcast({ at: Date.now(), type: "settings.changed" })
             return json({ settings, switches })
+          })
+        }
+
+        // Workspace maintenance: one archive of everything, and starting the workspace over.
+        if (request.method === "POST" && url.pathname === "/api/workspace/backup") {
+          const input = await body(request)
+          return await exclusive(async () => {
+            if (runner.hasWork()) throw new HttpError(409, "Stop active runs before backing up the workspace")
+            const requested = typeof input.name === "string" ? input.name.trim() : ""
+            if (requested !== "" && !validBackupName(requested))
+              throw new HttpError(400, "Invalid backup name")
+            const name = requested === "" ? defaultBackupName(root) : requested
+            const backup = await createWorkspaceBackup(root, name)
+            return json({ name, path: backup.path, bytes: backup.bytes })
+          })
+        }
+
+        if (request.method === "POST" && url.pathname === "/api/workspace/clear") {
+          const input = await body(request)
+          return await exclusive(async () => {
+            if (input.confirm !== true) throw new HttpError(400, "Clearing the workspace requires confirm: true")
+            if (runner.hasWork()) throw new HttpError(409, "Stop active runs before clearing the workspace")
+            autopilot.stop()
+            await pentestJobs.stopAll()
+            await pentestAgents.stopAll()
+            const removed = await clearWorkspaceData(root)
+            // Confirmations and per-challenge state point at task trees that no longer exist.
+            const nextPersisted: RootGuiState = { ...persisted, challenges: {} }
+            await saveRootGuiState(root, nextPersisted)
+            persisted = nextPersisted
+            broadcast({ at: Date.now(), type: "root.changed" })
+            return json({ ok: true, root, removed })
           })
         }
 
@@ -1063,6 +1409,413 @@ export async function startGuiServer(options: StartGuiOptions) {
 
         // Competition platform routes. The `:id` segment resolves through the adapter registry,
         // so one route set serves every built-in platform integration.
+        // ---- Penetration mode: engagements, host-managed tool runs, and the record gates ----
+        const pentestError = (error: unknown): HttpError =>
+          error instanceof HttpError ? error : new HttpError(400, error instanceof Error ? error.message : String(error))
+        const stringOrUndefined = (value: unknown) => (typeof value === "string" && value.trim() !== "" ? value : undefined)
+
+        if (request.method === "GET" && url.pathname === "/api/pentest/tools") {
+          const hostTools = await probePentestTools().catch(() => [])
+          return json({
+            tools: PENTEST_TOOLS.map((tool) => ({
+              name: tool.name,
+              displayName: tool.displayName,
+              parses: tool.parses,
+              unattended: tool.unattended,
+              ...(tool.note ? { note: tool.note } : {}),
+              installed: pentestToolInstalled(tool.name),
+              presets: tool.presets.map((preset) => ({
+                id: preset.id,
+                title: preset.title,
+                description: preset.description,
+              })),
+            })),
+            host: hostTools,
+          })
+        }
+
+        if (request.method === "GET" && url.pathname === "/api/pentest/engagements")
+          return json({ engagements: await listEngagements(root) })
+
+        if (request.method === "POST" && url.pathname === "/api/pentest/engagements") {
+          const input = await body(request)
+          return await exclusive(async () => {
+            // Minimal creation contract: one target, an authorization confirmation, and optional
+            // free-form notes. The objective and the authorization record have defaults so the
+            // operator never writes formatted declarations (docs/PENTEST_REWORK.md §4.1).
+            const authorized = input.authorized === true
+            const target = typeof input.target === "string" ? input.target : ""
+            const notes = typeof input.notes === "string" && input.notes.trim() !== "" ? input.notes.trim() : undefined
+            const scope = Array.isArray(input.scope)
+              ? input.scope.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "")
+              : []
+            const mode = input.mode === "flag-hunt" ? "flag-hunt" : "assessment"
+            const flags = Array.isArray(input.flags)
+              ? input.flags.flatMap((item) => {
+                if (!item || typeof item !== "object" || Array.isArray(item)) return []
+                const flag = item as Record<string, unknown>
+                const label = typeof flag.label === "string" ? flag.label.trim() : ""
+                if (!label) return []
+                return [{ label, ...(typeof flag.hint === "string" && flag.hint.trim() ? { hint: flag.hint.trim() } : {}) }]
+              })
+              : []
+            const engagementInput: PentestEngagementInput = {
+              target,
+              objective:
+                typeof input.objective === "string" && input.objective.trim() !== ""
+                  ? input.objective
+                  : mode === "flag-hunt" ? "获取已声明的 Flag 并保留可验证证据" : "对目标进行授权安全测试",
+              authorization:
+                typeof input.authorization === "string" && input.authorization.trim() !== ""
+                  ? input.authorization
+                  : authorized
+                    ? `创建时勾选授权确认 · ${new Date().toISOString()}`
+                    : "",
+              // The default scope is the target itself; extra entries only via advanced scope.
+              scope: scope.length > 0 ? scope : [target],
+              // The operator's notes are a fixed constraint: every turn re-states them, and no
+              // newer observation can push them out (docs/PENTEST_AUTONOMY.md §3.3).
+              ...(notes !== undefined ? { userNotes: notes } : {}),
+              mode,
+              flags,
+            }
+            try {
+              if (!authorized) throw new HttpError(400, "必须勾选「我确认已获得该目标的测试授权」后才能创建任务")
+              const engagement = await createEngagement(root, engagementInput)
+              if (notes !== undefined)
+                await addObservation(root, engagement.slug, {
+                  kind: "info",
+                  target: engagement.target,
+                  detail: `用户补充说明：${notes}`,
+                })
+              broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: engagement.slug })
+              return json({ engagement })
+            } catch (error) {
+              throw pentestError(error)
+            }
+          })
+        }
+
+        const pentestEngagementRoute = /^\/api\/pentest\/engagements\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname)
+        if (pentestEngagementRoute) {
+          const slug = pentestEngagementRoute[1]
+          const rest = pentestEngagementRoute[2] ?? ""
+          const requireEngagement = async () => {
+            try {
+              return await loadEngagement(root, slug)
+            } catch {
+              throw new HttpError(404, `没有这个渗透任务: ${slug}`)
+            }
+          }
+          const requireActiveEngagement = async () => {
+            const engagement = await requireEngagement()
+            if (engagement.status !== "active")
+              throw new HttpError(409, engagement.status === "archived" ? "任务已归档，只读" : "任务已放弃；恢复后才能修改")
+            return engagement
+          }
+
+          if (request.method === "GET" && rest === "") {
+            const loaded = await requireEngagement()
+            const run = parseAgentRunState(loaded.run)
+            const activity = await pentestAgents.activityTail(slug).catch(() => [] as PentestActivityEntry[])
+            const liveText = pentestAgents.liveText(slug)
+            return json({
+              engagement: loaded,
+              toolRuns: await listToolRuns(root, slug),
+              agent: {
+                ...run,
+                live: pentestAgents.isLive(slug),
+                activity,
+                ...(liveText !== "" ? { liveText } : {}),
+              },
+            })
+          }
+
+          if (request.method === "POST" && rest === "/agent/start") {
+            return await exclusive(async () => {
+              await requireActiveEngagement()
+              try {
+                await pentestAgents.start(slug)
+                return json({ started: true })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+
+          if (request.method === "POST" && (rest === "/agent/pause" || rest === "/agent/stop")) {
+            return await exclusive(async () => {
+              await requireEngagement()
+              try {
+                // The whole task stops, not just the agent: a scan that outlives the pause would keep
+                // producing results for a task the operator believes is stopped.
+                await pentestAgents.stop(slug)
+                await pentestJobs.stopFor(root, slug)
+                return json({ paused: true, stopped: true })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+
+          if (request.method === "POST" && rest === "/archive") {
+            return await exclusive(async () => {
+              const current = await requireEngagement()
+              if (current.status === "archived") return json({ engagement: current })
+              // Archiving is terminal for live activity: wait for the checkpoint before the status
+              // flips, never race a still-writing agent as the old implementation did.
+              await pentestAgents.stop(slug)
+              await pentestJobs.stopFor(root, slug)
+              const engagement = await updateEngagement(root, slug, (current) => ({ ...current, status: "archived" }))
+              broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+              return json({ engagement })
+            })
+          }
+
+          if (request.method === "POST" && rest === "/abandon") {
+            return await exclusive(async () => {
+              const current = await requireEngagement()
+              if (current.status === "abandoned") return json({ engagement: current })
+              await pentestAgents.stop(slug)
+              await pentestJobs.stopFor(root, slug)
+              const engagement = await updateEngagement(root, slug, (item) => ({ ...item, status: "abandoned" }))
+              broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+              return json({ engagement })
+            })
+          }
+
+          if (request.method === "POST" && rest === "/restore") {
+            return await exclusive(async () => {
+              const current = await requireEngagement()
+              if (current.status === "active") return json({ engagement: current })
+              const engagement = await updateEngagement(root, slug, (item) => ({ ...item, status: "active" }))
+              broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+              return json({ engagement })
+            })
+          }
+
+          if (request.method === "POST" && rest === "/mode") {
+            const input = await body(request)
+            return await exclusive(async () => {
+              const current = await requireActiveEngagement()
+              const mode = input.mode === "flag-hunt" ? "flag-hunt" : input.mode === "assessment" ? "assessment" : undefined
+              if (!mode) throw new HttpError(400, "任务模式必须是 assessment 或 flag-hunt")
+              const engagement = await updateEngagement(root, slug, (item) => ({
+                ...item,
+                mode,
+                // Preserve historical Flag submissions when switching away and back. A task moving
+                // into Flag mode for the first time gets one usable objective immediately.
+                ...(mode === "flag-hunt" && item.flagObjectives.length === 0
+                  ? { flagObjectives: [{ id: "flag-1", label: "Flag 1", hint: "", submissions: [] }] }
+                  : {}),
+              }))
+              broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+              return json({ engagement, previousMode: current.mode })
+            })
+          }
+
+          const flagDecisionRoute = /^\/flags\/(flag-\d+)\/submissions\/(flag-\d+-submission-\d+)\/(confirm|reject)$/.exec(rest)
+          if (request.method === "POST" && flagDecisionRoute) {
+            const [, flagId, submissionId, decision] = flagDecisionRoute
+            const input = await body(request)
+            return await exclusive(async () => {
+              await requireActiveEngagement()
+              try {
+                const note = typeof input.note === "string" ? input.note : undefined
+                const submission = decision === "confirm"
+                  ? await confirmFlagSubmission(root, slug, flagId!, submissionId!, note)
+                  : await rejectFlagSubmission(root, slug, flagId!, submissionId!, note)
+                broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+                return json({ submission })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+
+          if (request.method === "DELETE" && rest === "") {
+            return await exclusive(async () => {
+              await requireEngagement()
+              if (pentestAgents.isLive(slug) || pentestJobs.hasLiveRun(slug))
+                throw new HttpError(409, "请先暂停任务，再删除")
+              const deleted = await deleteEngagement(root, slug)
+              broadcast({ at: Date.now(), type: "pentest.engagement.deleted", engagement: slug })
+              return json({ deleted: true, recoverable: true, ...deleted })
+            })
+          }
+
+          if (request.method === "POST" && rest === "/tool-runs") {
+            const input = await body(request)
+            return await exclusive(async () => {
+              const engagement = await requireActiveEngagement()
+              const tool = typeof input.tool === "string" ? input.tool : ""
+              const reason = typeof input.reason === "string" ? input.reason.trim() : ""
+              if (reason === "") throw new HttpError(400, "启动工具任务必须填写执行原因")
+              if (!findPentestTool(tool)) throw new HttpError(400, `未知的渗透工具: ${tool}`)
+              let args: string[]
+              let presetId: string | undefined
+              const presetInput = stringOrUndefined(input.presetId)
+              if (presetInput !== undefined) {
+                const found = findPentestPreset(presetInput)
+                if (!found || found.tool.name !== tool)
+                  throw new HttpError(400, `预设 ${presetInput} 不属于工具 ${tool}`)
+                const target = stringOrUndefined(input.target) ?? engagement.target
+                args = found.preset.build(target)
+                presetId = found.preset.id
+              } else if (Array.isArray(input.args) && input.args.every((arg) => typeof arg === "string")) {
+                // Custom argv is a tier-2 action: the operator reviewing this argv and pressing
+                // start IS the confirmation; the plan (tool + args + target) is shown verbatim.
+                args = input.args
+              } else {
+                throw new HttpError(400, "必须提供预设 ID 或显式参数列表")
+              }
+              const timeoutMs =
+                typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0
+                  ? input.timeoutMs
+                  : undefined
+              try {
+                const run = await pentestJobs.start(root, slug, { tool, args, reason, presetId, timeoutMs })
+                return json({ run })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+
+          const pentestToolRunRoute = /^\/tool-runs\/(run-\d+)(\/.*)?$/.exec(rest)
+          if (pentestToolRunRoute) {
+            const runId = pentestToolRunRoute[1]
+            const runRest = pentestToolRunRoute[2] ?? ""
+            if (request.method === "GET" && runRest === "") {
+              const bytes =
+                typeof Number(url.searchParams.get("bytes")) === "number" &&
+                Number.isFinite(Number(url.searchParams.get("bytes"))) &&
+                Number(url.searchParams.get("bytes")) > 0
+                  ? Math.min(1_000_000, Math.floor(Number(url.searchParams.get("bytes"))))
+                  : undefined
+              try {
+                return json(await pentestJobs.detail(root, slug, runId, bytes))
+              } catch (error) {
+                throw pentestError(error)
+              }
+            }
+            if (request.method === "POST" && runRest === "/stop") {
+              return await exclusive(async () => {
+                try {
+                  const run = await pentestJobs.stop(root, slug, runId)
+                  return json({ run })
+                } catch (error) {
+                  throw pentestError(error)
+                }
+              })
+            }
+          }
+
+          if (request.method === "POST" && rest === "/assets") {
+            const input = await body(request)
+            return await exclusive(async () => {
+              await requireActiveEngagement()
+              try {
+                const asset = await addAsset(root, slug, {
+                  type: input.type as never,
+                  value: typeof input.value === "string" ? input.value : "",
+                  ...(stringOrUndefined(input.meta) !== undefined ? { meta: input.meta as string } : {}),
+                  ...(stringOrUndefined(input.parentId) !== undefined ? { parentId: input.parentId as string } : {}),
+                })
+                broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+                return json({ asset })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+
+          if (request.method === "POST" && rest === "/observations") {
+            const input = await body(request)
+            return await exclusive(async () => {
+              await requireActiveEngagement()
+              try {
+                const observation = await addObservation(root, slug, {
+                  kind: input.kind as never,
+                  ...(stringOrUndefined(input.target) !== undefined ? { target: input.target as string } : {}),
+                  detail: typeof input.detail === "string" ? input.detail : "",
+                  ...(typeof input.confidence === "number" ? { confidence: input.confidence } : {}),
+                })
+                broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+                return json({ observation })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+
+          if (request.method === "POST" && rest === "/evidence") {
+            const input = await body(request)
+            return await exclusive(async () => {
+              await requireActiveEngagement()
+              try {
+                const evidence = await addEvidence(root, slug, {
+                  ...(input.provenance === "external-import" ? { provenance: "external-import" as const } : {}),
+                  ...(stringOrUndefined(input.path) !== undefined ? { path: input.path as string } : {}),
+                  ...(stringOrUndefined(input.excerpt) !== undefined ? { excerpt: input.excerpt as string } : {}),
+                  ...(stringOrUndefined(input.note) !== undefined ? { note: input.note as string } : {}),
+                })
+                broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+                return json({ evidence })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+
+          if (request.method === "POST" && rest === "/findings") {
+            const input = await body(request)
+            return await exclusive(async () => {
+              await requireActiveEngagement()
+              try {
+                const finding = await addFinding(root, slug, {
+                  title: typeof input.title === "string" ? input.title : "",
+                  severity: input.severity as never,
+                  ...(stringOrUndefined(input.description) !== undefined ? { description: input.description as string } : {}),
+                  ...(Array.isArray(input.evidenceIds) && input.evidenceIds.every((id) => typeof id === "string")
+                    ? { evidenceIds: input.evidenceIds as string[] }
+                    : {}),
+                  ...(Array.isArray(input.reproducibleSteps) &&
+                    input.reproducibleSteps.every((step) => typeof step === "string")
+                    ? { reproducibleSteps: input.reproducibleSteps as string[] }
+                    : {}),
+                  ...(stringOrUndefined(input.affectedAssetId) !== undefined
+                    ? { affectedAssetId: input.affectedAssetId as string }
+                    : {}),
+                })
+                broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+                return json({ finding })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+
+          const pentestFindingRoute = /^\/findings\/(finding-\d+)\/(confirm|reject)$/.exec(rest)
+          if (request.method === "POST" && pentestFindingRoute) {
+            const [, findingId, action] = pentestFindingRoute
+            const input = await body(request)
+            return await exclusive(async () => {
+              await requireActiveEngagement()
+              try {
+                const finding =
+                  action === "confirm"
+                    ? await confirmFinding(root, slug, findingId)
+                    : await rejectFinding(root, slug, findingId, stringOrUndefined(input.note))
+                broadcast({ at: Date.now(), type: "pentest.engagement.changed", engagement: slug })
+                return json({ finding })
+              } catch (error) {
+                throw pentestError(error)
+              }
+            })
+          }
+        }
+
         if (request.method === "GET" && url.pathname === "/api/platform")
           return json(await platformAdapterSummaries(persisted.settings.competition.platformId))
 
@@ -1221,10 +1974,7 @@ export async function startGuiServer(options: StartGuiOptions) {
             const runs = await readChallengeRuns(root, found.slug)
             if (!runs.some((run) => run.id === runID))
               throw new HttpError(404, `No such task: ${found.slug}/${runID}`)
-            const directory = await assertPathWithin(
-              root,
-              path.join(root, "runs", found.slug, runID),
-            )
+            const directory = await taskDirectoryFromRoot(root, found.slug, runID)
             const previous = await loadTaskEnvironment(directory)
             const selected = await resolveEnvironmentProfile({ profileId })
             const binding = await bindTaskEnvironment({
@@ -1421,6 +2171,57 @@ export async function startGuiServer(options: StartGuiOptions) {
           })
         }
 
+        if (request.method === "POST" && url.pathname === "/api/challenges") {
+          const input = await body(request)
+          return await exclusive(async () => {
+            if (typeof input.slug !== "string") throw new HttpError(400, "slug must be a string")
+            const files = Array.isArray(input.files)
+              ? input.files.filter((item): item is string => typeof item === "string" && item.trim() !== "")
+              : []
+            const created = await createChallengeInCatalog(root, {
+              slug: input.slug,
+              category: typeof input.category === "string" ? input.category : undefined,
+              description: optionalText(input.description, "description"),
+              difficulty: optionalText(input.difficulty, "difficulty"),
+              remote: serviceRemote(input.remote === undefined ? undefined : input.remote),
+              serviceRequired: input.serviceRequired === true,
+              flagFormat: optionalText(input.flagFormat, "flagFormat"),
+              answer: optionalText(input.answer, "answer"),
+              attachments: files,
+            })
+            const discovered = (await discoverChallenges(root)).some((item) => item.slug === created.slug)
+            if (!discovered) {
+              await removeTree(root, created.directory).catch(() => {})
+              throw new HttpError(400, `Challenge was not discoverable after creation: ${created.slug}`)
+            }
+            broadcast({ at: Date.now(), type: "challenge.created", slug: created.slug, category: created.category })
+            return json(created, 201)
+          })
+        }
+
+        const fileMatch = /^\/api\/challenges\/([^/]+)\/files(?:\/([^/]+))?$/.exec(url.pathname)
+        if (fileMatch && (request.method === "POST" || request.method === "DELETE")) {
+          const slug = decodeSegment(fileMatch[1]!)
+          const name = fileMatch[2] === undefined ? undefined : decodeSegment(fileMatch[2])
+          return await exclusive(async () => {
+            await challenge(slug)
+            if (request.method === "DELETE") {
+              if (name === undefined) throw new HttpError(400, "attachment name is required")
+              const removed = await removeChallengeAttachment(root, slug, name)
+              broadcast({ at: Date.now(), type: "challenge.changed", slug })
+              return json({ ok: true, ...removed })
+            }
+            const input = await body(request)
+            const sources = Array.isArray(input.sources)
+              ? input.sources.filter((item): item is string => typeof item === "string" && item.trim() !== "")
+              : []
+            if (sources.length === 0) throw new HttpError(400, "sources must name at least one file")
+            const added = await addChallengeAttachments(root, slug, sources)
+            broadcast({ at: Date.now(), type: "challenge.changed", slug })
+            return json(added, 201)
+          })
+        }
+
         const patchMatch = /^\/api\/challenges\/([^/]+)$/.exec(url.pathname)
         if (request.method === "PATCH" && patchMatch) {
           const slug = decodeSegment(patchMatch[1]!)
@@ -1428,9 +2229,28 @@ export async function startGuiServer(options: StartGuiOptions) {
           return await exclusive(async () => {
             const found = await challenge(slug)
             const current = { ...(persisted.challenges[slug] ?? {}) }
+            const content: Parameters<typeof updateChallengeInCatalog>[2] = {}
+            if ("description" in input) content.description = optionalText(input.description, "description") ?? ""
+            if ("category" in input) {
+              if (typeof input.category !== "string") throw new HttpError(400, "category must be a string")
+              content.category = input.category
+            }
+            if ("difficulty" in input) content.difficulty = optionalText(input.difficulty, "difficulty") ?? null
+            if ("flagFormat" in input) content.flagFormat = optionalText(input.flagFormat, "flagFormat") ?? null
+            if ("serviceRequired" in input) {
+              if (typeof input.serviceRequired !== "boolean")
+                throw new HttpError(400, "serviceRequired must be a boolean")
+              content.serviceRequired = input.serviceRequired
+            }
+            if ("answer" in input) content.answer = optionalText(input.answer, "answer") ?? null
+            if ("remote" in input) content.remote = serviceRemote(input.remote) ?? null
+
             let remote = found.remote?.trim() || undefined
-            if ("remote" in input) {
-              remote = serviceRemote(input.remote)
+            if (Object.keys(content).length > 0) {
+              await updateChallengeInCatalog(root, slug, content)
+              if ("remote" in content) remote = content.remote ?? undefined
+            } else if ("remote" in input) {
+              // A remote-only edit keeps using the narrow writer, which touches nothing else.
               await updateChallengeRemote(found, remote)
             }
             if ("state" in input) {
@@ -1441,8 +2261,20 @@ export async function startGuiServer(options: StartGuiOptions) {
             persisted.challenges[slug] = current
             await saveRootGuiState(root, persisted)
             broadcast({ at: Date.now(), type: "challenge.changed", slug })
-            return json({ ok: true, remote: remote ?? null })
+            return json({
+              ok: true,
+              remote: remote ?? null,
+              ...("answer" in input ? { answer: (await readAnswer(root, slug)) ?? null } : {}),
+            })
           })
+        }
+
+        // One challenge's operator-owned fields that the queue state deliberately omits: the known
+        // answer lives in the workspace-wide `eval/answers.txt`, not in the challenge directory.
+        if (request.method === "GET" && patchMatch) {
+          const slug = decodeSegment(patchMatch[1]!)
+          await challenge(slug)
+          return json({ slug, answer: (await readAnswer(root, slug)) ?? null })
         }
 
         if (request.method === "POST" && url.pathname === "/api/runs") {
@@ -1700,10 +2532,7 @@ export async function startGuiServer(options: StartGuiOptions) {
               !selected.candidateHistory?.includes(flag)
             )
               throw new HttpError(400, "flag is not a candidate from this task")
-            const directory = await assertPathWithin(
-              root,
-              path.join(root, "runs", found.slug, selected.id),
-            )
+            const directory = await taskDirectoryFromRoot(root, found.slug, selected.id)
             const legacyStops = new Set([
               "completed",
               "budget",
@@ -1811,10 +2640,7 @@ export async function startGuiServer(options: StartGuiOptions) {
             const runs = await readChallengeRuns(root, found.slug)
             const selected = runs.find((run) => run.id === input.runID)
             if (!selected) throw new HttpError(404, `No such task: ${found.slug}/${input.runID}`)
-            const directory = await assertPathWithin(
-              root,
-              path.join(root, "runs", found.slug, selected.id),
-            )
+            const directory = await taskDirectoryFromRoot(root, found.slug, selected.id)
             const task = await loadOrCreateTask(directory, {
               id: selected.id,
               slug: found.slug,
@@ -1905,7 +2731,7 @@ export async function startGuiServer(options: StartGuiOptions) {
             await challenge(slug)
             if (runner.getTransientRuns(slug).length > 0)
               throw new HttpError(409, `Stop ${slug} before deleting its runs`)
-            await removeTree(root, path.join(root, "runs", slug))
+            for (const target of slugStores(root, slug)) await removeTree(root, target)
             broadcast({ at: Date.now(), type: "challenge.runs.deleted", slug })
             return json({ ok: true })
           })
@@ -1920,11 +2746,11 @@ export async function startGuiServer(options: StartGuiOptions) {
             if (runner.getTransientRuns(slug).length > 0)
               throw new HttpError(409, `Stop ${slug} before deleting it`)
             const challengeTarget = found.sourceDirectory ?? found.directory
-            const runsTarget = path.join(root, "runs", slug)
+            const taskTargets = slugStores(root, slug)
             await destructiveTarget(root, challengeTarget)
-            await destructiveTarget(root, runsTarget)
+            for (const target of taskTargets) await destructiveTarget(root, target)
             await removeTree(root, challengeTarget)
-            await removeTree(root, runsTarget)
+            for (const target of taskTargets) await removeTree(root, target)
             delete persisted.challenges[slug]
             await saveRootGuiState(root, persisted)
             broadcast({ at: Date.now(), type: "challenge.deleted", slug })
@@ -1934,8 +2760,17 @@ export async function startGuiServer(options: StartGuiOptions) {
 
         if (request.method === "POST" && url.pathname === "/api/open") {
           const input = await body(request)
-          if (input.kind !== "work" && input.kind !== "file")
-            throw new HttpError(400, "kind must be work or file")
+          if (input.kind !== "task" && input.kind !== "work" && input.kind !== "file" &&
+              input.kind !== "root" && input.kind !== "backups")
+            throw new HttpError(400, "kind must be task, work, file, root, or backups")
+          // The workspace itself and the backup folder are not challenge-scoped, so they open
+          // before the slug lookup: the operator is inspecting Boom's own folders.
+          if (input.kind === "root" || input.kind === "backups") {
+            const directory = input.kind === "root" ? root : boomBackupsDirectory()
+            await mkdir(directory, { recursive: true })
+            await openExternal(directory)
+            return json({ ok: true, path: directory })
+          }
           if (typeof input.slug !== "string") throw new HttpError(400, "slug must be a string")
           const found = await challenge(input.slug)
           const runs = await readChallengeRuns(root, found.slug)
@@ -1944,17 +2779,17 @@ export async function startGuiServer(options: StartGuiOptions) {
             ? runs.find((run) => run.id === requestedID)
             : runs[runs.length - 1]
           let target: string
-          if (input.kind === "work") {
+          if (input.kind === "task" || input.kind === "work") {
             if (!selectedRun) throw new HttpError(404, `No run found for ${found.slug}`)
-            target = await assertPathWithin(
-              root,
-              path.join(root, "runs", found.slug, selectedRun.id, "work"),
-            )
+            const directory = await taskDirectoryFromRoot(root, found.slug, selectedRun.id)
+            target = input.kind === "task"
+              ? directory
+              : await assertPathWithin(directory, path.join(directory, "work"))
           } else {
             if (typeof input.path !== "string" || input.path === "")
               throw new HttpError(400, "path is required when kind is file")
             const base = selectedRun
-              ? path.join(root, "runs", found.slug, selectedRun.id)
+              ? await taskDirectoryFromRoot(root, found.slug, selectedRun.id)
               : found.directory
             target = await assertPathWithin(base, path.join(base, input.path))
           }
@@ -1968,7 +2803,7 @@ export async function startGuiServer(options: StartGuiOptions) {
           error instanceof Error && /(?:Path escapes|symbolic link)/i.test(error.message)
         const conflict =
           error instanceof Error &&
-          /(?:already running|already queued|Consultation is already|Duplicate challenge|Cannot change providers|Cannot change armor prompts|Cannot change MCP|Cannot test MCP|Cannot authenticate MCP)/i.test(
+          /(?:already running|already queued|Consultation is already|Duplicate challenge|Challenge already exists|Cannot change providers|Cannot change armor prompts|Cannot change MCP|Cannot test MCP|Cannot authenticate MCP)/i.test(
             error.message,
           )
         const invalidConfiguration =
@@ -1976,13 +2811,24 @@ export async function startGuiServer(options: StartGuiOptions) {
           /(?:Invalid provider|Invalid armor prompt|Invalid MCP|Provider Base URL|Custom provider requires|No such armor prompt|No such MCP)/i.test(
             error.message,
           )
+        // Operator input the GUI can reject with a field correction: a bad slug, an attachment
+        // name that is not one path segment, or an attachment the operator no longer has on disk.
+        const invalidInput =
+          error instanceof Error &&
+          /(?:Invalid challenge slug|Invalid attachment name|Attachment (?:does not exist|is not a real file))/i.test(
+            error.message,
+          )
+        const missing =
+          error instanceof Error && /(?:No such challenge|No such attachment)/i.test(error.message)
         const status = error instanceof HttpError
           ? error.status
-          : unsafePath || invalidConfiguration
+          : unsafePath || invalidConfiguration || invalidInput
             ? 400
             : conflict
               ? 409
-              : 500
+              : missing
+                ? 404
+                : 500
         return json({ error: error instanceof Error ? error.message : String(error) }, status)
       }
   }
@@ -2060,6 +2906,8 @@ export async function startGuiServer(options: StartGuiOptions) {
       // Stop accepting new requests before draining jobs so close is a real lifecycle barrier.
       void server.stop(true)
       autopilot.stop()
+      await pentestAgents.stopAll()
+      await pentestJobs.stopAll()
       clearInterval(heartbeat)
       unsubscribe()
       for (const client of clients) {

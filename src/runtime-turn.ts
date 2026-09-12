@@ -1,5 +1,6 @@
 import type {
   AgentRuntime,
+  RuntimeConversation,
   RuntimeEvent,
   RuntimePromptResult,
   RuntimeResponsePart,
@@ -50,6 +51,14 @@ function billableUsage(usage: RuntimeUsage) {
   return usage.input + usage.output + usage.reasoning + usage.cache.write + usage.cache.read * 0.1
 }
 
+/**
+ * One billable-token number for a usage snapshot, using the same weighting the runtime budget
+ * check applies. Exported so callers that persist consumption records stay consistent with it.
+ */
+export function billableTokens(usage: RuntimeUsage): number {
+  return Math.round(billableUsage(usage))
+}
+
 export class RuntimePromptFailure extends Error {
   constructor(
     message: string,
@@ -68,16 +77,95 @@ export function runtimeFailureUsage(error: unknown) {
     : { usage: undefined, cost: 0 }
 }
 
+export type RuntimeSessionInfo = {
+  /** Durable conversation id the caller should persist for later resumes. */
+  id: string
+  /** True when an existing durable session was resumed; false when a fresh one was created. */
+  resumed: boolean
+  /** Why resumption was impossible (resume failure, or runtime without resume support). */
+  reason?: string
+}
+
+/**
+ * Open the conversation for one prompt: the durable session when it can be resumed, otherwise a
+ * fresh one. A runtime without resume support is not an error, but the caller still learns why the
+ * session changed.
+ */
+async function openConversation(input: {
+  runtime: AgentRuntime
+  directory: string
+  title: string
+  signal?: AbortSignal
+  tokenBudget?: number
+  resumeSessionID?: string
+}): Promise<{ conversation: RuntimeConversation; resumed: boolean; reason?: string }> {
+  if (input.resumeSessionID !== undefined && input.resumeSessionID !== "") {
+    if (!input.runtime.resumeConversation)
+      return {
+        conversation: await input.runtime.createConversation({
+          directory: input.directory,
+          title: input.title,
+          signal: input.signal,
+          tokenBudget: input.tokenBudget,
+        }),
+        resumed: false,
+        reason: "the runtime does not support session resume; a fresh session was started",
+      }
+    try {
+      return {
+        conversation: await input.runtime.resumeConversation({
+          directory: input.directory,
+          id: input.resumeSessionID,
+          signal: input.signal,
+          tokenBudget: input.tokenBudget,
+        }),
+        resumed: true,
+      }
+    } catch (error) {
+      return {
+        conversation: await input.runtime.createConversation({
+          directory: input.directory,
+          title: input.title,
+          signal: input.signal,
+          tokenBudget: input.tokenBudget,
+        }),
+        resumed: false,
+        reason: `the previous session ${input.resumeSessionID} could not be resumed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      }
+    }
+  }
+  return {
+    conversation: await input.runtime.createConversation({
+      directory: input.directory,
+      title: input.title,
+      signal: input.signal,
+      tokenBudget: input.tokenBudget,
+    }),
+    resumed: false,
+  }
+}
+
 export async function completeRuntimePrompt(input: {
   runtime: AgentRuntime
   directory: string
   title: string
   agent: string
   model: string
-  prompt: string
+  /**
+   * The turn's prompt. A function is resolved once the conversation exists and receives the actual
+   * session outcome, so a caller can assemble a smaller continuation prompt when the durable
+   * session really resumed, and a full overview when resumption failed.
+   */
+  prompt: string | ((session: RuntimeSessionInfo) => string)
   signal?: AbortSignal
   /** Hard billable-token ceiling for this one conversation, enforced from live step events. */
   tokenBudget?: number
+  /** Resume this durable session instead of creating a disconnected new conversation. */
+  resumeSessionID?: string
+  /** Notified once the conversation exists and the prompt is resolved, before it is sent. */
+  onSession?: (info: RuntimeSessionInfo) => unknown
   onEvent?: RuntimeTurnEventHandler
 }) {
   const budgetAbort = input.tokenBudget === undefined ? undefined : new AbortController()
@@ -86,12 +174,17 @@ export async function completeRuntimePrompt(input: {
       ? AbortSignal.any([input.signal, budgetAbort.signal])
       : budgetAbort.signal
     : input.signal
-  const conversation = await input.runtime.createConversation({
-    directory: input.directory,
-    title: input.title,
-    signal,
-    tokenBudget: input.tokenBudget,
-  })
+  // Resume the durable session when the runtime supports it; a resume failure falls back to a
+  // fresh conversation with the reason reported, so callers can persist both outcomes.
+  const opened = await openConversation(input)
+  const conversation = opened.conversation
+  const sessionInfo: RuntimeSessionInfo = {
+    id: conversation.id,
+    resumed: opened.resumed,
+    ...(opened.reason !== undefined ? { reason: opened.reason } : {}),
+  }
+  await Promise.resolve(input.onSession?.(sessionInfo)).catch(() => {})
+  const promptText = typeof input.prompt === "function" ? input.prompt(sessionInfo) : input.prompt
   const subscription = new AbortController()
   let watching: Promise<void> | undefined
   let terminal: (() => void) | undefined
@@ -146,7 +239,7 @@ export async function completeRuntimePrompt(input: {
       result = await conversation.prompt({
         agent: input.agent,
         model: input.model,
-        text: input.prompt,
+        text: promptText,
         signal,
       })
     } catch (error) {
@@ -188,8 +281,12 @@ export async function completeRuntimePrompt(input: {
   } finally {
     input.signal?.removeEventListener("abort", abort)
     subscription.abort()
-    await watching?.catch(() => {})
-    await conversation.close?.().catch(() => {})
+    // A runtime that ignores its subscription abort must not pin the caller forever. The final
+    // prompt result/error is authoritative; trailing events are useful but strictly best-effort.
+    if (watching)
+      await Promise.race([watching.catch(() => {}), trailingEventWindow()]).catch(() => {})
+    const closing = conversation.close?.().catch(() => {})
+    if (closing) await Promise.race([closing, trailingEventWindow()]).catch(() => {})
   }
 }
 

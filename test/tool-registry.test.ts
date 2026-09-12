@@ -26,6 +26,8 @@ describe("M3 Boom Tool Registry", () => {
       .map(([name]) => name)).toEqual([
         "bash", "read", "edit", "list", "glob", "grep", "skill", "websearch", "webfetch", "todowrite",
         "boom-exec", "ctf-note", "ctf-consult", "ctf-submit",
+        "pentest-note", "pentest-asset", "pentest-observation", "pentest-evidence", "pentest-finding",
+        "pentest-flag",
       ])
     expect(registry.tools["ctf-submit"]).toEqual(expect.objectContaining({
       implementation: "boom",

@@ -18,6 +18,7 @@ import type { AgentRuntime, RuntimeEvent } from "../src/runtime-contract.ts"
 import {
   normalizeOpenCodeContextMessage,
   normalizeOpenCodeRuntimeEvent,
+  createOpenCodeConversationEventRouter,
   normalizeOpenCodeStoredMessage,
   startRuntime,
 } from "../src/runtime.ts"
@@ -331,6 +332,46 @@ describe("OpenCode adapter normalization", () => {
     })
   })
 
+  test("routes descendant task usage into the root budget without leaking worker chatter", () => {
+    const descendants = new Set<string>()
+    const route = createOpenCodeConversationEventRouter("root", descendants)
+    expect(route({
+      type: "session.created",
+      properties: { info: { id: "worker", parentID: "root" } },
+    })).toBeUndefined()
+    expect(route({
+      type: "message.part.updated",
+      properties: {
+        delta: "worker private analysis",
+        part: { type: "text", sessionID: "worker" },
+      },
+    })).toBeUndefined()
+    expect(route({
+      type: "message.part.updated",
+      properties: {
+        part: {
+          type: "step-finish",
+          sessionID: "root",
+          cost: 0.2,
+          tokens: { input: 10, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      },
+    })).toMatchObject({ sessionID: "root", cost: 0.2, usage: { input: 10, output: 2 } })
+    expect(route({
+      type: "message.part.updated",
+      properties: {
+        part: {
+          type: "step-finish",
+          sessionID: "worker",
+          cost: 0.3,
+          tokens: { input: 20, output: 4, reasoning: 1, cache: { read: 0, write: 0 } },
+        },
+      },
+    })).toMatchObject({ sessionID: "root", cost: 0.5, usage: { input: 20, output: 4, reasoning: 1 } })
+    // The conversation can abort the workers it discovered; a pause must not leave one behind.
+    expect(descendants).toEqual(new Set(["worker"]))
+  })
+
   test("derives reasoning deltas from whole-part updates before the message role is known", () => {
     const context = { accumulatedParts: new Map<string, string>(), messageRoles: new Map<string, string>() }
     expect(normalizeOpenCodeRuntimeEvent({
@@ -508,10 +549,10 @@ describe("OpenCode adapter normalization", () => {
     const provider = new ScriptedProvider([])
     const boomHome = await temporary("boom-m1-matrix-home-")
     const project = await temporary("boom-m1-matrix-project-")
-    const workspace = path.join(project, "runs", "case-task")
-    await mkdir(path.join(workspace, "challenge"), { recursive: true })
+    const workspace = path.join(project, "tasks", "case-task")
+    await mkdir(path.join(workspace, "input"), { recursive: true })
     await mkdir(path.join(workspace, "work", ".boom"), { recursive: true })
-    await writeFile(path.join(workspace, "challenge", "challenge.json"), '{"slug":"case","description":"fixture"}\n')
+    await writeFile(path.join(workspace, "input", "challenge.json"), '{"slug":"case","description":"fixture"}\n')
     await writeFile(path.join(workspace, "work", "edit.txt"), "before\n")
     await writeFile(path.join(workspace, "NOTES.md"), "# NOTES\n")
     await writeFile(path.join(workspace, "work", ".boom", "environment.json"), `${JSON.stringify({
@@ -630,7 +671,7 @@ describe("OpenCode adapter normalization", () => {
               id: "edit-challenge",
               name: "edit",
               arguments: JSON.stringify({
-                filePath: path.join(canonicalWorkspace, "challenge", "challenge.json"),
+                filePath: path.join(canonicalWorkspace, "input", "challenge.json"),
                 oldString: "fixture",
                 newString: "changed",
               }),
@@ -640,7 +681,7 @@ describe("OpenCode adapter normalization", () => {
         { type: "completion", text: "edit checks complete" },
       ])
       expect(await readFile(path.join(workspace, "work", "edit.txt"), "utf8")).toBe("after\n")
-      expect(await readFile(path.join(workspace, "challenge", "challenge.json"), "utf8")).toContain("fixture")
+      expect(await readFile(path.join(workspace, "input", "challenge.json"), "utf8")).toContain("fixture")
       expect(edits.trace).toContainEqual(expect.objectContaining({
         kind: "tool", tool: "edit", call: "call-1", state: "completed",
       }))
@@ -764,8 +805,14 @@ describe("OpenCode adapter normalization", () => {
         "read", "skill", "task", "todowrite", "webfetch", "write",
       ])
       const neutralCatalog = neutralRegistry.catalog
+      // Bridged tools must appear in the provider tool list of the agent under test; pentest-mode
+      // tools are boom-implemented but belong to the pentest profile, not the solver's.
+      const solverProfileTools = new Set(
+        neutralRegistry.agents.find((agent) => agent.resource.id === "boom")!.profile.tools,
+      )
       const bridgedBoomTools = Object.entries(neutralCatalog.tools)
-        .filter(([name, descriptor]) => descriptor.implementation === "boom" && name !== "websearch")
+        .filter(([name, descriptor]) =>
+          descriptor.implementation === "boom" && name !== "websearch" && solverProfileTools.has(name))
         .map(([name]) => name)
       for (const name of bridgedBoomTools)
         expect(toolDefinitions[name]).toBeDefined()

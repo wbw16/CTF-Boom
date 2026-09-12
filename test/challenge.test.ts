@@ -152,7 +152,7 @@ describe("challenge discovery safety", () => {
       await mkdir(path.join(root, "WEB", "login"), { recursive: true })
       await mkdir(path.join(root, "misc", "packet"), { recursive: true })
       // Workspace infrastructure must not be mistaken for challenges.
-      await mkdir(path.join(root, "runs", "login", "20260101T000000Z-x"), { recursive: true })
+      await mkdir(path.join(root, "tasks", "login", "20260101T000000Z-x"), { recursive: true })
       await mkdir(path.join(root, "tools"), { recursive: true })
       await writeFile(path.join(root, "WEB", "login", "README.md"), "web task")
       await writeFile(path.join(root, "misc", "packet", "capture.pcap"), "pcap")
@@ -202,12 +202,12 @@ describe("challenge discovery safety", () => {
     const categorized = await mkdtemp(path.join(os.tmpdir(), "boom-prepare-categories-"))
     try {
       await prepareWorkspaceRoot(fresh)
-      await expect(exists(path.join(fresh, "runs"))).resolves.toBe(true)
+      await expect(exists(path.join(fresh, "tasks"))).resolves.toBe(true)
       await expect(exists(path.join(fresh, "challenges"))).resolves.toBe(true)
 
       await mkdir(path.join(categorized, "PWN", "stack"), { recursive: true })
       await prepareWorkspaceRoot(categorized)
-      await expect(exists(path.join(categorized, "runs"))).resolves.toBe(true)
+      await expect(exists(path.join(categorized, "tasks"))).resolves.toBe(true)
       await expect(exists(path.join(categorized, "challenges"))).resolves.toBe(false)
 
       // The prepared catalog stays discoverable alongside the root categories.

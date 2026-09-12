@@ -17,6 +17,7 @@ import {
 } from "./runtime/policy.ts"
 import { createBoomStateToolExecutor, type BoomStateToolName } from "./runtime/state-tools.ts"
 import { createBoomNetworkBroker, type BoomNetworkBroker } from "./runtime/network-broker.ts"
+import { executePentestRecordTool } from "./pentest/record-tools.ts"
 import { createBoomWebToolExecutor, type BoomWebToolName } from "./runtime/web-tools.ts"
 import {
   validateBoomToolArguments,
@@ -33,6 +34,12 @@ export type BoomToolName =
   | "ctf-note"
   | "ctf-consult"
   | "ctf-submit"
+  | "pentest-note"
+  | "pentest-asset"
+  | "pentest-observation"
+  | "pentest-evidence"
+  | "pentest-finding"
+  | "pentest-flag"
 const MAX_VISIBLE_OUTPUT_BYTES = 32_768
 
 /**
@@ -262,6 +269,18 @@ export function createBoomToolHost(
       executeConsultationRequest(input.directory, input.sessionID, input.arguments),
     "ctf-submit": (input: Parameters<BoomToolHost["execute"]>[0]) =>
       executeSubmission(input.directory, input.sessionID, input.arguments),
+    "pentest-note": (input: Parameters<BoomToolHost["execute"]>[0]) =>
+      executePentestRecordTool("pentest-note", input.directory, input.arguments),
+    "pentest-asset": (input: Parameters<BoomToolHost["execute"]>[0]) =>
+      executePentestRecordTool("pentest-asset", input.directory, input.arguments),
+    "pentest-observation": (input: Parameters<BoomToolHost["execute"]>[0]) =>
+      executePentestRecordTool("pentest-observation", input.directory, input.arguments),
+    "pentest-evidence": (input: Parameters<BoomToolHost["execute"]>[0]) =>
+      executePentestRecordTool("pentest-evidence", input.directory, input.arguments),
+    "pentest-finding": (input: Parameters<BoomToolHost["execute"]>[0]) =>
+      executePentestRecordTool("pentest-finding", input.directory, input.arguments),
+    "pentest-flag": (input: Parameters<BoomToolHost["execute"]>[0]) =>
+      executePentestRecordTool("pentest-flag", input.directory, input.arguments),
   } satisfies Record<BoomToolName, (input: Parameters<BoomToolHost["execute"]>[0]) => Promise<BoomToolResult>>
   const names = Object.entries(registry.tools)
     .filter(([, descriptor]) => descriptor.implementation === "boom")

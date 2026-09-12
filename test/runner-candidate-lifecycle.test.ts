@@ -109,8 +109,8 @@ async function fixture(input: {
     pythonInterpreter: interpreter,
   })
   for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1) await Bun.sleep(10)
-  const [runID] = await readdir(path.join(root, "runs", "sample"))
-  const run = path.join(root, "runs", "sample", runID!)
+  const [runID] = await readdir(path.join(root, "tasks", "sample"))
+  const run = path.join(root, "tasks", "sample", runID!)
   return { runner, root, run, prompts }
 }
 
@@ -280,8 +280,8 @@ describe("candidate lifecycle", () => {
         pythonInterpreter: interpreter,
       })
       for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1) await Bun.sleep(10)
-      const [runID] = await readdir(path.join(root, "runs", "sample"))
-      const run = path.join(root, "runs", "sample", runID!)
+      const [runID] = await readdir(path.join(root, "tasks", "sample"))
+      const run = path.join(root, "tasks", "sample", runID!)
       expect(submissionAttempts).toBe(2)
       expect(prompts).toHaveLength(2)
       expect(JSON.parse(await readFile(path.join(run, "task.json"), "utf8"))).toMatchObject({

@@ -21,7 +21,7 @@ afterEach(async () => {
 async function workspace() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-environment-"))
   temporary.push(directory)
-  await mkdir(path.join(directory, "challenge"))
+  await mkdir(path.join(directory, "input"))
   await mkdir(path.join(directory, "work"))
   await writeFile(path.join(directory, "NOTES.md"), "# NOTES\n")
   return directory
@@ -150,7 +150,7 @@ describe("environment hardening", () => {
     expect(rejected.status).toBe("invalid")
     expect(rejected.detail).toContain("temporary")
 
-    const storage = path.join(temporaryDirectory, "runs", "some-challenge", "run-1")
+    const storage = path.join(temporaryDirectory, "tasks", "some-challenge", "run-1")
     await mkdir(storage, { recursive: true })
     const planted = path.join(storage, "python")
     await writeFile(planted, "#!/bin/sh\nexit 0\n")

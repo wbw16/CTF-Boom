@@ -2,6 +2,7 @@ import { createHash } from "node:crypto"
 import { access, chmod, lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { boomHomeDirectory } from "./boom-home.ts"
 
 export type PythonEnvironmentKind = "conda" | "python"
 export type InstallPolicy = "deny" | "allow"
@@ -78,7 +79,7 @@ print(json.dumps({
 `
 
 function boomHome() {
-  return path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+  return boomHomeDirectory()
 }
 
 function storePath() {
@@ -279,7 +280,7 @@ async function interpreterPolicyRejection(
   taskStorageRoots: string[] = [],
 ): Promise<string | undefined> {
   const segments = interpreter.split(path.sep)
-  if (segments.includes("runs") || segments.includes("challenges"))
+  if (segments.includes("tasks") || segments.includes("runs") || segments.includes("challenges"))
     return "the interpreter path crosses Boom task storage (`runs`/`challenges`); select one from a system or dedicated environment prefix instead"
   for (const candidate of taskStorageRoots) {
     const resolved = await realpath(candidate).catch(() => undefined)

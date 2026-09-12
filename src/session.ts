@@ -405,7 +405,7 @@ export function findCandidates(text: string, flagFormat: string) {
 // model; Boom supplies only the input locations and required durable outputs.
 const PROMPT = `# Solve turn
 
-challenge/ is read-only input; work/ is your workspace; NOTES.md is cross-turn memory.
+input/ is read-only input; work/ is your workspace; NOTES.md is cross-turn memory.
 
 - Act, don't narrate. Your first tool call must make concrete progress — open an attachment, connect to the service, or inspect a file. Do not plan at length before acting.
 - Use tools to verify, not prose. Keep iterating with tools until you have a credible flag; do not stop to summarize without having acted.
@@ -438,7 +438,7 @@ export type SolverPromptCapabilities = {
 }
 
 const HEADLESS_IDA_GUIDANCE = [
-  "Headless IDA Pro MCP (idalib) is available. For native executables, copy the target from challenge/ to work/ida/ first, then use idb_open in force_headless mode to auto-analyze, and recover program logic with survey_binary, list_funcs, decompile, xrefs_to, callees, and callgraph; do not generate an IDB directly under challenge/.",
+  "Headless IDA Pro MCP (idalib) is available. For native executables, copy the target from input/ to work/ida/ first, then use idb_open in force_headless mode to auto-analyze, and recover program logic with survey_binary, list_funcs, decompile, xrefs_to, callees, and callgraph; do not generate an IDB directly under input/.",
   "If IDA open, auto-analysis, or decompilation fails, record the specific error and fall back to objdump, LLDB, Python, angr, etc.; do not skip IDA merely because shell tools are available. Once an IDB is open, query functions around entry points, validation paths, and key strings and their xrefs; avoid aimlessly decompiling every function.",
   "Large IDA query results are auto-archived under work/ida/results/; the context keeps only a summary and a file pointer. Use idalib_boom_ida_get to read details line by line in segments, and idalib_boom_ida_list to view archived queries. Archives are durable artifacts — resume turns should read them first and not re-query the same functions.",
 ].join(" ")
@@ -487,7 +487,7 @@ export function buildPrompt(
 
 const CONTINUE_PROMPT = `# Continue turn
 
-Same challenge. challenge/ is read-only input; work/ and NOTES.md hold prior work.
+Same challenge. input/ is read-only input; work/ and NOTES.md hold prior work.
 
 - Act, don't narrate. Make a concrete tool call first; do not plan at length before acting.
 - Keep the goal: recover the flag. On a credible candidate, call ctf-submit immediately and stop; do not generate the final writeup until the candidate is confirmed.
@@ -515,7 +515,7 @@ const WRITEUP_PROMPT = `# Writeup turn
 
 The candidate flag is confirmed by the platform or user. Stop guessing or submitting flags.
 
-- Generate work/WRITEUP.md offline from challenge/, work/, and NOTES.md only. Include the confirmed flag, core idea, derivation, and reproducible steps.
+- Generate work/WRITEUP.md offline from input/, work/, and NOTES.md only. Include the confirmed flag, core idea, derivation, and reproducible steps.
 - Write the writeup in Chinese. Keep commands, code, file paths, and the literal flag unchanged.
 - If a PoC/script was actually used, include its path, invocation, and complete source in a fenced code block — no truncation, ellipsis, or file-reference substitutes.
 - If no script/PoC was actually used, do not invent one; write the verified reasoning and manual reproduction steps.

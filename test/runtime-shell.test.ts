@@ -25,9 +25,9 @@ async function fixture() {
   if (!interpreter) return undefined
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-native-shell-"))
   temporary.push(directory)
-  await mkdir(path.join(directory, "challenge"))
+  await mkdir(path.join(directory, "input"))
   await mkdir(path.join(directory, "work"))
-  await writeFile(path.join(directory, "challenge", "evidence.txt"), "immutable evidence\n")
+  await writeFile(path.join(directory, "input", "evidence.txt"), "immutable evidence\n")
   await writeFile(path.join(directory, "NOTES.md"), "# NOTES\n")
   const profile = await probePythonEnvironment({ interpreter })
   if (profile.status !== "ready") return undefined
@@ -89,7 +89,7 @@ describe("M3 native shell", () => {
       },
     })
     expect(result.exitCode).toBe(0)
-    expect(await readFile(path.join(setup.directory, "challenge", "evidence.txt"), "utf8")).toBe("immutable evidence\n")
+    expect(await readFile(path.join(setup.directory, "input", "evidence.txt"), "utf8")).toBe("immutable evidence\n")
     expect(await readFile(path.join(setup.directory, "work", ".boom", "environment.json"), "utf8")).toBe(beforeBinding)
     expect(await Bun.file(path.join(setup.directory, "work", "RESULT.json")).exists()).toBe(false)
     expect(await readFile(path.join(setup.directory, "work", "allowed.txt"), "utf8")).toBe("allowed")

@@ -36,6 +36,7 @@ export type BoomAgentRole =
   | "challenger"
   | "arbiter"
   | "verifier"
+  | "pentester"
 
 export type BoomAgentResource = {
   version: 1
@@ -75,7 +76,7 @@ export type CompiledBoomAgentRegistry = {
 const AGENT_ID = /^boom(?:-[a-z][a-z0-9-]*)?$/
 const HEX_COLOR = /^#[0-9A-Fa-f]{6}$/
 const ROLES = new Set<BoomAgentRole>([
-  "solver", "worker", "intake", "consultant", "analyzer", "challenger", "arbiter", "verifier",
+  "solver", "worker", "intake", "consultant", "analyzer", "challenger", "arbiter", "verifier", "pentester",
 ])
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -132,6 +133,9 @@ function compatibilityPermissions(
   if (effects.write === "none") permissions.edit = "deny"
   else permissions.edit = {
     "*": "allow",
+    "input/**": "deny",
+    "**/input/**": "deny",
+    // Task directories written before the rename keep their read-only guarantee.
     "challenge/**": "deny",
     "**/challenge/**": "deny",
   }
@@ -148,7 +152,9 @@ function compatibilityPermissions(
     permissions.todowrite = "deny"
   }
   if (effects.submit === "deny") permissions["ctf-submit"] = "deny"
-  if (effects.delegate === "deny") permissions.task = "deny"
+  if (agentID === "boom-flag-hunt")
+    permissions.task = { "*": "deny", "boom-pentest-worker": "allow" }
+  else if (effects.delegate === "deny") permissions.task = "deny"
   for (const server of mcpServers) {
     if (!server.agents.some((id) => id === agentID))
       permissions[openCodeMcpToolPattern(server.id)] = "deny"

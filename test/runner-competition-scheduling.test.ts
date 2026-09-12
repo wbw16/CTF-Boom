@@ -21,6 +21,7 @@ function gatedRuntime() {
   const release = new Map<string, () => void>()
   const waiting: Array<() => void> = []
 
+  let gateSeq = 0
   const handle: RuntimeHandle = {
     backend: "fake",
     version: "test",
@@ -47,7 +48,10 @@ function gatedRuntime() {
           async prompt() {
             started.push(slug)
             for (const notify of waiting.splice(0)) notify()
-            await new Promise<void>((resolve) => release.set(slug, resolve))
+            // One gate per prompt, not per slug: two host consultations of the same title run
+            // concurrently, and a slug-keyed gate would overwrite one resolver and hang it.
+            const gate = `${slug}#${(gateSeq += 1)}`
+            await new Promise<void>((resolve) => release.set(gate, resolve))
             return {
               usage: { input: 4, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
               cost: 0,
@@ -143,6 +147,10 @@ describe("competition scheduling", () => {
     // Generous global concurrency: the remote cap must be what limits admission, not this.
     runner.setConcurrency(16)
     runner.setCompetitionSettings({ remoteSlots: 3, localSlots: 8, matchMinutes: 180, endgameMinutes: 20 })
+    // Host consultations (the stall-triggered second opinion) also open a conversation; only the
+    // per-challenge slugs say anything about how the environment cap paces admission.
+    const challengeSlugs = new Set(["r1", "r2", "r3", "r4", "r5"])
+    const startedChallenges = () => runtime.started.filter((slug) => challengeSlugs.has(slug))
     try {
       await runner.enqueue({
         challenges,
@@ -152,7 +160,7 @@ describe("competition scheduling", () => {
         pythonInterpreter: interpreter,
       })
       await runtime.settle(3)
-      expect(runtime.started).toHaveLength(3)
+      expect(startedChallenges()).toHaveLength(3)
       expect(runner.getCompetitionState().usage.remote).toBe(3)
 
       runtime.releaseAll()
@@ -162,7 +170,7 @@ describe("competition scheduling", () => {
       }
       // Every challenge still runs eventually; the cap paces them rather than dropping them.
       // (A challenge may take more than one turn, so compare the distinct set, not the total count.)
-      expect(new Set(runtime.started)).toEqual(new Set(["r1", "r2", "r3", "r4", "r5"]))
+      expect(new Set(startedChallenges())).toEqual(new Set(["r1", "r2", "r3", "r4", "r5"]))
     } finally {
       runtime.releaseAll()
       await runner.close()

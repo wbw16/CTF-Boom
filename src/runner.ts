@@ -20,7 +20,9 @@ import {
 import {
   appendRunEvent,
   assertPathWithin,
+  readChallengeRuns,
   readRunHistory,
+  taskDirectoryFromRoot,
   type RunHistory,
   writeRunResultAtomic,
 } from "./history.ts"
@@ -121,6 +123,7 @@ import {
   type TaskTurn,
 } from "./task.ts"
 import { prepareWorkspace, type Workspace } from "./workspace.ts"
+import { taskSlugRoot } from "./task-layout.ts"
 
 export type ModelInfo = {
   id: string
@@ -430,7 +433,7 @@ function isRemoteURLBlocked(outcome: Pick<Outcome, "stop" | "detail">) {
 export function recoverableRunOutcome(
   outcome: Pick<Outcome, "stop" | "detail" | "finish">,
 ) {
-  if (outcome.stop === "silent" || outcome.stop === "empty") return true
+  if (outcome.stop === "silent" || outcome.stop === "empty" || outcome.stop === "timeout") return true
   const detail = outcome.detail ?? ""
   if (
     outcome.stop === "stalled" &&
@@ -448,6 +451,7 @@ export function recoverableRunOutcome(
 function recoveryHint(
   outcome: Pick<Outcome, "stop" | "detail" | "recoveryContext">,
   attempt: number,
+  unbounded = false,
 ) {
   const action = outcome.stop === "stalled"
     ? /note-gate/i.test(outcome.detail ?? "")
@@ -464,7 +468,9 @@ function recoveryHint(
       : ""
   return [
     action,
-    `This is recovery attempt ${attempt}/${RUN_RECOVERY_ATTEMPTS}; prior results in work/ and NOTES.md are unchanged.`,
+    unbounded
+      ? `This is recovery attempt ${attempt}; this task has no cumulative budget and will keep recovering until completion or user cancellation.`
+      : `This is recovery attempt ${attempt}/${RUN_RECOVERY_ATTEMPTS}; prior results in work/ and NOTES.md are unchanged.`,
     outcome.detail ? `Original stop reason: ${outcome.detail}` : "",
     "Check the durable state first and continue from the last incomplete step; do not redo from scratch.",
     snapshot,
@@ -2125,10 +2131,16 @@ export class GuiRunner {
       : Math.floor(
         job.autonomyBudget.tokens - Math.max(0, totals.billableTokens - baseline.billableTokens),
       )
-    const timeout = Math.floor(
-      job.autonomyBudget.timeout -
-        Math.max(0, activeSolveTimeMs(job.task.turns) - baseline.activeSolveMs),
-    )
+    // Omitting the token ceiling is Boom's run-until-complete mode. `timeout` remains a per-turn
+    // watchdog in that mode: when it fires the host starts a recovery turn instead of consuming a
+    // finite task-wide time allowance. A configured token ceiling retains the historical cumulative
+    // token/time budget semantics.
+    const timeout = tokens === undefined
+      ? job.limits.timeout
+      : Math.floor(
+        job.autonomyBudget.timeout -
+          Math.max(0, activeSolveTimeMs(job.task.turns) - baseline.activeSolveMs),
+      )
     if ((tokens !== undefined && tokens < 1_000) || timeout < 1_000) return undefined
     return { ...job.limits, ...(tokens === undefined ? {} : { tokens }), timeout } satisfies Limits
   }
@@ -2394,6 +2406,15 @@ export class GuiRunner {
       job.task.status === "archived" ||
       job.task.status === "solved"
     ) return false
+    // Run-until-complete must not turn a permanent setup/policy failure (bad credentials, unknown
+    // model, denied path, missing environment binding) into a hot retry loop. Normal yields and the
+    // explicitly recoverable watchdog/provider failures continue; permanent failures remain visible
+    // and require configuration or user action.
+    if (
+      job.autonomyBudget.tokens === undefined &&
+      outcome.stop !== "completed" &&
+      !recoverableRunOutcome(outcome)
+    ) return false
     const turnEvents = job.events.slice(job.progressEventOffset ?? 0)
     const totals = taskTotals(job.task)
     const progress = await recordTurnProgress({
@@ -2426,7 +2447,9 @@ export class GuiRunner {
       this.queueAutonomyJob(
         job,
         limits,
-        "Boom is continuing the same main agent once after a normal yield without a candidate.",
+        job.autonomyBudget.tokens === undefined
+          ? "Boom run-until-complete mode is renewing the same main agent after a normal yield without a candidate. Continue from durable state until a candidate is ready or the user stops the task."
+          : "Boom is continuing the same main agent once after a normal yield without a candidate.",
         Date.now(),
       )
       return true
@@ -2512,15 +2535,12 @@ export class GuiRunner {
       if (job.controller.signal.aborted) return
       const challenge = { ...job.challenge, flagFormat: job.flagFormat }
       await assertPathWithin(this.root, challenge.directory)
-      await assertPathWithin(this.root, path.join(this.root, "runs", challenge.slug), true)
+      await assertPathWithin(this.root, taskSlugRoot(this.root, challenge.slug), true)
       for (const file of challenge.files)
         await assertPathWithin(challenge.directory, path.join(challenge.directory, file))
       if (job.resumeRunID) {
-        const directory = await assertPathWithin(
-          this.root,
-          path.join(this.root, "runs", challenge.slug, job.resumeRunID),
-        )
-        job.workspace = { directory, runID: job.resumeRunID, extracted: [] }
+        const directory = await taskDirectoryFromRoot(this.root, challenge.slug, job.resumeRunID)
+        job.workspace = { directory, runID: job.resumeRunID, input: "input", extracted: [] }
       } else {
         // A model belongs to a turn, not to a task. Keep the task directory stable when the user
         // switches models on a later turn.
@@ -3226,7 +3246,7 @@ export class GuiRunner {
           status: "writeup.queued",
           hint: [
             `Confirmed flag: ${accepted}. The target environment will be released immediately.`,
-            "Now generate the Chinese WRITEUP.md offline from challenge/, work/, and NOTES.md only.",
+            "Now generate the Chinese WRITEUP.md offline from input/, work/, and NOTES.md only.",
             "If a PoC/script was actually used, include its path, invocation, and complete source; if not, do not invent one — just write the core idea, evidence, and reproduction steps.",
           ].join("\n"),
         })
@@ -3252,7 +3272,16 @@ export class GuiRunner {
           runID: job.workspace.runID,
           detail: "accepted flag writeup completed",
         })
-      } else if (!job.controller.signal.aborted && job.writeupAttempts < 2) {
+      } else if (
+        !job.controller.signal.aborted &&
+        (
+          job.writeupAttempts < 2 ||
+          (
+            job.autonomyBudget.tokens === undefined &&
+            (outcome.stop === "completed" || recoverableRunOutcome(outcome))
+          )
+        )
+      ) {
         queuedProductFollowup = this.queueTaskFollowup({
           source: job,
           purpose: "writeup",
@@ -3349,7 +3378,7 @@ export class GuiRunner {
         source: job,
         purpose: "solve",
         status: "run.recovery.queued",
-        hint: recoveryHint(outcome, attempt),
+        hint: recoveryHint(outcome, attempt, job.autonomyBudget.tokens === undefined),
         recoveryAttempts: attempt,
       })
     }

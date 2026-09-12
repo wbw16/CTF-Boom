@@ -1,6 +1,6 @@
 # Boom project memory
 
-Last updated: 2026-08-18.
+Last updated: 2026-09-12.
 
 Read this first when resuming work. It records what is built, what is proven, and what is not — not
 how the code is structured (read the code for that).
@@ -689,3 +689,16 @@ origin/main（40abce42，通用 V3 基线）是 xhlj 的祖先，因此是**快�
 
 兼容性验证：test/platform-credentials.test.ts 覆盖旧 env/旧文件迁移路径；
 dasctf 适配器测试整体改名保留。
+
+## 2026-09-12 仓库清理（残留文件与历史文档）
+
+- 删除本地残留目录：`xihulunjian-ctf/`（7.8G 历史比赛工作区）、`ctf-bak/runs/`（4.2G，
+  仅保留 `ctf-bak/challenges/`）、`claude-code-source-code/`、`tmp-solve/`、
+  `prototype/boom-restyled*.html`、`test-results/`、`.zcode/plans/` 与散落的 `.DS_Store`。
+- 删除过时文档：`docs/BOOM_V2.md`、`docs/BOOM_V2_REMAINING_WORK.md`、`docs/research/v3/`
+  下的 M1–M5 对照研究及停更的 claude-context-migration-experiment；内容可从 git 历史取回。
+  `docs/research/v3/ctf-agent-market-survey.md` 保留（SOLVER_IMPROVEMENT_PLAN 引用）。
+- 移除空 gitlink `web`（mode 160000，指向不存在的提交 `8126fc64`）。
+- `docs/` 仍在 `.gitignore` 中（初始提交即如此，属有意为之）：`PENTEST*.md`、
+  `CONVERSATION_INTERFACES.md`、`SOLVER_IMPROVEMENT_PLAN.md`、`api_doc.md` 仍为本地未跟踪文件；
+  其中 `api_doc.md` 被 `src/platform/adapters/dasctf.ts` 注释引用，若要公开需 `git add -f`。

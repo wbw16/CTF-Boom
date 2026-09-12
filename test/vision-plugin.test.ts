@@ -16,9 +16,9 @@ afterEach(async () => {
 async function visionFixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "boom-vision-"))
   temporary.push(root)
-  await mkdir(path.join(root, "challenge"))
+  await mkdir(path.join(root, "input"))
   await mkdir(path.join(root, "work"))
-  await writeFile(path.join(root, "challenge", "sample.png"), Buffer.from("89504e470d0a1a0a", "hex"))
+  await writeFile(path.join(root, "input", "sample.png"), Buffer.from("89504e470d0a1a0a", "hex"))
   return root
 }
 
@@ -43,7 +43,7 @@ function visionClient(prompts: Record<string, unknown>[], deleted: string[]) {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function runDescribe(definition: any, root: string, question: string) {
   return definition.execute(
-    { path: "challenge/sample.png", question },
+    { path: "input/sample.png", question },
     {
       directory: root,
       worktree: root,
@@ -90,7 +90,7 @@ test("describe-image persists its question and answer to work/vision-log.md", as
   await runDescribe(definition!, root, "Describe the top band pattern.")
 
   const log = await readFile(path.join(root, "work", "vision-log.md"), "utf8")
-  expect(log).toContain("describe-image · challenge/sample.png")
+  expect(log).toContain("describe-image · input/sample.png")
   expect(log).toContain("**问题**：Read the pixel text character by character.")
   expect(log).toContain("Describe the top band pattern.")
   expect(log).toContain("visible answer")

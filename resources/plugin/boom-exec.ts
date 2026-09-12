@@ -227,7 +227,12 @@ Use isolated for unknown binaries or untrusted installers. It never falls back t
           const runtime = await containerRuntime()
           if (!runtime) throw new Error("isolated execution unavailable; Docker/Podman is missing")
           const relative = path.relative(sessionRoot, cwd).split(path.sep).join("/")
-          command = [runtime, "run", "--rm", "--user", "65534:65534", "--read-only", "--cpus", "1", "--memory", "1g", "--pids-limit", "128", "--network", network ? "bridge" : "none", "--mount", `type=bind,src=${path.join(sessionRoot, "challenge")},dst=/task/challenge,readonly`, "--mount", `type=bind,src=${path.join(sessionRoot, "work")},dst=/task/work`, "--workdir", `/task/${relative}`, "ghcr.io/openai/boom-ctf-tools:latest", path.basename(resolved.executable), ...resolved.prefix, ...argv]
+          // The read-only input snapshot is `input/`; task directories written before the rename
+          // still carry `challenge/`. Plugins are self-contained, so the name is resolved here.
+          const inputDirectory = await lstat(path.join(sessionRoot, "input"))
+            .then((info) => (info.isDirectory() && !info.isSymbolicLink() ? "input" : "challenge"))
+            .catch(() => "challenge")
+          command = [runtime, "run", "--rm", "--user", "65534:65534", "--read-only", "--cpus", "1", "--memory", "1g", "--pids-limit", "128", "--network", network ? "bridge" : "none", "--mount", `type=bind,src=${path.join(sessionRoot, inputDirectory)},dst=/task/${inputDirectory},readonly`, "--mount", `type=bind,src=${path.join(sessionRoot, "work")},dst=/task/work`, "--workdir", `/task/${relative}`, "ghcr.io/openai/boom-ctf-tools:latest", path.basename(resolved.executable), ...resolved.prefix, ...argv]
         } else if (process.platform === "darwin") {
           command = ["/usr/bin/sandbox-exec", "-p", sandboxProfile(sessionRoot, binding, network), ...command]
         }

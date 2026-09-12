@@ -43,6 +43,8 @@ describe("Boom-native tool host", () => {
     expect(host.names).toEqual([
       "bash", "read", "edit", "list", "glob", "grep", "skill", "websearch",
       "webfetch", "todowrite", "boom-exec", "ctf-note", "ctf-consult", "ctf-submit",
+      "pentest-note", "pentest-asset", "pentest-observation", "pentest-evidence", "pentest-finding",
+      "pentest-flag",
     ])
     expect(host.definitions["ctf-note"].schema).toEqual(expect.objectContaining({
       required: ["kind", "text"],

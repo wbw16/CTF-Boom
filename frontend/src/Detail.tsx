@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react"
-import { Check, Copy, FileText, Flag as FlagIcon, MoreHorizontal, Play, Square, X } from "lucide-react"
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react"
+import { Bell, Check, Copy, FileText, Flag as FlagIcon, Menu, MoreHorizontal, Play, Square, Trophy, X } from "lucide-react"
 import { useApp } from "./context"
 import { useActions } from "./actions"
-import { patchJSON, postJSON } from "./api"
-import { compactNumber, durationMs, eventStart, mmss, shortModel, verificationText } from "./format"
+import { api, patchJSON, postJSON } from "./api"
+import { compactNumber, durationMs, eventStart, mmss, verificationText } from "./format"
 import { renderMarkdown } from "./markdown"
+import { HeaderUtilities } from "./HeaderUtilities"
 import {
   alternatives,
   categoryOf,
@@ -15,16 +16,34 @@ import {
   formatMismatch,
   isLive,
   isUnconfirmedFlag,
+  latestFlagRun,
   primary,
   withRunDetail,
 } from "./state"
-import type { ChallengeGui, RunFile, RunHistory } from "./types"
+import type { ChallengeGui, CompetitionState, RunFile, RunHistory } from "./types"
 
 const TABS = ["activity", "evidence", "results"] as const
 type Tab = (typeof TABS)[number]
 
+const TAB_LABELS: Record<Tab, string> = {
+  activity: "活动",
+  evidence: "证据",
+  results: "结果",
+}
+
+type MatchOverview = { point: number; rank?: number }
+
+function hms(ms: number) {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return `${h > 0 ? `${h}:` : ""}${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+}
+
+/** CTF-mode main surface: the pinned competition strip, the challenge header, flag verdict, and the three panes. */
 export function Detail() {
-  const { data, selected, detail, now, toast, refresh, loadDetail, openDialog } = useApp()
+  const { data, selected, detail, now, toast, refresh, loadDetail, openDialog, openChallengeEditor, platform, unreadNoticeCount, setSidebarOpen } = useApp()
   const actions = useActions()
   const [tab, setTab] = useState<Tab>("activity")
   const [hint, setHint] = useState("")
@@ -33,8 +52,47 @@ export function Detail() {
   const challenge = summaryChallenge ? withRunDetail(summaryChallenge, detail) : undefined
   const [remoteDraft, setRemoteDraft] = useState("")
   const [savingRemote, setSavingRemote] = useState(false)
+  const [competition, setCompetition] = useState<CompetitionState | null>(null)
+  const [overview, setOverview] = useState<MatchOverview | null>(null)
   useEffect(() => setDetailMenu(false), [selected])
   useEffect(() => setRemoteDraft(challenge?.remote ?? ""), [selected, challenge?.remote])
+
+  // Match state (clock, autopilot) and platform ranking only matter in CTF mode.
+  useEffect(() => {
+    let cancelled = false
+    const read = () => {
+      void api<CompetitionState>("/api/competition")
+        .then((next) => {
+          if (!cancelled) setCompetition(next.unavailable ? null : next)
+        })
+        .catch(() => {})
+    }
+    read()
+    const timer = setInterval(read, 5_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!platform?.id) return
+    let cancelled = false
+    const read = () => {
+      void api<MatchOverview>(`/api/platform/${platform.id}/overview`)
+        .then((next) => {
+          if (!cancelled) setOverview(next)
+        })
+        .catch(() => {})
+    }
+    read()
+    const timer = setInterval(read, 20_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [platform?.id])
+
   useEffect(() => {
     if (!detailMenu) return
     const close = (event: KeyboardEvent) => {
@@ -43,11 +101,135 @@ export function Detail() {
     document.addEventListener("keydown", close)
     return () => document.removeEventListener("keydown", close)
   }, [detailMenu])
+
+  const runAll = useCallback(async () => {
+    try {
+      const result = await postJSON<{ competition: CompetitionState }>("/api/competition/autopilot/start")
+      setCompetition(result.competition)
+      toast("比赛已开始：正在同步题目，并每 10 分钟自动检查新题")
+      await refresh()
+    } catch (error) {
+      toast((error as Error).message, "error")
+    }
+  }, [refresh, toast])
+
+  const halt = useCallback(async () => {
+    try {
+      const result = await postJSON<{ stopped: number; competition: CompetitionState }>("/api/competition/autopilot/stop")
+      setCompetition(result.competition)
+      toast(`无人值守已停止，并已请求停止 ${result.stopped} 个运行`)
+      await refresh()
+    } catch (error) {
+      toast((error as Error).message, "error")
+    }
+  }, [refresh, toast])
+
+  // Pending flags span every challenge, so the count is global: it feeds the strip badge and
+  // the copy-all action below.
+  const pendingRows = useMemo(
+    () =>
+      (data?.challenges ?? [])
+        .map((item) => [item, latestFlagRun(item)] as const)
+        .filter(
+          ([item, run]) =>
+            run && primary(run) && run.taskStatus !== "archived" && !run.confirmedFlag,
+        ),
+    [data],
+  )
+
+  const copyPending = useCallback(async () => {
+    if (!pendingRows.length) {
+      toast("还没有得到任何 flag")
+      return
+    }
+    const text = pendingRows.map(([item, run]) => `${item.slug}\t${primary(run)}`).join("\n")
+    try {
+      await navigator.clipboard.writeText(text)
+      toast(`已复制 ${pendingRows.length} 个 flag`)
+    } catch {
+      toast("复制失败，请手动选中", "error")
+    }
+  }, [pendingRows, toast])
+
+  // Two bars, two scopes: this one holds competition state and app-wide controls, the challenge
+  // header below holds the selected challenge and its task actions. Competition state never
+  // depends on the selected challenge, so the strip is pinned outside the scrolling detail area
+  // and also renders in the no-challenge empty state below.
+  const autopilotOn = competition?.autopilot?.enabled === true
+  const matchStrip = (
+    <header className="match-strip" aria-label="赛事与全局操作">
+      <button type="button" className="icon-button mobile-only" aria-label="打开题目队列" onClick={() => setSidebarOpen(true)}>
+        <Menu className="icon" />
+      </button>
+      <span className="match-identity">
+        <Trophy className="icon lg" />
+        <span className="match-name">{platform?.displayName ?? "比赛平台"}</span>
+        <span className={`match-live${autopilotOn ? "" : " paused"}`}>
+          <i className={`state-dot ${autopilotOn ? "running" : "paused"}`} />
+          {competition
+            ? autopilotOn
+              ? competition.autopilot?.syncing ? "正在同步赛题" : "无人值守运行中"
+              : "自动巡航已停止"
+            : "未接入"}
+        </span>
+      </span>
+      <span className="match-tail">
+        {competition?.clock?.started ? (
+          <span className="match-metric match-clock" title="比赛剩余时间">
+            <b>{competition.clock.over ? "已结束" : hms(competition.clock.remainingMs)}</b>
+          </span>
+        ) : null}
+        <span className="match-metric match-rank">排名 <b>{overview?.rank ? `#${overview.rank}` : "—"}</b></span>
+        {overview ? <span className="match-metric match-points">积分 <b>{overview.point}</b></span> : null}
+        {competition ? (
+          <span className="match-metric match-containers">
+            容器 <b>{competition.usage.remote}/{competition.settings.remoteSlots}</b>
+          </span>
+        ) : null}
+        <button
+          type="button"
+          className={`pending-pill${pendingRows.length ? "" : " zero"}`}
+          onClick={() => void copyPending()}
+          title="复制全部待确认 flag"
+        >
+          <Copy className="icon sm" />
+          <b>{pendingRows.length}</b>
+          <span>待确认</span>
+        </button>
+        <span className="match-actions">
+          <button type="button" className="quiet-button" onClick={() => openDialog("competition")} title="打开比赛平台控制台">
+            <Trophy className="icon sm" /> 比赛控制台
+          </button>
+          <button
+            type="button"
+            className="quiet-button"
+            onClick={() => openDialog("notices")}
+            title={unreadNoticeCount ? `通知公告（${unreadNoticeCount} 条未读，每 60 秒自动更新）` : "通知公告（已全部阅读）"}
+          >
+            <Bell className="icon sm" /> 公告 {unreadNoticeCount > 0 ? <span className="notice-count">{unreadNoticeCount}</span> : null}
+          </button>
+          {autopilotOn ? (
+            <button type="button" className="quiet-button danger" onClick={() => void halt()}>
+              <Square className="icon sm" /> <span>停止比赛</span>
+            </button>
+          ) : (
+            <button type="button" className="quiet-button" onClick={() => void runAll()}>
+              <Play className="icon sm" /> <span>开始比赛</span>
+            </button>
+          )}
+        </span>
+        {/* Workspace utilities close the row: the quick-config popover drops from this corner. */}
+        <HeaderUtilities />
+      </span>
+    </header>
+  )
+
   if (!data) return null
   if (!challenge) {
     return (
-      <main className="main">
-        <div className="empty">没有题目</div>
+      <main className="ctf-main">
+        {matchStrip}
+        <div className="empty" style={{ margin: "auto" }}>没有题目</div>
       </main>
     )
   }
@@ -122,13 +304,13 @@ export function Detail() {
 
   const primaryContent =
     primaryKind === "stop" ? (
-      <><Square size={12} /> 停止本题</>
+      <><Square className="icon sm" /> <span className="button-label">停止本题</span></>
     ) : primaryKind === "confirm" ? (
-      <><Check size={12} /> 确认 Flag</>
+      <><Check className="icon sm" /> <span className="button-label">确认 Flag</span></>
     ) : primaryKind === "writeup" ? (
-      <><FileText size={12} /> 生成 Writeup</>
+      <><FileText className="icon sm" /> <span className="button-label">生成 Writeup</span></>
     ) : (
-      <><Play size={12} /> {run ? "继续任务" : "开始任务"}</>
+      <><Play className="icon sm" /> <span className="button-label">{run ? "继续任务" : "开始任务"}</span></>
     )
 
   const verdictAction = async (action: "copy" | "wrong") => {
@@ -144,18 +326,142 @@ export function Detail() {
       await actions.reviewFlag(challenge.slug, flagRun, flag, false, hint)
   }
 
+  const runStateText = live
+    ? run!.stop === "queued"
+      ? "排队中"
+      : "运行中"
+    : pendingCandidate
+      ? "等待人工确认"
+      : archived
+        ? "已归档"
+        : accepted
+          ? "已解出"
+          : run
+            ? "等待继续"
+            : "等待运行"
+  const verdictClass = pendingCandidate
+    ? ""
+    : accepted
+      ? " confirmed"
+      : mismatch
+        ? " mismatch"
+        : " running"
+  const verdictStatus = pendingCandidate
+    ? "候选 Flag · 等待确认"
+    : accepted
+      ? archived ? "Flag 已确认 · 已归档" : "Flag 已确认"
+      : mismatch
+        ? "候选 flag 不符合格式"
+        : live
+          ? "Boom 正在解题"
+          : run
+            ? "本次运行未得到 flag"
+            : "尚未开始"
+  const verdictValue = flag
+    ? flag
+    : live
+      ? "正在分析附件与远程服务…"
+      : run
+        ? "本次运行未得到 flag"
+        : "开始后，运行活动会显示在下方"
+  const defaultEnvironment = data.environments.profiles.find(
+    (profile) => profile.id === data.environments.defaultProfileId,
+  ) ?? data.environments.profiles[0]
+
   return (
-    <main className="main">
-      <div className="detail-header">
-        <div className="detail-title">
-          <h2>{categoryOf(challenge)} / {challenge.slug}</h2>
-          <span className="tag">{challenge.files.length} 个附件{challenge.difficulty ? ` · ${challenge.difficulty}` : ""}</span>
-          <span className="spacer" />
-          <span className="num detail-stats">
-            {compactNumber(run?.tokens ?? 0)} tokens · {run ? mmss(durationMs(run, now)) : "00:00"} · $
-            {(run?.cost ?? 0).toFixed(4)}
-          </span>
+    <main className="ctf-main">
+      {matchStrip}
+
+      <header className="ctf-header" aria-label="当前题目">
+        <div className="ctf-title">
+          <div className="ctf-title-row">
+            <h2>{challenge.slug}</h2>
+            <span className="tag blue">
+              {categoryOf(challenge)}{challenge.difficulty ? ` · ${challenge.difficulty}` : ""}
+            </span>
+          </div>
+          <p>
+            {challenge.files.length} 个附件 · 独立任务 {challenge.runs.length}
+            {run?.turns?.length ? ` · 已完成 ${run.turns.length} 轮` : run ? " · 进行中" : " · 未开始"}
+          </p>
         </div>
+        <div className="ctf-header-metrics">
+          <span><b>{compactNumber(run?.tokens ?? 0)}</b> tokens</span>
+          <span><b>{run ? mmss(durationMs(run, now)) : "00:00"}</b></span>
+          <span><b>${(run?.cost ?? 0).toFixed(4)}</b></span>
+        </div>
+        {primaryKind === "run" ? (
+          <input
+            className="hint-input"
+            placeholder="给 Boom 一条提示（可选）"
+            value={hint}
+            onChange={(event) => setHint(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault()
+                void rerun()
+              }
+            }}
+          />
+        ) : null}
+        <button
+          type="button"
+          className={`primary-button${primaryKind === "stop" ? " pause" : ""}`}
+          data-run-action={primaryKind === "run" ? "true" : undefined}
+          onClick={() => void runPrimaryAction()}
+        >
+          {primaryContent}
+        </button>
+        <div className={`detail-menu-wrap${detailMenu ? " open" : ""}`}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="更多任务操作"
+            aria-expanded={detailMenu}
+            onClick={() => setDetailMenu((current) => !current)}
+          >
+            <MoreHorizontal className="icon" />
+          </button>
+          {detailMenu ? (
+            <div className="context-menu detail-menu">
+              {primaryKind !== "run" && !live ? (
+                <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void rerun() }}>
+                  <Play className="icon sm" /> 继续当前任务
+                </button>
+              ) : null}
+              {flag ? (
+                <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void verdictAction("copy") }}>
+                  <Copy className="icon sm" /> 复制 Flag
+                </button>
+              ) : null}
+              {pendingCandidate ? (
+                <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void verdictAction("wrong") }}>
+                  <X className="icon sm" /> 否定候选
+                </button>
+              ) : null}
+              <div className="menu-sep" />
+              <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); openChallengeEditor({ mode: "edit", slug: challenge.slug }) }}>
+                ✎ 编辑题面 / 附件 / 答案
+              </button>
+              <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void actions.startConsultation(challenge.slug, settings, run?.id) }}>
+                ⚖ 发起会诊
+              </button>
+              {run && !live ? (
+                <>
+                  <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void switchEnvironment(challenge, run, settings, actions.switchTaskEnvironment, data) }}>
+                    切换运行环境
+                  </button>
+                  <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void openTaskDirectory(challenge, run) }}>
+                    打开任务目录
+                  </button>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      </header>
+
+      <div className="ctf-main-scroll">
         {challenge.serviceRequired ? (
           <form
             className="service-endpoint"
@@ -190,14 +496,6 @@ export function Detail() {
                 清除
               </button>
             ) : null}
-            <button
-              type="button"
-              className="btn btn-tiny"
-              disabled
-              title="接入平台的单题取址接口后在这里启用"
-            >
-              从平台获取
-            </button>
             <span className="service-endpoint-help">
               {challenge.remote?.trim()
                 ? "已填写服务地址，继续任务时会进行远程操作。"
@@ -205,87 +503,7 @@ export function Detail() {
             </span>
           </form>
         ) : null}
-        <div className="detail-actions">
-          {flag ? (
-            <button
-              type="button"
-              className="detail-flag"
-              title={`点击复制 ${flag}`}
-              aria-label={`复制 Flag ${flag}`}
-              onClick={() => void verdictAction("copy")}
-            >
-              <span className="detail-flag-label"><FlagIcon size={11} aria-hidden="true" /> 已找到 Flag</span>
-              <span className="detail-flag-value">{flag}</span>
-              <Copy size={12} aria-hidden="true" />
-            </button>
-          ) : null}
-          {primaryKind === "run" ? (
-            <input
-              className="hint-input"
-              placeholder="给 Boom 一条提示（可选）"
-              value={hint}
-              onChange={(event) => setHint(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault()
-                  void rerun()
-                }
-              }}
-            />
-          ) : !flag ? <span className="spacer" /> : null}
-          <button
-            type="button"
-            className={`btn ${primaryKind === "stop" ? "" : "btn-primary"}`}
-            data-run-action={primaryKind === "run" ? "true" : undefined}
-            onClick={() => void runPrimaryAction()}
-          >
-            {primaryContent}
-          </button>
-          <div className={`detail-menu-wrap${detailMenu ? " open" : ""}`}>
-            <button
-              type="button"
-              className="icon-btn detail-more"
-              aria-label="更多任务操作"
-              aria-expanded={detailMenu}
-              onClick={() => setDetailMenu((current) => !current)}
-            >
-              <MoreHorizontal size={17} />
-            </button>
-            {detailMenu ? (
-              <div className="context-menu detail-menu">
-                {primaryKind !== "run" && !live ? (
-                  <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void rerun() }}>
-                    <Play size={13} /> 继续当前任务
-                  </button>
-                ) : null}
-                {flag ? (
-                  <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void verdictAction("copy") }}>
-                    <Copy size={13} /> 复制 Flag
-                  </button>
-                ) : null}
-                {pendingCandidate ? (
-                  <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void verdictAction("wrong") }}>
-                    <X size={13} /> 否定候选
-                  </button>
-                ) : null}
-                <div className="menu-sep" />
-                <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void actions.startConsultation(challenge.slug, settings, run?.id) }}>
-                  ⚖ 发起会诊
-                </button>
-                {run && !live ? (
-                  <>
-                    <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void switchEnvironment(challenge, run, settings, actions.switchTaskEnvironment, data) }}>
-                      切换运行环境
-                    </button>
-                    <button type="button" className="menu-item" onClick={() => { setDetailMenu(false); void openWork(challenge, run) }}>
-                      打开 work/
-                    </button>
-                  </>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        </div>
+
         <Alerts
           challenge={challenge}
           run={run}
@@ -295,108 +513,245 @@ export function Detail() {
           onFixFormat={fixFormat}
           onRaiseBudget={() => void raiseBudget()}
         />
-      </div>
 
-      <div className="tabs">
-        {TABS.map((name) => (
-          <button
-            type="button"
-            key={name}
-            className={tab === name ? "active" : ""}
-            onClick={() => setTab(name)}
-          >
-            {TAB_LABELS[name]}
-          </button>
-        ))}
-      </div>
-      <div className="panes">
-        <Pane active={tab === "activity"} compound>
-          <div className="activity-layout">
-            <section className="workspace-section">
-              <h3>运行日志</h3>
-              <StreamPane run={run} />
-            </section>
-            <section className="workspace-section activity-side">
-              <h3>检查点与会诊</h3>
-              <ConsultationPane run={run} />
-            </section>
-          </div>
-        </Pane>
-        <Pane active={tab === "evidence"} compound>
-          <div className="evidence-layout">
-            <section className="workspace-section">
-              <h3>NOTES</h3>
-              <MarkdownPane text={run?.notes} fallback="（尚无 NOTES.md 内容）" />
-            </section>
-            <section className="workspace-section">
-              <h3>文件</h3>
-              <FilesPane run={run} challenge={challenge} />
-            </section>
-          </div>
-        </Pane>
-        <Pane active={tab === "results"} compound>
-          <div className="results-layout">
-            <section className="workspace-section">
-              <h3>Flag</h3>
-              <Verdict
-                challenge={challenge}
+        <div className="ctf-summary-grid">
+          <section className={`flag-verdict${verdictClass}`} aria-label="Flag 判定">
+            <span className="flag-verdict-icon">
+              <FlagIcon className="icon lg" />
+            </span>
+            <span className="flag-verdict-copy">
+              <span>{verdictStatus}</span>
+              <code className="vflag">{verdictValue}</code>
+              <SourceNotes
                 run={run}
                 flagRun={flagRun}
                 flag={flag}
-                mismatch={!!mismatch}
-                accepted={accepted}
                 archived={archived}
-                onAction={(action) => void verdictAction(action)}
+                accepted={accepted}
+                onCopyAlternative={(value) =>
+                  void navigator.clipboard.writeText(value).then(
+                    () => toast("已复制备选串"),
+                    () => toast("复制失败，请手动选中", "error"),
+                  )
+                }
               />
+            </span>
+            {flag ? (
+              <span className="flag-verdict-actions">
+                <button type="button" className="secondary-button" title="复制 Flag" onClick={() => void verdictAction("copy")}>
+                  <Copy className="icon sm" /> 复制
+                </button>
+                {!accepted ? (
+                  <button type="button" className="quiet-button danger" onClick={() => void verdictAction("wrong")}>
+                    否定
+                  </button>
+                ) : null}
+              </span>
+            ) : null}
+          </section>
+          <section className="run-facts" aria-label="运行摘要">
+            <div className="run-fact"><span>状态</span><b>{runStateText}</b></div>
+            <div className="run-fact"><span>主模型</span><b title={run?.model}>{run?.model ?? settings.strongModel}</b></div>
+            <div className="run-fact">
+              <span>运行环境</span>
+              <b title={run?.environment?.displayName ?? defaultEnvironment?.displayName}>
+                {run?.environment?.displayName ?? defaultEnvironment?.displayName ?? "未绑定"}
+              </b>
+            </div>
+            <div className="run-fact"><span>Flag 格式</span><b>{settings.flagFormat || "未设置"}</b></div>
+          </section>
+        </div>
+
+        <div className="ctf-tabs" role="tablist" aria-label="题目视图">
+          {TABS.map((name) => (
+            <button
+              type="button"
+              key={name}
+              role="tab"
+              aria-selected={tab === name}
+              className={`ctf-tab${tab === name ? " active" : ""}`}
+              onClick={() => setTab(name)}
+            >
+              {TAB_LABELS[name]}
+            </button>
+          ))}
+          <span className="spacer" />
+          <span className="muted" style={{ fontSize: 12 }}>任务记录已保存</span>
+        </div>
+
+        <div className={`ctf-pane${tab === "activity" ? " active" : ""}`}>
+          <div className="ctf-activity-layout">
+            <section className="panel">
+              <header className="panel-head">
+                <h3>运行活动</h3>
+                <span className="meta">最近事件优先 · 完整日志保留</span>
+              </header>
+              <EventList run={run} />
+            </section>
+            <aside className="panel">
+              <header className="panel-head">
+                <h3>检查点与会诊</h3>
+                <span className="meta">{run?.turns?.length ? `第 ${run.turns.length} 轮` : "—"}</span>
+              </header>
+              <ConsultationPane run={run} />
+            </aside>
+          </div>
+        </div>
+        <div className={`ctf-pane${tab === "evidence" ? " active" : ""}`}>
+          <div className="evidence-grid">
+            <section className="panel">
+              <header className="panel-head">
+                <h3>NOTES.md</h3>
+                <span className="meta">自动保存</span>
+              </header>
+              <MarkdownPane text={run?.notes} fallback="（尚无 NOTES.md 内容）" />
+            </section>
+            <section className="panel">
+              <header className="panel-head">
+                <h3>附件与产物</h3>
+                <span className="meta">{run?.files?.length ?? challenge.files.length} 个文件</span>
+              </header>
+              <FilesPane run={run} challenge={challenge} />
+            </section>
+          </div>
+        </div>
+        <div className={`ctf-pane${tab === "results" ? " active" : ""}`}>
+          <div className="results-grid">
+            <section className="panel">
+              <header className="panel-head">
+                <h3>Flag 记录</h3>
+                <span className="meta">完整候选历史</span>
+              </header>
               <FlagsPane challenge={challenge} run={run} />
             </section>
-            <section className="workspace-section">
-              <h3>Writeup</h3>
-              <MarkdownPane text={flag ? flagRun?.writeup ?? "" : ""} fallback="暂无 Writeup" />
+            <section className="panel">
+              <header className="panel-head">
+                <h3>Writeup</h3>
+                <span className="meta">{flagRun?.writeup ? "已生成" : "待生成"}</span>
+              </header>
+              {flag && flagRun?.writeup ? (
+                <div className="writeup-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(flagRun.writeup) }} />
+              ) : (
+                <div className="writeup-preview">
+                  <h3>确认 Flag 后生成</h3>
+                  <p>Boom 将基于已保存的 NOTES、命令、脚本和 Flag 证据整理完整解题过程。</p>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={!accepted}
+                    style={{ width: "100%", marginTop: 9 }}
+                    onClick={() => flagRun && void actions.writeupRun(challenge.slug, flagRun.id)}
+                  >
+                    生成 Writeup
+                  </button>
+                </div>
+              )}
               <details className="result-meta">
                 <summary>运行元数据</summary>
                 <MetaPane run={flagRun ?? run} flag={flag} flagRun={flagRun} now={now} />
               </details>
             </section>
           </div>
-        </Pane>
+        </div>
       </div>
       {detailMenu ? <div className="detail-menu-backdrop" onPointerDown={() => setDetailMenu(false)} /> : null}
     </main>
   )
 }
 
-const TAB_LABELS: Record<Tab, string> = {
-  activity: "活动",
-  evidence: "证据",
-  results: "结果",
-}
-
-function Pane({ active, children, compound = false }: { active: boolean; children: ReactNode; compound?: boolean }) {
-  return <div className={`pane${active ? " active" : ""}${compound ? " compound" : ""}`}>{children}</div>
-}
-
-function StreamPane({ run }: { run?: RunHistory }) {
-  if (!run?.events?.length) return <div className="empty">该历史运行没有事件日志；结果、NOTES 和文件仍可复核。</div>
+function EventList({ run }: { run?: RunHistory }) {
+  if (!run?.events?.length)
+    return <div className="ctf-event-list"><div className="empty">该历史运行没有事件日志；结果、NOTES 和文件仍可复核。</div></div>
   const start = eventStart(run)
-  const lines = run.events.slice(-600).map((event) => eventLine(event, start))
-  return <pre className="stream-pre" dangerouslySetInnerHTML={{ __html: lines.join("\n") }} />
+  const rows = run.events.slice(-600).reverse().map((event, index) => {
+    const at = mmss((event.at - start) / 1000)
+    if (event.type === "tool")
+      return (
+        <div className="ctf-event" key={index}>
+          <time>{at}</time>
+          <span className="ctf-event-kind">{event.tool}</span>
+          <span>{event.text ?? event.status ?? ""}</span>
+          <small>{event.status ?? ""}</small>
+        </div>
+      )
+    if (event.type === "usage")
+      return (
+        <div className="ctf-event" key={index}>
+          <time>{at}</time>
+          <span className="ctf-event-kind">usage</span>
+          <span>{compactNumber(event.tokens)} tokens · ${Number(event.cost || 0).toFixed(4)}</span>
+          <small></small>
+        </div>
+      )
+    if (event.type === "text")
+      return (
+        <div className="ctf-event" key={index}>
+          <time>{at}</time>
+          <span className="ctf-event-kind good">结论</span>
+          <span>{event.text ?? ""}</span>
+          <small></small>
+        </div>
+      )
+    const bad = ["error", "budget", "stalled", "timeout", "aborted"].includes(event.status ?? "")
+    const kind = event.status ?? event.type
+    return (
+      <div className="ctf-event" key={index}>
+        <time>{at}</time>
+        <span className={`ctf-event-kind${bad ? " bad" : kind === "completed" || kind === "start" ? " good" : ""}`}>{kind}</span>
+        <span>{event.text ?? ""}</span>
+        <small></small>
+      </div>
+    )
+  })
+  return <div className="ctf-event-list">{rows}</div>
 }
 
-function eventLine(event: RunHistory["events"][number], start: number) {
-  const at = `${mmss((event.at - start) / 1000)} `
-  if (event.type === "tool")
-    return `${at}<span class="${event.status === "error" ? "bad" : "tool"}">${escapeHtml(event.tool)}</span> ${escapeHtml(event.text ?? event.status ?? "")}`
-  if (event.type === "usage")
-    return `${at}<span class="tool">usage</span> ${compactNumber(event.tokens)} tokens · $${Number(event.cost || 0).toFixed(4)}`
-  if (event.type === "text") return `${at}<span class="say">${escapeHtml(event.text ?? "")}</span>`
-  const bad = ["error", "budget", "stalled", "timeout", "aborted"].includes(event.status ?? "")
-  return `${at}<span class="${bad ? "bad" : event.status === "completed" ? "good" : "tool"}">${escapeHtml(event.status ?? event.type)}</span> ${escapeHtml(event.text ?? "")}`
-}
-
-function escapeHtml(value: unknown) {
-  return String(value ?? "").replace(/[&<>"]/g, (char) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char] as string)
+function SourceNotes({
+  run,
+  flagRun,
+  flag,
+  archived,
+  accepted,
+  onCopyAlternative,
+}: {
+  run?: RunHistory
+  flagRun?: RunHistory
+  flag: string
+  archived: boolean
+  accepted: boolean
+  onCopyAlternative: (value: string) => void
+}) {
+  const parts: string[] = []
+  if (flag && flagRun) {
+    const source =
+      flagRun.candidateSource === "submission"
+        ? "由 Boom 提交槽接收"
+        : flagRun.candidateSource === "regex"
+          ? "按设定正则提取"
+          : "由模型判定"
+    parts.push(`${source} · ${verificationText(flagRun)}`)
+  }
+  if (archived) parts.push("✓ Writeup 已完成，任务已归档")
+  else if (accepted) parts.push("✓ Flag 已确认，主流程结束；需要时点击「生成 Writeup」")
+  if (flagRun?.rejectedFlags?.includes(flag)) parts.push("已标记为错误，仍会保留；如果判断有误可重新确认。")
+  if (flag && flagRun !== run) parts.push("历史任务中的候选；当前运行没有新 flag。")
+  const others = useMemo(() => alternatives(flagRun), [flagRun])
+  if (!parts.length && !others.length) return null
+  return (
+    <span className="src">
+      {parts.map((part, index) => <span key={index}>{part}<br /></span>)}
+      {others.length ? (
+        <>
+          本任务历史候选：
+          {others.map((candidate) => (
+            <button type="button" key={candidate} className="alt" onClick={() => onCopyAlternative(candidate)}>
+              {candidate}
+            </button>
+          ))}
+        </>
+      ) : null}
+    </span>
+  )
 }
 
 function Alerts({
@@ -452,112 +807,23 @@ function Alerts({
   return <>{alerts}</>
 }
 
-function Verdict({
-  challenge,
-  run,
-  flagRun,
-  flag,
-  mismatch,
-  accepted,
-  archived,
-  onAction,
-}: {
-  challenge: ChallengeGui
-  run?: RunHistory
-  flagRun?: RunHistory
-  flag: string
-  mismatch: boolean
-  accepted: boolean
-  archived: boolean
-  onAction: (action: "copy" | "wrong") => void
-}) {
-  const { toast } = useApp()
-  const sourceParts: string[] = []
-  if (flag && flagRun) {
-    const source =
-      flagRun.candidateSource === "submission"
-        ? "由 Boom 提交槽接收"
-        : flagRun.candidateSource === "regex"
-          ? "按设定正则提取"
-          : "由模型判定"
-    sourceParts.push(`${source} · ${verificationText(flagRun)}`)
-  }
-  if (archived) sourceParts.push("✓ Writeup 已完成，任务已归档")
-  else if (accepted) sourceParts.push("✓ Flag 已确认，主流程结束；需要时点击「生成 Writeup」")
-  if (flagRun?.rejectedFlags?.includes(flag)) sourceParts.push("已标记为错误，仍会保留；如果判断有误可重新确认。")
-  const others = alternatives(flagRun)
-  if (flag && flagRun !== run) sourceParts.push("历史任务中的候选；当前运行没有新 flag。")
-
-  return (
-    <div className={`verdict${flag ? " has-flag" : ""}${mismatch ? " mismatch" : ""}${flag && !mismatch && !accepted ? " candidate" : ""}${flag && !mismatch && accepted ? " accepted" : ""}`}>
-      {flag ? (
-        <div className="verdict-head">
-          <span><FlagIcon size={13} aria-hidden="true" /> 已找到 Flag</span>
-          <em>{mismatch ? "格式不符" : archived ? "已归档" : accepted ? "已确认" : "待确认"}</em>
-        </div>
-      ) : null}
-      <span className={`vflag${flag ? mismatch ? " miss" : "" : " none"}`}>
-        {flag || (run ? "本次运行未得到 flag" : "尚未运行")}
-      </span>
-      {flag ? (
-        <div className="flag-actions">
-          <button type="button" className="btn btn-tiny" onClick={() => onAction("copy")}>
-            <Copy size={11} /> 复制
-          </button>
-          {!accepted ? (
-            <button type="button" className="btn btn-tiny" onClick={() => onAction("wrong")}>
-              <X size={11} /> 否定
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-      {sourceParts.length ? (
-        <span className="src">
-          {sourceParts.map((part, index) => (
-            <span key={index}>{part}<br /></span>
-          ))}
-        </span>
-      ) : null}
-      {others.length ? (
-        <span className="src">
-          本任务历史候选：
-          {others.map((candidate) => (
-            <button
-              type="button"
-              key={candidate}
-              className="alt"
-              onClick={() =>
-                void navigator.clipboard.writeText(candidate).then(
-                  () => toast("已复制备选串"),
-                  () => toast("复制失败，请手动选中", "error"),
-                )
-              }
-            >
-              {candidate}
-            </button>
-          ))}
-        </span>
-      ) : null}
-    </div>
-  )
-}
-
 function FlagsPane({ challenge, run }: { challenge: ChallengeGui; run?: RunHistory }) {
   const { toast } = useApp()
   const actions = useActions()
   const entries = flagEntries(challenge, run)
-  if (!entries.length) return <div className="empty">尚无 flag 历史</div>
+  if (!entries.length) return <div className="flag-history"><div className="empty">尚无 flag 历史</div></div>
   return (
     <div className="flag-history">
-      {entries.map((entry, index) => {
-        const [status, style] = flagHistoryStatus(entry)
+      {entries.map((entry) => {
+        const [status] = flagHistoryStatus(entry)
         const unconfirmed = isUnconfirmedFlag(entry)
+        const rejected = entry.run.rejectedFlags?.includes(entry.value)
         return (
-          <div className={`flag-history-row${style ? ` ${style}` : ""}`} key={`${entry.run.id}-${entry.value}`}>
+          <div className="flag-history-row" key={`${entry.run.id}-${entry.value}`}>
             <div className="flag-history-main">
               <button
                 type="button"
-                className={`flag-history-value${style ? ` ${style}` : ""}`}
+                className="flag-history-value"
                 title="点击复制 flag"
                 onClick={() =>
                   void navigator.clipboard.writeText(entry.value).then(
@@ -566,9 +832,9 @@ function FlagsPane({ challenge, run }: { challenge: ChallengeGui; run?: RunHisto
                   )
                 }
               >
-                <span className="flag-history-copy-label"><FlagIcon size={10} aria-hidden="true" /> Flag</span>
+                <FlagIcon className="icon sm" style={{ flex: "none", color: "var(--text-3)" }} />
                 <span className="flag-history-copy-value">{entry.value}</span>
-                <Copy size={11} aria-hidden="true" />
+                <Copy className="icon sm" />
               </button>
               <span className="flag-history-meta">
                 {entry.historical ? "历史运行" : "当前运行"} · {entry.run.id}
@@ -583,8 +849,9 @@ function FlagsPane({ challenge, run }: { challenge: ChallengeGui; run?: RunHisto
                   否定
                 </button>
               </span>
-            ) : null}
-            <span className={`flag-history-status ${style}`}>{status}</span>
+            ) : (
+              <span className={`flag-history-status ${rejected ? "rejected" : ""}`}>{status}</span>
+            )}
           </div>
         )
       })}
@@ -594,7 +861,7 @@ function FlagsPane({ challenge, run }: { challenge: ChallengeGui; run?: RunHisto
 
 function MarkdownPane({ text, fallback }: { text?: string; fallback: string }) {
   const html = text?.trim() ? renderMarkdown(text) : ""
-  if (!html) return <div className="empty">{fallback || "暂无内容"}</div>
+  if (!html) return <div className="md"><div className="empty">{fallback || "暂无内容"}</div></div>
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />
 }
 
@@ -602,7 +869,7 @@ function ConsultationPane({ run }: { run?: RunHistory }) {
   if (run?.consultation) {
     const consultation = run.consultation
     return (
-      <div className="consultation">
+      <div className="consultation" style={{ padding: 14 }}>
         <div className="cmeta">多模型会诊 · {consultation.trigger} · {compactNumber(consultation.tokens)} tokens</div>
         {consultation.degraded ? (
           <div className="consultation-degraded">
@@ -625,13 +892,21 @@ function ConsultationPane({ run }: { run?: RunHistory }) {
       </div>
     )
   }
-  return <div className="empty">该任务还没有会诊记录</div>
+  return (
+    <div className="checkpoint">
+      <h4>检查点</h4>
+      <p>{run?.reply?.split("\n")[0] || "该任务还没有会诊记录；需要多模型交叉验证时，从右上角菜单发起会诊。"}</p>
+      {run?.turns?.length ? (
+        <div className="checkpoint-meta"><span className="tag">{run.turns.length} 轮</span></div>
+      ) : null}
+    </div>
+  )
 }
 
 function FilesPane({ run, challenge }: { run?: RunHistory; challenge: ChallengeGui }) {
   const { toast } = useApp()
   const files = run?.files
-  if (!files?.length) return <div className="empty">尚无运行文件</div>
+  if (!files?.length) return <div className="file-list"><div className="empty">尚无运行文件</div></div>
   const openFile = async (path: string) => {
     try {
       await postJSON("/api/open", { kind: "file", slug: challenge.slug, runID: run?.id, path })
@@ -673,7 +948,7 @@ function FileTree({ files, onOpen }: { files: RunFile[]; onOpen: (path: string) 
           <summary>
             <span className="fdir-name">{name}/</span>
             <span className="sz">目录</span>
-            <button type="button" className="btn btn-tiny" onClick={() => onOpen(node.path)}>打开</button>
+            <button type="button" className="btn btn-tiny" onClick={(event) => { event.preventDefault(); onOpen(node.path) }}>打开</button>
           </summary>
           <div className="fchildren">{[...node.children.entries()].map(([child, childNode]) => renderNode(child, childNode))}</div>
         </details>
@@ -687,7 +962,7 @@ function FileTree({ files, onOpen }: { files: RunFile[]; onOpen: (path: string) 
     )
   }
 
-  return <div className="file-tree">{[...root.children.entries()].map(([name, node]) => renderNode(name, node))}</div>
+  return <div className="file-list">{[...root.children.entries()].map(([name, node]) => renderNode(name, node))}</div>
 }
 
 function MetaPane({ run, flag, flagRun, now }: { run?: RunHistory; flag: string; flagRun?: RunHistory; now: number }) {
@@ -713,7 +988,7 @@ function MetaPane({ run, flag, flagRun, now }: { run?: RunHistory; flag: string;
         ...(run.turns ?? []).map(
           (turn, index): [string, string] => [
             `轮次 ${index + 1}`,
-            `${shortModel(turn.model)} · ${turn.stop} · ${compactNumber(turn.tokens)} tokens${turn.prompt ? ` · 提示：${turn.prompt}` : ""}`,
+            `${turn.stop} · ${compactNumber(turn.tokens)} tokens${turn.prompt ? ` · 提示：${turn.prompt}` : ""}`,
           ],
         ),
       ]
@@ -750,9 +1025,10 @@ async function switchEnvironment(
   )
 }
 
-async function openWork(challenge: ChallengeGui, run: RunHistory) {
+/** Opens the task's own directory (`<root>/tasks/<slug>/<run>/`), not just its `work/`. */
+async function openTaskDirectory(challenge: ChallengeGui, run: RunHistory) {
   try {
-    await postJSON("/api/open", { kind: "work", slug: challenge.slug, runID: run.id })
+    await postJSON("/api/open", { kind: "task", slug: challenge.slug, runID: run.id })
   } catch (error) {
     window.alert((error as Error).message)
   }

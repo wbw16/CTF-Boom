@@ -29,6 +29,7 @@ function state(...runs: RunHistory[]): GuiState {
   return {
     root: "/tmp/boom-detail-render",
     settings: {
+      mode: "ctf",
       economyModel: "test/model",
       strongModel: "test/model",
       tokens: 10_000,
@@ -78,7 +79,12 @@ describe("GUI task detail rendering", () => {
       collapsed: new Set(),
       toasts: [],
       dialog: null,
+      challengeEditor: null,
       menu: null,
+      settingsOpen: false,
+      setSettingsOpen: noop,
+      sidebarOpen: false,
+      setSidebarOpen: noop,
       deleteTarget: null,
       now: 200,
       notices: [],
@@ -93,6 +99,7 @@ describe("GUI task detail rendering", () => {
       loadDetail: async () => {},
       toast: noop,
       openDialog: noop,
+      openChallengeEditor: noop,
       closeDialog: noop,
       requestDelete: noop,
       setMenu: noop,
@@ -106,7 +113,10 @@ describe("GUI task detail rendering", () => {
     expect(html).toContain("exploit.py")
     expect(html).toContain("Live writeup")
     expect(html).toContain("flag{live}")
-    expect(html.indexOf("service-endpoint")).toBeLessThan(html.indexOf("detail-flag"))
+    // The service-address form is surfaced ahead of the flag verdict so needing a remote
+    // endpoint is visible before acting on the result.
+    expect(html).toContain("service-endpoint")
+    expect(html.indexOf("service-endpoint")).toBeLessThan(html.indexOf("flag-verdict"))
   })
 
   test("keeps a resumed historical run focused while it is live", () => {
@@ -133,7 +143,12 @@ describe("GUI task detail rendering", () => {
       collapsed: new Set(),
       toasts: [],
       dialog: null,
+      challengeEditor: null,
       menu: null,
+      settingsOpen: false,
+      setSettingsOpen: noop,
+      sidebarOpen: false,
+      setSidebarOpen: noop,
       deleteTarget: null,
       now: 200,
       notices: [],
@@ -148,6 +163,7 @@ describe("GUI task detail rendering", () => {
       loadDetail: async () => {},
       toast: noop,
       openDialog: noop,
+      openChallengeEditor: noop,
       closeDialog: noop,
       requestDelete: noop,
       setMenu: noop,
@@ -178,11 +194,12 @@ describe("GUI task detail rendering", () => {
     const value: AppContextValue = {
       theme: "light", setTheme: noop, data: state(resumedSummary, newerFinished),
       selected: "alpha", detail: resumedDetail, filter: "", collapsed: new Set(),
-      toasts: [], dialog: null, menu: null, deleteTarget: null, now: 200, notices: [],
+      toasts: [], dialog: null, challengeEditor: null, menu: null, settingsOpen: false, setSettingsOpen: noop, sidebarOpen: false, setSidebarOpen: noop, deleteTarget: null, now: 200, notices: [],
       platform: null, unreadNoticeCount: 0,
       select: noop, setFilter: noop, toggleCollapsed: noop,
       refresh: async () => {}, refreshNotices: async () => {}, markNoticeRead: noop, loadDetail: async () => {}, toast: noop,
-      openDialog: noop, closeDialog: noop, requestDelete: noop, setMenu: noop,
+      openDialog: noop,
+      openChallengeEditor: noop, closeDialog: noop, requestDelete: noop, setMenu: noop,
     }
 
     const html = renderToStaticMarkup(

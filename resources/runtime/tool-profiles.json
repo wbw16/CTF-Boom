@@ -252,6 +252,101 @@
           "candidate": { "type": "string", "minLength": 1, "maxLength": 4096 }
         }
       }
+    },
+    "pentest-note": {
+      "description": "Maintain the engagement working state in NOTES.md: what is being verified now, confirmed conclusions with record ids or artifact paths, ruled-out directions and the conditions under which they were ruled out, and unfinished actions with next steps. Keep it to a page or two; use kind=checkpoint to rewrite the whole file when it grows or the direction changes.",
+      "implementation": "boom",
+      "sideEffect": "memory",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "text"],
+        "properties": {
+          "kind": { "enum": ["note", "ruled-out", "next", "checkpoint"] },
+          "text": { "type": "string", "minLength": 1, "maxLength": 8000 }
+        }
+      }
+    },
+    "pentest-asset": {
+      "description": "Record one discovered asset (host, service, app, or endpoint) into the current engagement's asset graph. Parent assets must be recorded before their children; use the returned real ids.",
+      "implementation": "boom",
+      "sideEffect": "write",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "value"],
+        "properties": {
+          "type": { "enum": ["root-domain", "subdomain", "ip", "service", "app", "endpoint"] },
+          "value": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "meta": { "type": "string", "maxLength": 2000 },
+          "parentId": { "type": "string", "minLength": 1, "maxLength": 64 }
+        }
+      }
+    },
+    "pentest-observation": {
+      "description": "Record what a tool or command saw (a port, service banner, HTTP behavior, or other observed fact) into the current engagement. Observations are facts, not conclusions.",
+      "implementation": "boom",
+      "sideEffect": "write",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "detail"],
+        "properties": {
+          "kind": { "enum": ["port", "service", "http", "vuln", "info"] },
+          "target": { "type": "string", "maxLength": 512 },
+          "detail": { "type": "string", "minLength": 1, "maxLength": 8000 },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "pentest-evidence": {
+      "description": "Register durable evidence in the current engagement: an engagement-relative file path (tool output, raw response, screenshot) or a short verbatim excerpt.",
+      "implementation": "boom",
+      "sideEffect": "write",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "excerpt": { "type": "string", "minLength": 1, "maxLength": 8000 },
+          "note": { "type": "string", "maxLength": 2000 }
+        }
+      }
+    },
+    "pentest-finding": {
+      "description": "Record a suspected vulnerability as a candidate finding in the current engagement. Candidates stay candidates until a human confirms them; confirmation requires at least one cited evidence id and one reproducible step.",
+      "implementation": "boom",
+      "sideEffect": "write",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "severity"],
+        "properties": {
+          "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+          "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
+          "description": { "type": "string", "maxLength": 8000 },
+          "evidenceIds": { "type": "array", "maxItems": 50, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+          "reproducibleSteps": { "type": "array", "maxItems": 50, "items": { "type": "string", "minLength": 1, "maxLength": 4000 } },
+          "affectedAssetId": { "type": "string", "minLength": 1, "maxLength": 64 }
+        }
+      }
+    },
+    "pentest-flag": {
+      "description": "Immediately register a recovered Flag value for one declared Flag objective of the current engagement. Evidence, finding links, and a short reusable note are optional; supplied references are validated. The candidate waits for a platform or human verdict and does not end the engagement.",
+      "implementation": "boom",
+      "sideEffect": "write",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["flagId", "value"],
+        "properties": {
+          "flagId": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "value": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "evidenceIds": { "type": "array", "maxItems": 50, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+          "findingIds": { "type": "array", "maxItems": 50, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+          "note": { "type": "string", "maxLength": 2000 }
+        }
+      }
     }
   },
   "profiles": {
@@ -262,6 +357,18 @@
     "worker": {
       "tools": ["bash", "read", "edit", "write", "list", "glob", "grep", "task", "skill", "websearch", "webfetch", "todowrite", "boom-exec", "ctf-note", "ctf-submit"],
       "effects": { "write": "branch", "process": "allow", "network": "allow", "memory": "allow", "submit": "allow", "delegate": "allow" }
+    },
+    "pentest": {
+      "tools": ["bash", "read", "edit", "write", "list", "glob", "grep", "skill", "websearch", "webfetch", "todowrite", "boom-exec", "pentest-note", "pentest-asset", "pentest-observation", "pentest-evidence", "pentest-finding", "pentest-flag"],
+      "effects": { "write": "run", "process": "allow", "network": "allow", "memory": "allow", "submit": "deny", "delegate": "deny" }
+    },
+    "pentest-flag-hunt": {
+      "tools": ["bash", "read", "edit", "write", "list", "glob", "grep", "task", "skill", "websearch", "webfetch", "todowrite", "boom-exec", "pentest-note", "pentest-asset", "pentest-observation", "pentest-evidence", "pentest-finding", "pentest-flag"],
+      "effects": { "write": "run", "process": "allow", "network": "allow", "memory": "allow", "submit": "deny", "delegate": "allow" }
+    },
+    "pentest-worker": {
+      "tools": ["bash", "read", "edit", "write", "list", "glob", "grep", "boom-exec", "pentest-flag"],
+      "effects": { "write": "run", "process": "allow", "network": "allow", "memory": "deny", "submit": "deny", "delegate": "deny" }
     },
     "reasoning": {
       "tools": ["read", "list", "glob", "grep"],

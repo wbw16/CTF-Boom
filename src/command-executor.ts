@@ -8,6 +8,7 @@ import {
   type TaskEnvironmentBinding,
 } from "./environment.ts"
 import { resolveTaskPath } from "./runtime/policy.ts"
+import { resolveInputDirectory } from "./task-layout.ts"
 
 export type CommandRequest = {
   program: string
@@ -298,12 +299,13 @@ export async function executeControlledCommand(input: {
     if (container.status !== "ready" || !container.executable)
       throw new Error(`Isolated execution is unavailable: ${container.detail ?? container.status}`)
     const relative = path.relative(root, cwd).split(path.sep).join("/")
+    const inputDirectory = path.basename(await resolveInputDirectory(root))
     const image = "ghcr.io/openai/boom-ctf-tools:latest"
     const blockedResult = await resultBlocker(root)
     command = [
       container.executable, "run", "--rm", "--user", "65534:65534", "--read-only",
       "--cpus", "1", "--memory", "1g", "--pids-limit", "128", "--network", input.request.network ? "bridge" : "none",
-      "--mount", `type=bind,src=${path.join(root, "challenge")},dst=/task/challenge,readonly`,
+      "--mount", `type=bind,src=${path.join(root, inputDirectory)},dst=/task/${inputDirectory},readonly`,
       "--mount", `type=bind,src=${path.join(root, "work")},dst=/task/work`,
       "--mount", `type=bind,src=${path.join(root, "work", ".boom")},dst=/task/work/.boom,readonly`,
       "--mount", `type=bind,src=${blockedResult},dst=/task/work/RESULT.json,readonly`,
@@ -447,6 +449,7 @@ async function shellCommand(input: {
     const container = await detectContainerCapability()
     if (container.status !== "ready" || !container.executable)
       throw new Error(`Shell isolation is unavailable: ${container.detail ?? container.status}`)
+    const inputDirectory = path.basename(await resolveInputDirectory(input.root))
     const image = "ghcr.io/openai/boom-ctf-tools:latest"
     const sandboxEnv = taskSandboxEnvironment(input.env, input.root)
     const blockedResult = await resultBlocker(input.root)
@@ -457,7 +460,7 @@ async function shellCommand(input: {
         container.executable, "run", "--rm", "--user", "65534:65534", "--read-only",
         "--cpus", "1", "--memory", "1g", "--pids-limit", "128",
         "--network", input.network ? "bridge" : "none",
-        "--mount", `type=bind,src=${path.join(input.root, "challenge")},dst=/task/challenge,readonly`,
+        "--mount", `type=bind,src=${path.join(input.root, inputDirectory)},dst=/task/${inputDirectory},readonly`,
         "--mount", `type=bind,src=${path.join(input.root, "work")},dst=/task/work`,
         "--mount", `type=bind,src=${path.join(input.root, "work", ".boom")},dst=/task/work/.boom,readonly`,
         "--mount", `type=bind,src=${blockedResult},dst=/task/work/RESULT.json,readonly`,

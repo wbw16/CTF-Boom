@@ -72,6 +72,24 @@ describe("M3 Network Broker", () => {
     expect(audit).not.toContain("initial-secret")
   })
 
+  test("returns HTTP error responses as auditable probe observations", async () => {
+    const directory = await workspace()
+    const broker = createBoomNetworkBroker({
+      resolver: publicResolver,
+      transport: async () => ({
+        status: 404,
+        headers: { "content-type": "text/plain" },
+        body: Buffer.from("not found"),
+      }),
+    })
+    const response = await broker.fetch({ directory, sessionID: "probe", url: "https://target.example/missing" })
+    expect(response.status).toBe(404)
+    expect(response.body.toString()).toBe("not found")
+    const audit = await readFile(path.join(directory, "work", ".boom", "network-events.jsonl"), "utf8")
+    expect(audit).toContain('"status":404')
+    expect(audit).not.toContain('"type":"network.error"')
+  })
+
   test("uses the pinned transport against a real task-local HTTP listener", async () => {
     const directory = await workspace()
     const server = Bun.serve({

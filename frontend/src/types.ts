@@ -1,11 +1,206 @@
 export type ExecutionMode = "managed" | "isolated" | "static-only"
 
+export type PentestAssetType = "root-domain" | "subdomain" | "ip" | "service" | "app" | "endpoint"
+export type PentestSeverity = "critical" | "high" | "medium" | "low" | "info"
+export type PentestObservationKind = "port" | "service" | "http" | "vuln" | "info"
+export type PentestFindingStatus = "candidate" | "confirmed" | "rejected"
+
+export type PentestEngagementSummary = {
+  slug: string
+  target: string
+  objective: string
+  authorization: string
+  scope: string[]
+  mode: "assessment" | "flag-hunt"
+  status: "active" | "abandoned" | "archived"
+  run: {
+    phase: PentestAgentPhase
+    turns: number
+    lastEndedAt?: string
+    lastError?: string
+  }
+  counts: {
+    assets: number
+    observations: number
+    findings: number
+    candidates: number
+    confirmed: number
+    runs: number
+    flags: number
+    flagCandidates: number
+    flagsConfirmed: number
+  }
+  createdAt: string
+  updatedAt: string
+}
+
+export type PentestEngagement = {
+  version: 1
+  slug: string
+  target: string
+  objective: string
+  authorization: string
+  scope: string[]
+  /** Fixed operator notes captured at creation; re-stated on every agent turn. */
+  userNotes?: string
+  mode: "assessment" | "flag-hunt"
+  status: "active" | "abandoned" | "archived"
+  counters: { asset: number; observation: number; finding: number; evidence: number; run: number }
+  createdAt: string
+  updatedAt: string
+  assets: Array<{
+    id: string
+    type: PentestAssetType
+    value: string
+    meta: string
+    parentId?: string
+    runId?: string
+    at: string
+  }>
+  observations: Array<{
+    id: string
+    kind: PentestObservationKind
+    target: string
+    detail: string
+    confidence: number
+    runId?: string
+    at: string
+  }>
+  evidence: Array<{
+    id: string
+    provenance: "tool-run" | "external-import"
+    path?: string
+    excerpt?: string
+    note: string
+    runId?: string
+    at: string
+  }>
+  findings: Array<{
+    id: string
+    title: string
+    severity: PentestSeverity
+    status: PentestFindingStatus
+    description: string
+    evidenceIds: string[]
+    reproducibleSteps: string[]
+    affectedAssetId?: string
+    at: string
+    decidedAt?: string
+    decisionNote?: string
+  }>
+  flagObjectives: Array<{
+    id: string
+    label: string
+    hint: string
+    submissions: Array<{
+      id: string
+      value: string
+      status: "candidate" | "confirmed" | "rejected"
+      evidenceIds: string[]
+      findingIds: string[]
+      source: "agent" | "operator"
+      note: string
+      at: string
+      decidedAt?: string
+      decisionNote?: string
+    }>
+  }>
+  run?: {
+    phase: PentestAgentPhase
+    turns: number
+    startedAt?: string
+    lastEndedAt?: string
+    lastError?: string
+    lastReply?: string
+    checkpointAt?: string
+    checkpointNote?: string
+  }
+}
+
+export type PentestToolRunStatus = "running" | "done" | "failed" | "interrupted"
+
+export type PentestToolRunDetail = {
+  run: PentestToolRun
+  stdout: string
+  stderr: string
+}
+
+export type PentestToolRun = {
+  version: 1
+  id: string
+  tool: string
+  args: string[]
+  reason: string
+  presetId?: string
+  status: PentestToolRunStatus
+  startedAt: string
+  endedAt?: string
+  exitCode?: number
+  interruption?: "stopped" | "timeout" | "orphaned"
+  error?: string
+  parsed?: { assets: number; observations: number; error?: string }
+}
+
+export type PentestToolPresetSummary = { id: string; title: string; description: string }
+
+export type PentestToolSummary = {
+  name: string
+  displayName: string
+  parses: "nmap-xml" | "none"
+  unattended: boolean
+  note?: string
+  installed: boolean
+  presets: PentestToolPresetSummary[]
+}
+
+export type PentestHostTool = {
+  name: string
+  version?: string
+}
+
+export type PentestAgentPhase = "idle" | "running" | "pausing" | "paused" | "failed"
+
+/**
+ * One activity line. `status`/`text`/`error` carry their payload in `text`; a current `tool`
+ * entry carries structured fields instead (`title` = one-line command summary, `argv` for
+ * click-to-expand, `detail` = completion title, `status` = running/completed/error).
+ */
+export type PentestActivityEntry = {
+  at: string
+  kind: "status" | "text" | "tool" | "error"
+  text?: string
+  callID?: string
+  tool?: string
+  title?: string
+  argv?: Record<string, unknown>
+  status?: "running" | "completed" | "error"
+  detail?: string
+  endedAt?: string
+}
+
+/** Agent run view returned by the engagement detail endpoint. */
+export type PentestAgentView = {
+  phase: PentestAgentPhase
+  turns: number
+  startedAt?: string
+  lastEndedAt?: string
+  lastError?: string
+  lastReply?: string
+  checkpointAt?: string
+  checkpointNote?: string
+  live?: boolean
+  activity: PentestActivityEntry[]
+  liveText?: string
+}
+
 export type GuiSettings = {
+  /** Product mode: "ctf" solves challenges; "pentest" emphasizes the authorized penetration console. */
+  mode: "ctf" | "pentest"
   economyModel: string
   strongModel: string
   visionModel?: string
   tokens: number
-  /** When false, a run is governed by time/repeat safeguards but has no token ceiling. */
+  /** When false, per-turn safeguards self-recover and the task keeps running without a total ceiling. */
   tokenBudgetEnabled: boolean
   repeats: number
   minutes: number
@@ -273,6 +468,8 @@ export type GuiState = {
   instanceID?: string
   sequence?: number
   root: string
+  /** The folder Boom opens on a first launch; the workbench names it and can return to it. */
+  defaultRoot?: string
   settings: GuiSettings
   models: ModelInfo[]
   runtime: RuntimeState

@@ -102,12 +102,24 @@ export function decideAutonomy(input: {
 }): AutonomyDecision {
   const now = input.now ?? Date.now()
   if (input.outcome.candidates.length > 0) return { action: "none", reason: "candidate available" }
+  // No challenge token ceiling means the user selected run-until-complete mode. A normal model yield
+  // is then only a turn boundary, never a reason to pause the task. Preserve the existing two-yield
+  // escalation cadence so an unproductive direction still gets an independent diagnosis.
+  const runUntilComplete = input.challengeTokenBudget === undefined
   const explicitlyRequested = input.manual === true || agentRequestedEscalation(input.outcome)
   if (
     !explicitlyRequested &&
     input.outcome.stop === "completed" &&
-    !input.state.automaticContinuationUsedAt
-  ) return { action: "continue", reason: "first normal yield without a candidate" }
+    (
+      !input.state.automaticContinuationUsedAt ||
+      (runUntilComplete && input.state.consecutiveNormalYieldsWithoutDurableProgress < 2)
+    )
+  ) return {
+    action: "continue",
+    reason: runUntilComplete
+      ? "normal yield without a candidate; run-until-complete remains active"
+      : "first normal yield without a candidate",
+  }
 
   const early = explicitlyRequested || input.state.consecutiveNormalYieldsWithoutDurableProgress >= 2
   const hasTokenBudget =
@@ -122,6 +134,14 @@ export function decideAutonomy(input: {
     input.cumulativeBillable - input.state.billableAtLastProgress >=
       input.challengeTokenBudget! * AUTONOMY_THRESHOLDS.stalledBudgetRatio
   if (!early && (!eligible || (!stalledByTime && !stalledByUsage))) {
+    if (runUntilComplete) {
+      return {
+        action: "continue",
+        reason: !eligible
+          ? "run-until-complete remains active before the escalation threshold"
+          : "meaningful progress is still recent; run-until-complete remains active",
+      }
+    }
     return {
       action: "none",
       reason: !eligible
@@ -130,18 +150,26 @@ export function decideAutonomy(input: {
     }
   }
   if (input.productiveLongRunningTool)
-    return { action: "none", reason: "productive long-running tool is still active" }
+    return runUntilComplete
+      ? { action: "continue", reason: "productive tool state was preserved; run-until-complete remains active" }
+      : { action: "none", reason: "productive long-running tool is still active" }
 
   const related = input.state.escalations.filter((item) =>
     item.fingerprint === input.state.progressEpoch && item.level === 1,
   )
   if (related.some((item) => item.status === "running"))
-    return { action: "none", reason: "an L1 second opinion is already running" }
+    return runUntilComplete
+      ? { action: "continue", reason: "an L1 second opinion is already recorded as running; main execution continues" }
+      : { action: "none", reason: "an L1 second opinion is already running" }
   if (related.some((item) => item.status === "completed" || item.status === "partial"))
-    return { action: "none", reason: "L1 second opinion was already used for this progress fingerprint" }
+    return runUntilComplete
+      ? { action: "continue", reason: "L1 second opinion was already used; run-until-complete remains active" }
+      : { action: "none", reason: "L1 second opinion was already used for this progress fingerprint" }
   const latest = related.at(-1)
   if (latest && now - validTime(latest.finishedAt ?? latest.startedAt) < AUTONOMY_THRESHOLDS.cooldownMs)
-    return { action: "none", reason: "matching L1 fingerprint is cooling down" }
+    return runUntilComplete
+      ? { action: "continue", reason: "matching L1 fingerprint is cooling down; run-until-complete remains active" }
+      : { action: "none", reason: "matching L1 fingerprint is cooling down" }
 
   const reason = input.manual
     ? "user requested a stagnation diagnosis"
@@ -212,6 +240,8 @@ export async function runAutonomyEscalation(input: {
     level: 1,
     reason: input.decision.reason,
   })
+  const deadline = AbortSignal.timeout(input.limits.timeout)
+  const signal = input.signal ? AbortSignal.any([input.signal, deadline]) : deadline
   try {
     const completed = await completeRuntimePrompt({
       runtime: input.runtime,
@@ -220,7 +250,7 @@ export async function runAutonomyEscalation(input: {
       agent: "boom-consultant",
       model: input.policy.economy,
       prompt: await secondOpinionPrompt(input),
-      signal: input.signal,
+      signal,
       tokenBudget: input.limits.tokens === undefined
         ? undefined
         : Math.max(1_000, Math.min(input.limits.tokens, Math.floor(input.limits.tokens * 0.4))),

@@ -1,44 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 260" role="img" aria-labelledby="title desc">
-  <title id="title">Boom app icon</title>
-  <desc id="desc">A dark terminal window with a bright explosion spark.</desc>
-  <defs>
-    <linearGradient id="terminal" x1="32" y1="34" x2="204" y2="214" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#172554"/>
-      <stop offset="1" stop-color="#0f172a"/>
-    </linearGradient>
-    <linearGradient id="frame" x1="42" y1="42" x2="198" y2="200" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#60a5fa"/>
-      <stop offset="1" stop-color="#2563eb"/>
-    </linearGradient>
-    <linearGradient id="spark" x1="104" y1="79" x2="160" y2="159" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ffd166"/>
-      <stop offset="0.5" stop-color="#ff9f1c"/>
-      <stop offset="1" stop-color="#f97316"/>
-    </linearGradient>
-    <filter id="spark-glow" x="-60%" y="-60%" width="220%" height="220%">
-      <feGaussianBlur stdDeviation="4" result="blur"/>
-      <feMerge>
-        <feMergeNode in="blur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-    <filter id="soft-shadow" x="-30%" y="-30%" width="160%" height="180%">
-      <feDropShadow dx="0" dy="9" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.18"/>
-    </filter>
-  </defs>
-  <g filter="url(#soft-shadow)">
-    <rect x="28" y="28" width="204" height="204" rx="48" fill="url(#terminal)"/>
-    <rect x="29.5" y="29.5" width="201" height="201" rx="46.5" fill="none" stroke="#1e3a8a" stroke-width="3"/>
-    <path d="M53 80h154" stroke="#334155" stroke-width="2" opacity="0.82"/>
-    <circle cx="60" cy="58" r="5" fill="#ff6b5f"/>
-    <circle cx="78" cy="58" r="5" fill="#ffb84d"/>
-    <circle cx="96" cy="58" r="5" fill="#5eead4"/>
-    <path d="M66 111 92 137 66 163" fill="none" stroke="url(#frame)" stroke-linecap="round" stroke-linejoin="round" stroke-width="11"/>
-    <path d="M194 111 168 137 194 163" fill="none" stroke="url(#frame)" stroke-linecap="round" stroke-linejoin="round" stroke-width="11"/>
-    <path d="M105 174h50" stroke="#93c5fd" stroke-linecap="round" stroke-width="8" opacity="0.92"/>
-    <g filter="url(#spark-glow)">
-      <path d="m130 91 8 25 24-8-13 23 22 13-27 3 3 27-17-20-18 20 4-27-27-3 22-13-13-23 24 8z" fill="url(#spark)"/>
-      <circle cx="130" cy="137" r="10" fill="#fff7d6" opacity="0.9"/>
-    </g>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Boom</title>
+  <desc id="desc">A light tile holding a command prompt caret and an explosive spark.</desc>
+  <path d="M231 128C231 157.43 233.46 199.13 216.3 216.3C199.13 233.46 157.43 231 128 231C98.57 231 56.87 233.46 39.7 216.3C22.54 199.13 25 157.43 25 128C25 98.57 22.54 56.87 39.7 39.7C56.87 22.54 98.57 25 128 25C157.43 25 199.13 22.54 216.3 39.7C233.46 56.87 231 98.57 231 128Z" fill="#fdfdfc" stroke="#d7d7ce" stroke-width="4"/>
+  <path d="M56 84.1 103.4 128 56 171.9" fill="none" stroke="#242621" stroke-width="21" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M170.1 87.6Q176.4 121.7 210.5 128Q176.4 134.3 170.1 168.4Q163.8 134.3 129.7 128Q163.8 121.7 170.1 87.6Z" fill="#b54d32"/>
 </svg>

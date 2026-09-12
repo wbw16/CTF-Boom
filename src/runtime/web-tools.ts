@@ -121,7 +121,7 @@ export function createBoomWebToolExecutor(broker: BoomNetworkBroker) {
     }
     const output = bounded(rendered)
     return {
-      title: `${response.url} (${contentType})`,
+      title: `HTTP ${response.status} · ${response.url} (${contentType})`,
       output: output.output,
       metadata: {
         url: response.url,

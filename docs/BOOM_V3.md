@@ -216,7 +216,7 @@ Prompt 用于解释规则和提高模型配合度，但路径、权限、网络�
 
 ### 4.3 文件系统是持久状态，消息上下文是缓存
 
-`challenge/`、`work/`、`NOTES.md`、任务状态、证据索引和审计事件是可恢复事实来源。模型
+`input/`、`work/`、`NOTES.md`、`records/`、任务状态、证据索引和审计事件是可恢复事实来源。模型
 上下文可以压缩、重建或丢失，不能成为唯一任务记忆。
 
 ### 4.4 工具结果优先于模型叙述
@@ -563,10 +563,10 @@ Native 不维护狭窄的系统命令白名单。PATH 中的分析器、编译�
 - Conversation 创建时 realpath 固化任务根；
 - 文件工具的相对路径拒绝 `..`、NUL、绝对路径和非预期平台前缀；
 - 每层父目录检查 symlink；敏感读取使用 no-follow 打开；
-- `challenge/` 文件不可修改；
+- `input/` 文件不可修改；
 - 写入只允许 `work/` 和由宿主授权的 `NOTES.md` 原子操作；
 - Shell 可以执行绝对路径系统程序，但其文件系统视图不包含宿主 HOME、凭据和 Runtime 控制
-  socket；`challenge/` 只读，持久写入只落在 `work/` 或任务私有环境；
+  socket；`input/` 只读，持久写入只落在 `work/` 或任务私有环境；
 - 大输出写入 `work/` 后只返回摘要和路径；
 - Tool result 不返回 Provider key、宿主 HOME 或清洗前环境。
 
@@ -1035,7 +1035,7 @@ Shell/System Tool、网络和 Tool Host 语义一致。
 | 对照研究 | 通过 | `docs/research/v3/tool-host-policy-network.md` 固化 OpenCode/Claude Code 的 Registry、权限、插件、Shell 与网络差异及 Boom 决策 |
 | Boom Tool Registry | 通过 | `src/runtime/tool-registry.ts` 统一解析并冻结工具描述、实现归属、副作用、schema 和 profile；实现不再反向定义公共合约 |
 | Prompt/Agent 消费端 | 通过 | `src/runtime/agent.ts` 从 Tool Registry 加载 M2 资源，C19 的稳定目录和 schema snapshot 保持 |
-| Policy 与任务文件系统 | 通过 | `src/runtime/policy.ts` 在每次 dispatch 按 profile/effect 判定；任务相对路径逐级 no-follow，challenge/控制面只读，普通 edit 仅写 `work/` |
+| Policy 与任务文件系统 | 通过 | `src/runtime/policy.ts` 在每次 dispatch 按 profile/effect 判定；任务相对路径逐级 no-follow，input/控制面只读，普通 edit 仅写 `work/` |
 | Native 文件/状态工具 | 通过 | `src/runtime/file-tools.ts` 实现有界 read/list/glob/grep/edit；`src/runtime/state-tools.ts` 实现 Boom-owned Skill 与会话级 Todo |
 | Shell/System Tool | 通过 | `src/command-executor.ts` 支持完整 Bash、PATH、绑定 Python、任务本地包目录和 loopback 监听；macOS sandbox、Linux bubblewrap、Windows/isolated container 不可用时 fail closed；进程树、超时、32 KiB 可见输出和 10 MB 日志上限已验证 |
 | Network Broker/Web | 通过 | `src/runtime/network-broker.ts`、`web-tools.ts` 实现默认开放目标、DNS pin、逐跳重定向校验、并发/流量/响应/超时/取消和脱敏审计；仅精确拒绝 Boom 当前控制面 origin，strict profile 可额外拒绝私网 |
@@ -1066,7 +1066,7 @@ Shell/System Tool、网络和 Tool Host 语义一致。
 | Provider/Kernel 合约 | 通过 | `src/runtime/native-provider.ts` 定义 Provider-neutral message/tool/stream；`scripted-provider.ts` 可注入 text/reasoning/tool fragments、usage、finish、延迟、断流、错误和 abort，零网络/零成本 |
 | Conversation、ledger、Event Bus | 通过 | `native-storage.ts` 在任务 `work/.boom/native/` 下实现 durable message ledger、单调事件审计和 persist-before-broadcast；provenance、secret redaction、顺序 continuation 和跨实例 resume 已验证 |
 | 多 step Agent Loop | 通过 | `native-runtime.ts` 实现完整 tool result 回注、schema 完整性、retry、length continuation、empty/malformed、streaming、usage/cost、唯一 finish 和幂等 cancellation |
-| task tree | 通过 | `native-task-tree.ts` 实现独立 challenge/NOTES/work/ledger、默认总活动并发 4、深度 2、部分失败隔离、父子结果回注、任务树 audit、父取消和跨树累计 token budget；嵌套等待不占 permit，避免递归死锁 |
+| task tree | 通过 | `native-task-tree.ts` 实现独立 input/NOTES/records/work/ledger、默认总活动并发 4、深度 2、部分失败隔离、父子结果回注、任务树 audit、父取消和跨树累计 token budget；嵌套等待不占 permit，避免递归死锁 |
 | M3 Host/Policy 复用 | 通过 | Native scripted Provider 实际调用 read/edit、越界拒绝、ctf-note、受控 Bash 和 loopback webfetch；Kernel 不重写 M3 路径、Shell 或 Network Broker 规则 |
 | Runtime selector | 通过 | `startRuntime({ backend: "native", native: ... })` 保留可注入 scripted Driver 的内部入口；M5 已在相同 selector 上增加 first-party managed Driver 组装，产品默认仍为 OpenCode |
 | C21 与全量回归 | 通过 | C01–C09、C12、C13、C16–C21 在 Native scripted 场景和共享 M3 conformance 中通过；`bun run typecheck`；`bun test`：164 pass、0 fail、947 assertions |

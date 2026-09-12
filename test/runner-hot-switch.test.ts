@@ -253,8 +253,8 @@ test("hot-switches an active model only after its running tool completes", async
     expect(fixture.prompts[1]?.text).toContain("Compatibility impact: The new model does not support image attachments")
     expect(fixture.prompts[1]?.text).not.toContain("Compact handoff")
     expect(fixture.resumed).toEqual(["session-hot"])
-    const [runID] = await readdir(path.join(fixture.root, "runs", "sample"))
-    const task = JSON.parse(await readFile(path.join(fixture.root, "runs", "sample", runID!, "task.json"), "utf8"))
+    const [runID] = await readdir(path.join(fixture.root, "tasks", "sample"))
+    const task = JSON.parse(await readFile(path.join(fixture.root, "tasks", "sample", runID!, "task.json"), "utf8"))
     expect(task.turns).toMatchObject([
       { model: "openai/old", stop: "switched" },
       { model: "openai/next", candidates: ["flag{switched}"] },
@@ -374,14 +374,14 @@ test("runs a user-requested consultation at a safe boundary and resumes the live
     expect(fixture.prompts[1]?.text).toContain("merged diagnosis from the live context")
     expect(fixture.resumed).toEqual(["session-hot"])
 
-    const [runID] = await readdir(path.join(fixture.root, "runs", "sample"))
-    const task = JSON.parse(await readFile(path.join(fixture.root, "runs", "sample", runID!, "task.json"), "utf8"))
+    const [runID] = await readdir(path.join(fixture.root, "tasks", "sample"))
+    const task = JSON.parse(await readFile(path.join(fixture.root, "tasks", "sample", runID!, "task.json"), "utf8"))
     expect(task.turns).toMatchObject([
       { model: "openai/old", stop: "switched" },
       { model: "openai/old", candidates: ["flag{switched}"] },
     ])
     const consultation = JSON.parse(await readFile(
-      path.join(fixture.root, "runs", "sample", runID!, "work", "consultation.json"),
+      path.join(fixture.root, "tasks", "sample", runID!, "work", "consultation.json"),
       "utf8",
     ))
     expect(consultation).toMatchObject({ trigger: "manual", source_run_id: runID })

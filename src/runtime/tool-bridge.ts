@@ -1,6 +1,9 @@
 import type { CompiledBoomAgentRegistry } from "./agent.ts"
 import { createBoomToolHost, type BoomToolName } from "../tool-runtime.ts"
 import { createBoomNetworkBroker } from "./network-broker.ts"
+import { buildPentestSharedProgress } from "../pentest/shared-progress.ts"
+import { loadEngagement } from "../pentest/store.ts"
+import { resolveEngagementWorkspace } from "../pentest/record-tools.ts"
 
 function object(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -38,6 +41,24 @@ export function startBoomToolBridge(
       const url = new URL(request.url)
       if (request.method === "GET" && url.pathname === "/registry")
         return Response.json(registry.catalog)
+      if (request.method === "POST" && url.pathname === "/pentest-progress") {
+        try {
+          const body = object(await request.json())
+          const directory = body?.directory
+          const agent = body?.agent
+          if (typeof directory !== "string" || typeof agent !== "string")
+            throw new Error("Invalid pentest progress request")
+          if (agent !== "boom-flag-hunt" && agent !== "boom-pentest-worker")
+            throw new Error("Shared Flag progress is available only to Boom Flag agents")
+          const { root, slug } = resolveEngagementWorkspace(directory)
+          const progress = buildPentestSharedProgress(await loadEngagement(root, slug))
+          return Response.json(progress ?? { revision: "", text: "" })
+        } catch (error) {
+          return Response.json({
+            error: error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000),
+          }, { status: 400 })
+        }
+      }
       if (request.method !== "POST" || url.pathname !== "/execute")
         return Response.json({ error: "not found" }, { status: 404 })
       const declared = Number(request.headers.get("content-length") ?? 0)

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { discoverChallenges, loadAnswers } from "./challenge.ts"
-import { readChallengeRuns } from "./history.ts"
+import { readChallengeRuns, taskDirectoryFromRoot } from "./history.ts"
 
 export type EvaluationVariant =
   | "autonomy-l0"
@@ -131,7 +131,8 @@ export async function collectEvaluationSamples(root: string) {
   const samples: EvaluationSample[] = []
   for (const challenge of await discoverChallenges(root)) {
     for (const run of await readChallengeRuns(root, challenge.slug)) {
-      const raw = await readFile(path.join(root, "runs", challenge.slug, run.id, "result.json"), "utf8").catch(() => undefined)
+      const directory = await taskDirectoryFromRoot(root, challenge.slug, run.id)
+      const raw = await readFile(path.join(directory, "result.json"), "utf8").catch(() => undefined)
       if (!raw) continue
       let result: Record<string, unknown>
       try { result = object(JSON.parse(raw)) } catch { continue }

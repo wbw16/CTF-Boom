@@ -1,6 +1,7 @@
 import { lstat, readFile, readdir, realpath } from "node:fs/promises"
 import path from "node:path"
 import type { Challenge } from "../challenge.ts"
+import { resolveEventsFile } from "../task-layout.ts"
 import type { TaskRecord } from "../task.ts"
 
 const MAX_NOTES = 6_000
@@ -38,7 +39,7 @@ function hasDurableNotes(notes: string) {
   })
 }
 
-/** A minimal, defensive view of one `work/events.jsonl` record. */
+/** A minimal, defensive view of one task event record. */
 type EventLogLine = {
   at: number
   type: string
@@ -48,12 +49,13 @@ type EventLogLine = {
 }
 
 /**
- * Read the run's event log without ever following an agent-controlled link. The log lives under
- * `work/`, which the solving agent can write to; the same lstat/realpath discipline as the history
- * reader applies, so a symlink planted there can never point the handoff at an arbitrary file.
+ * Read the run's event log without ever following an agent-controlled link. The trail lives in the
+ * host-owned `records/` directory, and legacy tasks kept it inside the agent-writable `work/`; the
+ * same lstat/realpath discipline as the history reader applies either way, so a symlink planted at
+ * the log path can never point the handoff at an arbitrary file.
  */
 async function readEventLog(directory: string): Promise<EventLogLine[] | undefined> {
-  let target = path.join(directory, "work", "events.jsonl")
+  let target = await resolveEventsFile(directory)
   try {
     const info = await lstat(target)
     if (!info.isFile() || info.isSymbolicLink()) return undefined
@@ -176,7 +178,7 @@ export async function buildHandoffSummary(input: {
     `Challenge: ${input.challenge.slug}`,
     `Category: ${input.challenge.category ?? "OTHER"}`,
     ...(input.challenge.remote?.trim() ? [`Remote: ${input.challenge.remote.trim()}`] : []),
-    "Input: challenge/ (read-only) · Durable evidence: NOTES.md and work/",
+    "Input: input/ (read-only) · Durable evidence: NOTES.md and work/",
     "",
     "## Current task state",
     `Status: ${input.task.status} · ${input.task.turns.length} turns run · ${input.task.rejectedFlags.length} candidates excluded.`,

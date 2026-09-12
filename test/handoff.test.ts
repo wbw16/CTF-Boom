@@ -15,7 +15,8 @@ async function fixture() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-handoff-"))
   temporary.push(directory)
   await mkdir(path.join(directory, "work"))
-  await mkdir(path.join(directory, "challenge"))
+  await mkdir(path.join(directory, "records"))
+  await mkdir(path.join(directory, "input"))
   return directory
 }
 
@@ -32,7 +33,7 @@ describe("compact turn handoff", () => {
       slug: "warmup",
       category: "CRYPTO",
       remote: "challenge.example:31337",
-      directory: path.join(directory, "challenge"),
+      directory: path.join(directory, "input"),
       description: "Decode it",
       files: [],
       flagFormat: "flag\\{[^}]*\\}",
@@ -82,7 +83,7 @@ describe("compact turn handoff", () => {
   test("uses a bounded recovery activity only when no durable checkpoint exists", async () => {
     const directory = await fixture()
     await writeFile(path.join(directory, "NOTES.md"), "# NOTES\n\nShared cross-turn, cross-model task memory. Maintained by the ctf-note tool.\n")
-    await writeFile(path.join(directory, "work", "events.jsonl"), [
+    await writeFile(path.join(directory, "records", "events.jsonl"), [
       JSON.stringify({ at: 1_000, type: "tool", tool: "bash", status: "running", text: "file challenge/*" }),
       JSON.stringify({ at: 1_500, type: "tool", tool: "bash", status: "completed", text: "bash · exit 0" }),
     ].join("\n") + "\n")
@@ -91,7 +92,7 @@ describe("compact turn handoff", () => {
       directory,
       challenge: {
         slug: "empty-notes",
-        directory: path.join(directory, "challenge"),
+        directory: path.join(directory, "input"),
         description: "Recover context",
         files: [],
         flagFormat: "flag\\{[^}]*\\}",

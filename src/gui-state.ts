@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
-import os from "node:os"
 import path from "node:path"
+import { boomHomeDirectory } from "./boom-home.ts"
 import { CONSULT_EXPERTS } from "./consultation.ts"
 import {
   DEFAULT_COMPETITION_SETTINGS,
@@ -9,12 +9,21 @@ import {
 } from "./competition/policy.ts"
 
 export type GuiSettings = {
+  /**
+   * Product mode: "ctf" is the default challenge-solving flow; "pentest" surfaces the authorized
+   * penetration console. The CTF pipeline is identical in both modes — the axis selects which
+   * console the GUI emphasizes, not a different runtime.
+   */
+  mode: "ctf" | "pentest"
   economyModel: string
   strongModel: string
   /** Optional image-capable model used by the on-demand vision tool. */
   visionModel: string
   tokens: number
-  /** When false, a run has no token ceiling and is bounded by time and other safeguards instead. */
+  /**
+   * When false, the task has no cumulative token/time allowance. Per-turn watchdogs remain active,
+   * but the host recovers or renews turns until the task completes or the user stops it.
+   */
   tokenBudgetEnabled: boolean
   repeats: number
   minutes: number
@@ -58,14 +67,20 @@ export type RootGuiState = {
 type StateFile = {
   version: 2
   roots: Record<string, RootGuiState>
+  /**
+   * Workspace root the GUI opened last, shared across roots and modes. Startup reopens it instead
+   * of assuming the launch directory is a workspace; absent until the first root is activated.
+   */
+  lastRoot?: string
 }
 
 export const DEFAULT_GUI_SETTINGS: GuiSettings = {
+  mode: "ctf",
   economyModel: "free/deepseek-v4-flash-free",
   strongModel: "free/deepseek-v4-flash-free",
   visionModel: "",
   tokens: 1_000_000,
-  tokenBudgetEnabled: true,
+  tokenBudgetEnabled: false,
   repeats: 5,
   minutes: 60,
   concurrency: 1,
@@ -80,9 +95,12 @@ export const DEFAULT_GUI_SETTINGS: GuiSettings = {
 }
 
 function statePath() {
-  const home = path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+  const home = boomHomeDirectory()
   return path.join(home, "gui-state.json")
 }
+
+/** The Boom-owned data directory: state and tokens live here; see `boom-home.ts`. */
+export { boomHomeDirectory }
 
 function positive(value: unknown, fallback: number, minimum = 1) {
   return typeof value === "number" && Number.isFinite(value) && value >= minimum ? value : fallback
@@ -99,6 +117,7 @@ function normalizeSettings(value: unknown): GuiSettings {
     : DEFAULT_GUI_SETTINGS.consultModels
   const concurrency = Math.min(32, Math.floor(positive(input.concurrency, DEFAULT_GUI_SETTINGS.concurrency)))
   return {
+    mode: input.mode === "pentest" ? "pentest" : "ctf",
     economyModel:
       typeof input.economyModel === "string" && input.economyModel.includes("/")
         ? input.economyModel
@@ -112,7 +131,7 @@ function normalizeSettings(value: unknown): GuiSettings {
         ? input.visionModel
         : DEFAULT_GUI_SETTINGS.visionModel,
     tokens: positive(input.tokens, DEFAULT_GUI_SETTINGS.tokens),
-    // Existing saved settings predate this flag and therefore retain the historical bounded mode.
+    // A missing flag adopts the current run-until-complete default. Explicit saved ceilings remain.
     tokenBudgetEnabled:
       typeof input.tokenBudgetEnabled === "boolean"
         ? input.tokenBudgetEnabled
@@ -206,7 +225,13 @@ async function loadFile(): Promise<StateFile> {
     return await quarantineCorruptState(target, "expected an object with a roots map")
   const roots: Record<string, RootGuiState> = {}
   for (const [root, state] of Object.entries(parsed.roots)) roots[path.resolve(root)] = normalizeRoot(state)
-  return { version: 2, roots }
+  return {
+    version: 2,
+    roots,
+    ...(typeof parsed.lastRoot === "string" && parsed.lastRoot.trim() !== ""
+      ? { lastRoot: path.resolve(parsed.lastRoot) }
+      : {}),
+  }
 }
 
 async function saveFile(file: StateFile) {
@@ -225,5 +250,19 @@ export async function loadRootGuiState(root: string): Promise<RootGuiState> {
 export async function saveRootGuiState(root: string, state: RootGuiState) {
   const file = await loadFile()
   file.roots[path.resolve(root)] = normalizeRoot(state)
+  await saveFile(file)
+}
+
+/** The workspace root the GUI opened last, resolved absolute; undefined before the first activation. */
+export async function loadLastGuiRoot(): Promise<string | undefined> {
+  return (await loadFile()).lastRoot
+}
+
+/** Remember the active workspace root so the next launch reopens it instead of the launch cwd. */
+export async function saveLastGuiRoot(root: string) {
+  const file = await loadFile()
+  const resolved = path.resolve(root)
+  if (file.lastRoot === resolved) return
+  file.lastRoot = resolved
   await saveFile(file)
 }

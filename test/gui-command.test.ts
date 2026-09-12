@@ -30,18 +30,20 @@ function options(mode: GuiMode): GuiCommandOptions {
 }
 
 describe("GUI command arguments", () => {
-  test("selects the platform default mode and free port", () => {
+  test("selects the platform default mode, a free port, and no implicit root", () => {
     const cwd = path.join(path.sep, "tmp", "Boom GUI tests")
 
+    // Absent --root must not fall back to the launch directory: preparing a workspace there would
+    // create runs/ and challenges/ inside whatever folder Boom started from.
     expect(parseGuiArgs([], { cwd, platform: "darwin" })).toEqual({
-      root: cwd,
+      root: undefined,
       port: 0,
       mode: "native",
       help: false,
       network: "allow",
     })
     expect(parseGuiArgs([], { cwd, platform: "linux" })).toEqual({
-      root: cwd,
+      root: undefined,
       port: 0,
       mode: "browser",
       help: false,
@@ -77,7 +79,7 @@ describe("GUI command arguments", () => {
     for (const item of cases) {
       const parsed = parseGuiArgs(item.argv, { cwd, platform: item.platform })
       expect(parsed).toEqual({
-        root: item.root ?? cwd,
+        root: item.root,
         port: item.port ?? 0,
         mode: item.mode,
         help: item.help ?? false,
@@ -115,7 +117,7 @@ describe("GUI command lifecycle", () => {
   test("closes the server when the native client exits", async () => {
     const childExit = deferred<number>()
     const serverCalls: Array<{
-      root: string
+      root?: string
       hostname: string
       port: number
       open: boolean

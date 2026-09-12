@@ -20,13 +20,13 @@ const servers: Array<ReturnType<typeof Bun.serve>> = []
 async function workspace(prefix = "boom-native-") {
   const directory = await mkdtemp(path.join(os.tmpdir(), prefix))
   temporaryDirectories.push(directory)
-  await mkdir(path.join(directory, "challenge"), { recursive: true })
+  await mkdir(path.join(directory, "input"), { recursive: true })
   await mkdir(path.join(directory, "work", ".boom"), { recursive: true })
   await writeFile(
-    path.join(directory, "challenge", "challenge.json"),
+    path.join(directory, "input", "challenge.json"),
     '{"slug":"native","description":"Native conformance fixture"}\n',
   )
-  await writeFile(path.join(directory, "challenge", "evidence.txt"), "evidence\n")
+  await writeFile(path.join(directory, "input", "evidence.txt"), "evidence\n")
   await writeFile(path.join(directory, "NOTES.md"), "# NOTES\n\nroot evidence\n")
   await writeFile(path.join(directory, "work", "edit.txt"), "before\n")
   await writeFile(path.join(directory, "work", ".boom", "environment.json"), `${JSON.stringify({
@@ -98,7 +98,7 @@ describe("Boom Native Agent Kernel", () => {
         reasoning: ["inspect ", "evidence"],
         tools: [
           { id: "read-notes", name: "read", arguments: ['{"filePath":', '"NOTES.md"}'] },
-          { id: "list-challenge", name: "list", arguments: '{"path":"challenge"}' },
+          { id: "list-challenge", name: "list", arguments: '{"path":"input"}' },
         ],
         usage: usage(10, 2),
         cost: 0.1,
@@ -300,7 +300,7 @@ describe("Boom Native Agent Kernel", () => {
     expect(toolParts.find((part) => part.callID === "shell")?.state?.status).toBe("completed")
     expect(toolParts.find((part) => part.callID === "fetch-loopback")?.state?.status).toBe("completed")
     expect(await readFile(path.join(directory, "work", "edit.txt"), "utf8")).toBe("after\n")
-    expect(await readFile(path.join(directory, "challenge", "evidence.txt"), "utf8")).toBe("evidence\n")
+    expect(await readFile(path.join(directory, "input", "evidence.txt"), "utf8")).toBe("evidence\n")
     expect(await readFile(path.join(directory, "NOTES.md"), "utf8")).toContain("native durable fact")
     expect(JSON.stringify(driver.requests[1]?.messages)).toContain("native-shell-ok")
     expect(JSON.stringify(driver.requests[2]?.messages)).toContain("native-loopback-evidence")
@@ -440,7 +440,7 @@ describe("Boom Native Agent Kernel", () => {
     const directories = new Set(audit.filter((entry) => entry.state === "queued").map((entry) => entry.directory))
     expect(directories.size).toBe(5)
     for (const relative of directories) {
-      expect(await readFile(path.join(directory, relative as string, "challenge", "evidence.txt"), "utf8"))
+      expect(await readFile(path.join(directory, relative as string, "input", "evidence.txt"), "utf8"))
         .toBe("evidence\n")
       const nativeRoot = path.join(directory, relative as string, "work", ".boom", "native", "conversations")
       expect((await Array.fromAsync(new Bun.Glob("*/messages.jsonl").scan({ cwd: nativeRoot })))).toHaveLength(1)

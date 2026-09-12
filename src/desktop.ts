@@ -2,6 +2,7 @@ import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/pro
 import os from "node:os"
 import path from "node:path"
 import type { NativeClientProcess } from "./gui-command.ts"
+import { boomHomeDirectory } from "./boom-home.ts"
 
 const PACKAGE_ROOT = path.resolve(import.meta.dir, "..")
 const SOURCE = path.join(PACKAGE_ROOT, "resources", "desktop", "BoomApp.swift")
@@ -37,7 +38,7 @@ export function nativeClientCacheKey(input: NativeClientCacheInput) {
 }
 
 function boomHome() {
-  return path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+  return boomHomeDirectory()
 }
 
 /** Hard ceiling for one compiler/tool invocation so an ignored SIGTERM cannot hang startup. */

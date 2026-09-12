@@ -40,9 +40,9 @@ function model(id: string) {
 async function workspace() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-provider-driver-"))
   directories.push(directory)
-  await mkdir(path.join(directory, "challenge"), { recursive: true })
+  await mkdir(path.join(directory, "input"), { recursive: true })
   await mkdir(path.join(directory, "work"), { recursive: true })
-  await writeFile(path.join(directory, "challenge", "challenge.json"), "{}\n")
+  await writeFile(path.join(directory, "input", "challenge.json"), "{}\n")
   await writeFile(path.join(directory, "NOTES.md"), "# NOTES\n\nprotocol evidence\n")
   return directory
 }

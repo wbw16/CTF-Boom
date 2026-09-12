@@ -56,6 +56,9 @@ describe("M2 neutral agent registry", () => {
     expect(registry.agents.map((agent) => agent.resource.id)).toEqual([
       "boom",
       "boom-consultant",
+      "boom-flag-hunt",
+      "boom-pentest",
+      "boom-pentest-worker",
       "boom-worker",
       "boom-worker-pro",
     ])
@@ -70,6 +73,23 @@ describe("M2 neutral agent registry", () => {
         expect(agent.profile.tools).toContain(tool)
     }
     expect(consultant.profile.tools).toEqual(["read", "list", "glob", "grep"])
+    const pentester = registry.agents.find((agent) => agent.resource.id === "boom-pentest")!
+    const flagHunt = registry.agents.find((agent) => agent.resource.id === "boom-flag-hunt")!
+    const pentestWorker = registry.agents.find((agent) => agent.resource.id === "boom-pentest-worker")!
+    expect(pentester.resource.role).toBe("pentester")
+    expect(pentester.profile.tools).toContain("bash")
+    expect(pentester.profile.tools).toContain("pentest-finding")
+    expect(pentester.profile.tools).toContain("pentest-flag")
+    for (const ctfOnly of ["task", "ctf-submit", "ctf-consult", "ctf-note"])
+      expect(pentester.profile.tools).not.toContain(ctfOnly)
+    expect(flagHunt.profile.tools).toContain("task")
+    expect(flagHunt.openCodeMarkdown).toContain('boom-pentest-worker: "allow"')
+    expect(flagHunt.openCodeMarkdown).toContain('"*": "deny"')
+    expect(pentestWorker.resource.mode).toBe("subagent")
+    expect(pentestWorker.profile.tools).toEqual([
+      "bash", "read", "edit", "write", "list", "glob", "grep", "boom-exec", "pentest-flag",
+    ])
+    expect(pentestWorker.openCodeMarkdown).toContain("task: \"deny\"")
     expect(solver.profile.tools).toContain("ctf-consult")
     expect(worker.profile.tools).not.toContain("ctf-consult")
     expect(strongWorker.profile.tools).not.toContain("ctf-consult")
@@ -143,6 +163,12 @@ describe("M2 neutral agent registry", () => {
       ["ctf-note", "boom", "memory"],
       ["ctf-consult", "boom", "memory"],
       ["ctf-submit", "boom", "write"],
+      ["pentest-note", "boom", "memory"],
+      ["pentest-asset", "boom", "write"],
+      ["pentest-observation", "boom", "write"],
+      ["pentest-evidence", "boom", "write"],
+      ["pentest-finding", "boom", "write"],
+      ["pentest-flag", "boom", "write"],
     ])
     expect(catalog.tools["ctf-note"]?.schema).toEqual(expect.objectContaining({
       required: ["kind", "text"],

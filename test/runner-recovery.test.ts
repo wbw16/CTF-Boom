@@ -15,6 +15,7 @@ afterEach(async () => Promise.all(
 describe("host-level run recovery", () => {
   test("retries provider silence, ambiguous finishes, and guard-terminated loops", () => {
     expect(recoverableRunOutcome({ stop: "silent" })).toBe(true)
+    expect(recoverableRunOutcome({ stop: "timeout" })).toBe(true)
     expect(recoverableRunOutcome({ stop: "error", finish: "unknown" })).toBe(true)
     expect(recoverableRunOutcome({ stop: "error", finish: "content-filter" })).toBe(true)
     expect(recoverableRunOutcome({ stop: "error", finish: "cancelled" })).toBe(true)
@@ -230,9 +231,9 @@ describe("host-level run recovery", () => {
       expect(prompts[0]).toContain("do everything that does not need the target")
       expect(prompts[0]).toContain("just because the address is missing")
       expect(runner.getRuntimeState().concurrency).toBe(8)
-      const [runID] = await readdir(path.join(root, "runs", "service-only"))
+      const [runID] = await readdir(path.join(root, "tasks", "service-only"))
       const result = JSON.parse(await readFile(
-        path.join(root, "runs", "service-only", runID!, "result.json"),
+        path.join(root, "tasks", "service-only", runID!, "result.json"),
         "utf8",
       ))
       expect(result).toMatchObject({
@@ -313,8 +314,8 @@ describe("host-level run recovery", () => {
         pythonInterpreter: interpreter,
       })
       await waitForIdle()
-      const [runID] = await readdir(path.join(root, "runs", challenge.slug))
-      const runDirectory = path.join(root, "runs", challenge.slug, runID!)
+      const [runID] = await readdir(path.join(root, "tasks", challenge.slug))
+      const runDirectory = path.join(root, "tasks", challenge.slug, runID!)
       // Competition build: a missing endpoint is a scheduling wait, not a dead end. The turn runs and
       // completes offline rather than blocking for a human to paste a URL.
       expect(JSON.parse(await readFile(path.join(runDirectory, "result.json"), "utf8"))).toMatchObject({

@@ -4,6 +4,7 @@ import type { ToastItem } from "./ui"
 
 export type DialogName =
   | "settings"
+  | "challenge"
   | "providers"
   | "mcp"
   | "competition"
@@ -11,6 +12,12 @@ export type DialogName =
   | "armor"
   | "delete"
   | null
+
+/**
+ * Challenge authoring target: a blank draft, or one existing challenge opened for editing. The
+ * dialog itself reads the challenge from `data`, so a refresh never leaves it showing stale fields.
+ */
+export type ChallengeEditorState = { mode: "create" } | { mode: "edit"; slug: string } | null
 
 export type MenuState = {
   slug: string
@@ -28,7 +35,14 @@ export type AppContextValue = {
   collapsed: Set<string>
   toasts: ToastItem[]
   dialog: DialogName
+  challengeEditor: ChallengeEditorState
   menu: MenuState
+  /** Quick run-config popover shared by the rail and the mode headers. */
+  settingsOpen: boolean
+  setSettingsOpen: (open: boolean) => void
+  /** Narrow-viewport drawer for the task sidebar (engagements or challenge queue). */
+  sidebarOpen: boolean
+  setSidebarOpen: (open: boolean) => void
   deleteTarget: string | null
   now: number
   notices: PlatformNotice[]
@@ -44,6 +58,7 @@ export type AppContextValue = {
   loadDetail: (slug?: string) => Promise<void>
   toast: (message: string, kind?: "error" | "success") => void
   openDialog: (name: Exclude<DialogName, null>) => void
+  openChallengeEditor: (editor: Exclude<ChallengeEditorState, null>) => void
   closeDialog: () => void
   requestDelete: (slug: string | null) => void
   setMenu: (menu: MenuState) => void

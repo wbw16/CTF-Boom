@@ -305,8 +305,10 @@ export function createBoomNetworkBroker(options: {
           redirects += 1
           continue
         }
-        if (response.status < 200 || response.status >= 300)
-          throw new Error(`Network request failed with HTTP ${response.status}`)
+        // HTTP status is an observation, not a transport failure. In particular, 401/403/404/405
+        // are useful reconnaissance results for authorized CTF and pentest work. Surface their
+        // headers/body to webfetch and let the agent record the outcome; only connection, policy,
+        // redirect, timeout, and size failures are tool errors.
         const scope = `${await realpath(input.directory)}\0${input.sessionID ?? "task"}`
         const consumed = (usage.get(scope) ?? 0) + response.body.byteLength
         if (consumed > sessionByteLimit) throw new Error(`Network session traffic exceeds ${sessionByteLimit} bytes`)

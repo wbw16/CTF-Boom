@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { gunzipSync } from "node:zlib"
 import os from "node:os"
 import path from "node:path"
-import { mergeTransient, startGuiServer, type GuiRunnerBackend } from "../src/gui.ts"
-import { DEFAULT_GUI_SETTINGS, saveRootGuiState } from "../src/gui-state.ts"
+import { guardUnhandledRejections, mergeTransient, resolveInitialWorkspaceRoot, startGuiServer, type GuiRunnerBackend } from "../src/gui.ts"
+import { DEFAULT_GUI_SETTINGS, loadLastGuiRoot, saveLastGuiRoot, saveRootGuiState } from "../src/gui-state.ts"
 import type { RunHistory } from "../src/history.ts"
 import { GuiRunner, type McpServerDetails } from "../src/runner.ts"
 
@@ -25,7 +26,7 @@ async function harness(options: HarnessOptions = {}) {
   const root = path.join(directory, "ctf")
   const challenge = path.join(root, "challenges", "alpha")
   const runID = "20260729T010203Z-test"
-  const run = path.join(root, "runs", "alpha", runID)
+  const run = path.join(root, "tasks", "alpha", runID)
   if (options.categoryRoot) {
     await mkdir(path.join(root, "WEB", "login"), { recursive: true })
     await mkdir(path.join(root, "misc", "packet"), { recursive: true })
@@ -33,6 +34,7 @@ async function harness(options: HarnessOptions = {}) {
     await writeFile(path.join(root, "misc", "packet", "capture.pcap"), "pcap")
   } else if (!options.freshRoot) {
     await mkdir(path.join(run, "work"), { recursive: true })
+    await mkdir(path.join(run, "records"), { recursive: true })
     await mkdir(challenge, { recursive: true })
     await writeFile(path.join(challenge, "README.md"), "Recover the flag")
     await writeFile(path.join(challenge, "payload.txt"), "payload")
@@ -320,7 +322,99 @@ async function request(
   })
 }
 
+describe("GUI host survival", () => {
+  test("reports a dropped promise rejection instead of exiting the host", () => {
+    const listeners: Array<(reason: unknown, promise: unknown) => void> = []
+    const reported: string[] = []
+    const emitter = {
+      on: (event: string, listener: (reason: unknown, promise: unknown) => void) => {
+        expect(event).toBe("unhandledRejection")
+        listeners.push(listener)
+      },
+    }
+    guardUnhandledRejections(emitter, (message) => reported.push(message))
+    expect(listeners).toHaveLength(1)
+    // Aborting a runtime turn leaks exactly this rejection from the SDK's event-stream cancel; a
+    // host that lets Bun's fatal default run dies inside the pause request that caused the abort.
+    const abortedBody = new DOMException("The operation was aborted.", "AbortError")
+    expect(() => listeners[0]!(abortedBody, Promise.resolve())).not.toThrow()
+    expect(reported).toHaveLength(1)
+    expect(reported[0]).toContain("忽略了未处理的 Promise 拒绝")
+    expect(reported[0]).toContain("The operation was aborted.")
+    // A non-Error rejection is still reported rather than swallowed silently.
+    listeners[0]!("plain failure", Promise.resolve())
+    expect(reported).toHaveLength(2)
+    expect(reported[1]).toContain("plain failure")
+    // One process can host several servers over its lifetime; the guard still installs one listener.
+    guardUnhandledRejections(emitter, (message) => reported.push(message))
+    expect(listeners).toHaveLength(1)
+  })
+})
+
 describe("GUI HTTP surface", () => {
+  test("manages pentest task lifecycle and creates evidence-backed Flag objectives", async () => {
+    const one = await harness()
+    try {
+      const created = await request(one, "/api/pentest/engagements", "POST", {
+        target: "10.10.10.5",
+        authorized: true,
+        mode: "flag-hunt",
+        flags: [{ label: "Web Flag", hint: "login route" }],
+      })
+      expect(created.status).toBe(200)
+      const body = await created.json() as { engagement: { slug: string; mode: string; flagObjectives: Array<{ id: string; label: string }> } }
+      expect(body.engagement).toMatchObject({ mode: "flag-hunt", flagObjectives: [{ id: "flag-1", label: "Web Flag" }] })
+      const slug = body.engagement.slug
+
+      const archived = await request(one, `/api/pentest/engagements/${slug}/archive`, "POST")
+      expect(archived.status).toBe(200)
+      expect(await archived.json()).toMatchObject({ engagement: { status: "archived" } })
+      const archivedWrite = await request(one, `/api/pentest/engagements/${slug}/assets`, "POST", { type: "ip", value: "10.10.10.5" })
+      expect(archivedWrite.status).toBe(409)
+      const restored = await request(one, `/api/pentest/engagements/${slug}/restore`, "POST")
+      expect(restored.status).toBe(200)
+      const assessment = await request(one, `/api/pentest/engagements/${slug}/mode`, "POST", { mode: "assessment" })
+      expect(assessment.status).toBe(200)
+      expect(await assessment.json()).toMatchObject({ engagement: { mode: "assessment" }, previousMode: "flag-hunt" })
+      const flagHunt = await request(one, `/api/pentest/engagements/${slug}/mode`, "POST", { mode: "flag-hunt" })
+      expect(flagHunt.status).toBe(200)
+      expect(await flagHunt.json()).toMatchObject({ engagement: { mode: "flag-hunt", flagObjectives: [{ id: "flag-1" }] } })
+      const abandoned = await request(one, `/api/pentest/engagements/${slug}/abandon`, "POST")
+      expect(abandoned.status).toBe(200)
+      expect(await abandoned.json()).toMatchObject({ engagement: { status: "abandoned" } })
+      const deleted = await request(one, `/api/pentest/engagements/${slug}`, "DELETE")
+      expect(deleted.status).toBe(200)
+      expect(await deleted.json()).toMatchObject({ deleted: true, recoverable: true })
+      expect(await (await request(one, "/api/pentest/engagements")).json()).toMatchObject({ engagements: [] })
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("keeps the operator's creation notes as a fixed engagement constraint", async () => {
+    const one = await harness()
+    try {
+      const created = await request(one, "/api/pentest/engagements", "POST", {
+        target: "10.10.10.9",
+        authorized: true,
+        notes: "关注 /admin；禁止登录爆破",
+      })
+      expect(created.status).toBe(200)
+      const body = await created.json() as { engagement: { slug: string; userNotes?: string } }
+      // The notes are a first-class field, not only an observation that newer records can displace.
+      expect(body.engagement.userNotes).toBe("关注 /admin；禁止登录爆破")
+      const detail = await request(one, `/api/pentest/engagements/${body.engagement.slug}`)
+      const loaded = await detail.json() as {
+        engagement: { userNotes?: string; observations: Array<{ detail: string }> }
+      }
+      expect(loaded.engagement.userNotes).toBe("关注 /admin；禁止登录爆破")
+      // The audit trail still records what the operator wrote at creation.
+      expect(loaded.engagement.observations.some((observation) => observation.detail.includes("关注 /admin"))).toBe(true)
+    } finally {
+      await one.close()
+    }
+  })
+
   test("opens stationary even when an earlier session persisted unattended mode", async () => {
     const one = await harness({ persistedAutopilot: true })
     try {
@@ -342,7 +436,7 @@ describe("GUI HTTP surface", () => {
       expect(response.status).toBe(200)
       const state = await response.json() as { challenges: unknown[] }
       expect(state.challenges).toEqual([])
-      expect(await exists(path.join(one.root, "runs"))).toBe(true)
+      expect(await exists(path.join(one.root, "tasks"))).toBe(true)
       expect(await exists(path.join(one.root, "challenges"))).toBe(true)
     } finally {
       await one.close()
@@ -362,7 +456,7 @@ describe("GUI HTTP surface", () => {
       expect(state.challenges[0]?.storagePath).toBe("WEB/login")
       // A root-level catalog must not gain a shadowing empty challenges/ directory.
       expect(await exists(path.join(one.root, "challenges"))).toBe(false)
-      expect(await exists(path.join(one.root, "runs"))).toBe(true)
+      expect(await exists(path.join(one.root, "tasks"))).toBe(true)
     } finally {
       await one.close()
     }
@@ -409,7 +503,7 @@ describe("GUI HTTP surface", () => {
     const root = path.join(directory, "ctf")
     await Promise.all([
       mkdir(path.join(root, "challenges"), { recursive: true }),
-      mkdir(path.join(root, "runs"), { recursive: true }),
+      mkdir(path.join(root, "tasks"), { recursive: true }),
     ])
     let launches = 0
     const runner = new GuiRunner(root, async () => {
@@ -469,7 +563,7 @@ describe("GUI HTTP surface", () => {
       }])
       expect(await readFile(path.join(one.run, "work", ".boom", "environment.json"), "utf8"))
         .toContain('"executionMode": "static-only"')
-      expect(await readFile(path.join(one.run, "work", "events.jsonl"), "utf8"))
+      expect(await readFile(path.join(one.run, "records", "events.jsonl"), "utf8"))
         .toContain("environment-switched")
     } finally {
       await one.close()
@@ -491,7 +585,7 @@ describe("GUI HTTP surface", () => {
       const icon = await request(one, "/boom-icon.svg")
       expect(icon.status).toBe(200)
       expect(icon.headers.get("content-type")).toContain("image/svg+xml")
-      expect(await icon.text()).toContain("Boom app icon")
+      expect(await icon.text()).toContain('<title id="title">Boom</title>')
       const asset = /\/assets\/index-[^"]+\.js/.exec(html)?.[0]
       expect(asset).toBeTruthy()
       const script = await request(one, asset ?? "/assets/missing.js")
@@ -568,7 +662,7 @@ describe("GUI HTTP surface", () => {
         writeFile(path.join(one.run, "work", "new-proof.txt"), "new proof"),
         writeFile(path.join(one.run, "work", "WRITEUP.md"), "# Live writeup\n\nflag{alpha}"),
         writeFile(
-          path.join(one.run, "work", "events.jsonl"),
+          path.join(one.run, "records", "events.jsonl"),
           `${JSON.stringify({ at: 123, type: "tool", tool: "ctf-note", status: "completed", text: "saved" })}\n`,
         ),
       ])
@@ -766,6 +860,7 @@ describe("GUI HTTP surface", () => {
         strongModel: "free/strong",
         visionModel: "free/vision",
         tokens: 2_000,
+        tokenBudgetEnabled: true,
         repeats: 3,
         minutes: 2,
         concurrency: 2,
@@ -781,6 +876,7 @@ describe("GUI HTTP surface", () => {
           strongModel: "free/strong",
           visionModel: "free/vision",
           tokens: 2_000,
+          tokenBudgetEnabled: true,
           minutes: 2,
           consultModels: ["free/expert-a", "free/expert-b"],
           blindReview: false,
@@ -893,6 +989,7 @@ describe("GUI HTTP surface", () => {
         economyModel: "free/economy",
         strongModel: "free/strong",
         tokens: 4_000,
+        tokenBudgetEnabled: true,
         repeats: 3,
         minutes: 5,
         concurrency: 1,
@@ -968,7 +1065,7 @@ describe("GUI HTTP surface", () => {
     const one = await harness()
     try {
       await writeFile(
-        path.join(one.run, "work", "events.jsonl"),
+        path.join(one.run, "records", "events.jsonl"),
         `${JSON.stringify({ at: Date.now(), type: "text", text: "x".repeat(200_000) })}\n`,
       )
       await writeFile(
@@ -1198,18 +1295,18 @@ describe("GUI HTTP surface", () => {
       const reset = await request(one, "/api/challenges/alpha/runs", "DELETE")
       expect(reset.status).toBe(200)
       expect(await exists(one.challenge)).toBe(true)
-      expect(await exists(path.join(one.root, "runs", "alpha"))).toBe(false)
+      expect(await exists(path.join(one.root, "tasks", "alpha"))).toBe(false)
 
-      await mkdir(path.join(one.root, "runs", "alpha", "new-run", "work"), { recursive: true })
+      await mkdir(path.join(one.root, "tasks", "alpha", "new-run", "work"), { recursive: true })
       const unconfirmed = await request(one, "/api/challenges/alpha", "DELETE", { confirm: false })
       expect(unconfirmed.status).toBe(400)
       expect(await exists(one.challenge)).toBe(true)
-      expect(await exists(path.join(one.root, "runs", "alpha"))).toBe(true)
+      expect(await exists(path.join(one.root, "tasks", "alpha"))).toBe(true)
 
       const deleted = await request(one, "/api/challenges/alpha", "DELETE", { confirm: true })
       expect(deleted.status).toBe(200)
       expect(await exists(one.challenge)).toBe(false)
-      expect(await exists(path.join(one.root, "runs", "alpha"))).toBe(false)
+      expect(await exists(path.join(one.root, "tasks", "alpha"))).toBe(false)
     } finally {
       await one.close()
     }
@@ -1228,9 +1325,9 @@ describe("GUI HTTP surface", () => {
       expect(traversal.status).toBe(400)
       expect(((await traversal.json()) as { error: string }).error).toContain("Path escapes")
 
-      await rm(path.join(one.root, "runs", "alpha"), { recursive: true, force: true })
+      await rm(path.join(one.root, "tasks", "alpha"), { recursive: true, force: true })
       await writeFile(path.join(outside, "sentinel.txt"), "keep")
-      await symlink(outside, path.join(one.root, "runs", "alpha"))
+      await symlink(outside, path.join(one.root, "tasks", "alpha"))
       const reset = await request(one, "/api/challenges/alpha/runs", "DELETE")
 
       expect(reset.status).toBe(400)
@@ -1242,13 +1339,268 @@ describe("GUI HTTP surface", () => {
   })
 })
 
+describe("GUI challenge authoring", () => {
+  test("creates a challenge with description, metadata, attachments, and an answer", async () => {
+    const one = await harness({ freshRoot: true })
+    const attachment = path.join(path.dirname(one.root), "payload.bin")
+    try {
+      await writeFile(attachment, "attachment body")
+      const created = await request(one, "/api/challenges", "POST", {
+        slug: "warmup-base64",
+        category: "misc",
+        description: "Decode the blob",
+        difficulty: "easy",
+        serviceRequired: true,
+        remote: "http://127.0.0.1:9000",
+        flagFormat: "flag\\{[^}]*\\}",
+        answer: "flag{from-gui}",
+        files: [attachment],
+      })
+
+      expect(created.status).toBe(201)
+      const body = (await created.json()) as { slug: string; category: string; files: string[] }
+      expect(body).toMatchObject({ slug: "warmup-base64", category: "MISC", files: ["payload.bin"] })
+
+      const directory = path.join(one.root, "challenges", "MISC", "warmup-base64")
+      expect(await readFile(path.join(directory, "README.md"), "utf8")).toContain("Decode the blob")
+      expect(await readFile(path.join(directory, "files", "payload.bin"), "utf8")).toBe("attachment body")
+      expect(JSON.parse(await readFile(path.join(directory, "meta.json"), "utf8"))).toEqual({
+        category: "MISC",
+        difficulty: "easy",
+        remote: "http://127.0.0.1:9000",
+        service_required: true,
+        flag_format: "flag\\{[^}]*\\}",
+      })
+      expect(await readFile(path.join(one.root, "eval", "answers.txt"), "utf8"))
+        .toBe("warmup-base64 flag{from-gui}\n")
+
+      const state = (await (await request(one, "/api/state")).json()) as {
+        challenges: Array<{ slug: string; category: string; storagePath: string; files: unknown[]; serviceRequired?: boolean }>
+      }
+      expect(state.challenges).toContainEqual(expect.objectContaining({
+        slug: "warmup-base64",
+        category: "MISC",
+        storagePath: "challenges/MISC/warmup-base64",
+        serviceRequired: true,
+      }))
+      expect(state.challenges.find((item) => item.slug === "warmup-base64")?.files).toHaveLength(1)
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("rejects a duplicate slug and rolls back a challenge whose attachment is missing", async () => {
+    const one = await harness()
+    try {
+      const duplicate = await request(one, "/api/challenges", "POST", { slug: "alpha", category: "MISC" })
+      expect(duplicate.status).toBe(409)
+      expect(((await duplicate.json()) as { error: string }).error).toContain("already exists")
+
+      const invalid = await request(one, "/api/challenges", "POST", { slug: "../escape", category: "MISC" })
+      expect(invalid.status).toBe(400)
+      expect(await exists(path.join(path.dirname(one.root), "escape"))).toBe(false)
+
+      const missing = await request(one, "/api/challenges", "POST", {
+        slug: "no-attachment",
+        category: "MISC",
+        files: [path.join(path.dirname(one.root), "nope.bin")],
+      })
+      expect(missing.status).toBe(400)
+      expect(((await missing.json()) as { error: string }).error).toContain("Attachment does not exist")
+      expect(await exists(path.join(one.root, "challenges", "MISC", "no-attachment"))).toBe(false)
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("edits a challenge in place and follows a category change", async () => {
+    const one = await harness()
+    try {
+      const moved = await request(one, "/api/challenges/alpha", "PATCH", {
+        category: "crypto",
+        description: "Rewritten statement",
+        difficulty: "hard",
+        answer: "flag{edited}",
+      })
+      expect(moved.status).toBe(200)
+
+      const movedDirectory = path.join(one.root, "challenges", "CRYPTO", "alpha")
+      expect(await exists(one.challenge)).toBe(false)
+      // The description is rewritten below the challenge's title line, which an edit keeps.
+      expect(await readFile(path.join(movedDirectory, "README.md"), "utf8"))
+        .toBe("# alpha\n\nRewritten statement\n")
+      // The operator's own metadata keys and the original flag format survive an edit.
+      expect(JSON.parse(await readFile(path.join(movedDirectory, "meta.json"), "utf8"))).toEqual({
+        service_required: true,
+        custom_field: "preserved",
+        category: "CRYPTO",
+        difficulty: "hard",
+      })
+      expect(await readFile(path.join(one.root, "eval", "answers.txt"), "utf8"))
+        .toBe("alpha flag{edited}\n")
+
+      const state = (await (await request(one, "/api/state")).json()) as {
+        challenges: Array<{ slug: string; category: string; storagePath: string }>
+      }
+      expect(state.challenges).toContainEqual(expect.objectContaining({
+        slug: "alpha",
+        category: "CRYPTO",
+        storagePath: "challenges/CRYPTO/alpha",
+      }))
+
+      const current = (await (await request(one, "/api/challenges/alpha")).json()) as { answer: string | null }
+      expect(current.answer).toBe("flag{edited}")
+
+      const cleared = await request(one, "/api/challenges/alpha", "PATCH", { answer: null })
+      expect(cleared.status).toBe(200)
+      expect(await readFile(path.join(one.root, "eval", "answers.txt"), "utf8")).toBe("")
+      expect(((await (await request(one, "/api/challenges/alpha")).json()) as { answer: string | null }).answer)
+        .toBeNull()
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("adds and removes attachments through the API", async () => {
+    const one = await harness()
+    const source = path.join(path.dirname(one.root), "second.bin")
+    try {
+      await writeFile(source, "second")
+      const added = await request(one, "/api/challenges/alpha/files", "POST", { sources: [source] })
+      expect(added.status).toBe(201)
+      expect((await added.json()) as { files: string[] }).toMatchObject({ files: ["second.bin"] })
+      expect(await readFile(path.join(one.challenge, "files", "second.bin"), "utf8")).toBe("second")
+
+      const removed = await request(one, "/api/challenges/alpha/files/second.bin", "DELETE")
+      expect(removed.status).toBe(200)
+      expect(await exists(path.join(one.challenge, "files", "second.bin"))).toBe(false)
+
+      const missing = await request(one, "/api/challenges/alpha/files/absent.bin", "DELETE")
+      expect(missing.status).toBe(404)
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("keeps unrelated answers and comments while writing one challenge's flag", async () => {
+    const one = await harness()
+    try {
+      await mkdir(path.join(one.root, "eval"), { recursive: true })
+      await writeFile(
+        path.join(one.root, "eval", "answers.txt"),
+        "# operator notes\nalpha flag{old}\nbeta flag{beta}\n",
+      )
+      const patched = await request(one, "/api/challenges/alpha", "PATCH", { answer: "flag{new}" })
+      expect(patched.status).toBe(200)
+      expect(await readFile(path.join(one.root, "eval", "answers.txt"), "utf8"))
+        .toBe("# operator notes\nalpha flag{new}\nbeta flag{beta}\n")
+    } finally {
+      await one.close()
+    }
+  })
+})
+
+describe("initial workspace root", () => {
+  async function isolatedHome() {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "boom-gui-root-"))
+    const previous = process.env.BOOM_HOME
+    process.env.BOOM_HOME = path.join(directory, "home")
+    return {
+      directory,
+      // macOS tmpdirs resolve through /var to /private/var; canonical roots compare against this.
+      canonical: await realpath(directory),
+      restore: async () => {
+        if (previous === undefined) delete process.env.BOOM_HOME
+        else process.env.BOOM_HOME = previous
+        await rm(directory, { recursive: true, force: true })
+      },
+    }
+  }
+
+  test("without a remembered root it prepares and remembers ~/BoomProject, never the cwd", async () => {
+    const { directory, canonical, restore } = await isolatedHome()
+    try {
+      const root = await resolveInitialWorkspaceRoot(undefined, { home: directory })
+      expect(root).toBe(path.join(canonical, "BoomProject"))
+      expect(await exists(path.join(root, "tasks"))).toBe(true)
+      expect(await exists(path.join(root, "challenges"))).toBe(true)
+      // Nothing may be scaffolded relative to where Boom was started from, and Boom's own data
+      // directory stays a data directory.
+      expect(await exists(path.join(directory, "tasks"))).toBe(false)
+      expect(await exists(path.join(directory, "challenges"))).toBe(false)
+      expect(await exists(path.join(directory, "home", "workspace"))).toBe(false)
+      expect(await loadLastGuiRoot()).toBe(root)
+    } finally {
+      await restore()
+    }
+  })
+
+  test("upgrades an empty hidden workspace to ~/BoomProject but keeps one that holds tasks", async () => {
+    const { directory, canonical, restore } = await isolatedHome()
+    try {
+      const legacy = path.join(directory, "home", "workspace")
+      await mkdir(legacy, { recursive: true })
+      await saveLastGuiRoot(legacy)
+      expect(await resolveInitialWorkspaceRoot(undefined, { home: directory }))
+        .toBe(path.join(canonical, "BoomProject"))
+
+      // A hidden workspace with real data is still opened: the upgrade must never strand tasks.
+      await mkdir(path.join(legacy, "tasks", "alpha", "20260729T010203Z-test"), { recursive: true })
+      await saveLastGuiRoot(legacy)
+      expect(await resolveInitialWorkspaceRoot(undefined, { home: directory }))
+        .toBe(path.join(canonical, "home", "workspace"))
+    } finally {
+      await restore()
+    }
+  })
+
+  test("reopens the remembered root without scaffolding the first-run default", async () => {
+    const { directory, canonical, restore } = await isolatedHome()
+    try {
+      const chosen = path.join(directory, "chosen")
+      await mkdir(chosen, { recursive: true })
+      await saveLastGuiRoot(chosen)
+      expect(await resolveInitialWorkspaceRoot(undefined, { home: directory })).toBe(path.join(canonical, "chosen"))
+      expect(await exists(path.join(directory, "BoomProject"))).toBe(false)
+    } finally {
+      await restore()
+    }
+  })
+
+  test("a vanished remembered root falls back to the default project folder", async () => {
+    const { directory, canonical, restore } = await isolatedHome()
+    try {
+      await saveLastGuiRoot(path.join(directory, "deleted"))
+      const root = await resolveInitialWorkspaceRoot(undefined, { home: directory })
+      expect(root).toBe(path.join(canonical, "BoomProject"))
+    } finally {
+      await restore()
+    }
+  })
+
+  test("an explicit root wins, is prepared, and becomes the remembered root", async () => {
+    const { directory, canonical, restore } = await isolatedHome()
+    try {
+      const chosen = path.join(directory, "explicit")
+      await mkdir(chosen, { recursive: true })
+      await saveLastGuiRoot(path.join(directory, "stale"))
+      const root = await resolveInitialWorkspaceRoot(chosen)
+      expect(root).toBe(path.join(canonical, "explicit"))
+      expect(await exists(path.join(chosen, "challenges"))).toBe(true)
+      expect(await loadLastGuiRoot()).toBe(root)
+    } finally {
+      await restore()
+    }
+  })
+})
+
 describe("GUI token authentication", () => {
   test("rejects anonymous local callers, seeds the cookie, and accepts the tokened URL", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "boom-gui-auth-"))
     const root = path.join(directory, "ctf")
     await Promise.all([
       mkdir(path.join(root, "challenges"), { recursive: true }),
-      mkdir(path.join(root, "runs"), { recursive: true }),
+      mkdir(path.join(root, "tasks"), { recursive: true }),
     ])
     const previousHome = process.env.BOOM_HOME
     process.env.BOOM_HOME = path.join(directory, "home")
@@ -1300,6 +1652,121 @@ describe("GUI token authentication", () => {
       if (previousHome === undefined) delete process.env.BOOM_HOME
       else process.env.BOOM_HOME = previousHome
       await rm(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+/** Poll a file the platform opener appends to, so the test never races the spawned process. */
+async function appendedLines(target: string, minimum: number, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const lines = (await readFile(target, "utf8").catch(() => ""))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "")
+    if (lines.length >= minimum) return lines
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error(`only ${(await readFile(target, "utf8").catch(() => "")).trim()} was written`)
+}
+
+describe("GUI workspace maintenance", () => {
+  test("names the default project folder and archives a workspace under the backup directory", async () => {
+    const one = await harness()
+    try {
+      const state = (await (await request(one, "/api/state")).json()) as { defaultRoot: string }
+      expect(state.defaultRoot).toBe(path.join(os.homedir(), "BoomProject"))
+
+      const backup = await request(one, "/api/workspace/backup", "POST", { name: "unit-check" })
+      expect(backup.status).toBe(200)
+      const saved = (await backup.json()) as { name: string; path: string; bytes: number }
+      expect(saved.path).toBe(path.join(one.directory, "home", "backups", "unit-check.tar.gz"))
+      expect(saved.bytes).toBeGreaterThan(0)
+      // The archive really holds the workspace: challenge material and durable notes are inside.
+      const archive = gunzipSync(await readFile(saved.path))
+      expect(archive.includes(Buffer.from("challenges/alpha/README.md"))).toBe(true)
+      expect(archive.includes(Buffer.from("NOTES.md"))).toBe(true)
+
+      // A second archive never overwrites the first one.
+      expect((await request(one, "/api/workspace/backup", "POST", { name: "unit-check" })).status).toBe(409)
+
+      const automatic = await request(one, "/api/workspace/backup", "POST", {})
+      expect(automatic.status).toBe(200)
+      expect(((await automatic.json()) as { name: string }).name).toMatch(/^ctf-\d{8}T\d{6}Z$/)
+
+      // A typed name is a file name, never a path: traversal is refused before anything is written.
+      const escape = await request(one, "/api/workspace/backup", "POST", { name: "../escape" })
+      expect(escape.status).toBe(400)
+      expect(await exists(path.join(one.directory, "home", "escape.tar.gz"))).toBe(false)
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("clears Boom's data while keeping the files an operator owns", async () => {
+    const one = await harness()
+    try {
+      await writeFile(path.join(one.root, "writeup.md"), "operator notes")
+
+      expect((await request(one, "/api/workspace/clear", "POST", {})).status).toBe(400)
+
+      const cleared = await request(one, "/api/workspace/clear", "POST", { confirm: true })
+      expect(cleared.status).toBe(200)
+      const result = (await cleared.json()) as { removed: string[]; root: string }
+      // The API reports the canonical workspace path, which is what every other route uses.
+      expect(result.root).toBe(await realpath(one.root))
+      expect(result.removed).toContain("challenges")
+      expect(result.removed).toContain("tasks")
+      expect(await exists(one.challenge)).toBe(false)
+      expect(await exists(path.join(one.root, "tasks", "alpha"))).toBe(false)
+      // The workspace stays usable: the empty catalog and task root are rebuilt...
+      expect(await exists(path.join(one.root, "challenges"))).toBe(true)
+      expect(await exists(path.join(one.root, "tasks"))).toBe(true)
+      // ...and anything Boom does not own is untouched.
+      expect(await readFile(path.join(one.root, "writeup.md"), "utf8")).toBe("operator notes")
+      const state = (await (await request(one, "/api/state")).json()) as { challenges: unknown[] }
+      expect(state.challenges).toEqual([])
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("clears challenge folders from a traditional root catalog without deleting the root", async () => {
+    const one = await harness({ categoryRoot: true })
+    try {
+      expect(await exists(path.join(one.root, "WEB", "login"))).toBe(true)
+      const cleared = await request(one, "/api/workspace/clear", "POST", { confirm: true })
+      expect(cleared.status).toBe(200)
+      expect(((await cleared.json()) as { removed: string[] }).removed).toContain("WEB/login")
+      expect(await exists(path.join(one.root, "WEB", "login"))).toBe(false)
+      expect(await exists(path.join(one.root, "misc", "packet"))).toBe(false)
+      expect(await exists(one.root)).toBe(true)
+    } finally {
+      await one.close()
+    }
+  })
+
+  test("reveals the workspace and the backup folder through the platform opener", async () => {
+    const one = await harness()
+    const mockBin = path.join(one.directory, "mock-bin")
+    const log = path.join(one.directory, "opened.txt")
+    await mkdir(mockBin, { recursive: true })
+    await writeFile(path.join(mockBin, "open"), `#!/bin/sh\nprintf '%s\\n' "$1" >> '${log}'\n`)
+    await chmod(path.join(mockBin, "open"), 0o755)
+    const previousPath = process.env.PATH
+    try {
+      process.env.PATH = `${mockBin}:${previousPath ?? ""}`
+
+      expect((await request(one, "/api/open", "POST", { kind: "root" })).status).toBe(200)
+      expect((await request(one, "/api/open", "POST", { kind: "backups" })).status).toBe(200)
+
+      const opened = await appendedLines(log, 2)
+      expect(opened).toContain(await realpath(one.root))
+      expect(opened).toContain(path.join(one.directory, "home", "backups"))
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH
+      else process.env.PATH = previousPath
+      await one.close()
     }
   })
 })

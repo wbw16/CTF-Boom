@@ -3,6 +3,7 @@ import os from "node:os"
 import path from "node:path"
 import type { RuntimeModelPricing } from "./runtime-contract.ts"
 import { exactEndpointURL, isExactEndpoint } from "./runtime/provider-http.ts"
+import { boomHomeDirectory } from "./boom-home.ts"
 
 export type ManagedProviderDriver = "openai-compatible" | "openai" | "anthropic"
 
@@ -299,7 +300,7 @@ export function assertProviderBaseURL(value: string) {
 
 export function providerStorePath() {
   const home = path.resolve(
-    process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"),
+    boomHomeDirectory(),
   )
   return path.join(home, "providers.json")
 }

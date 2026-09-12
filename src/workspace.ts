@@ -1,11 +1,24 @@
 import { chmod, copyFile, lstat, mkdir, readdir, realpath, rm, statfs, writeFile } from "node:fs/promises"
 import path from "node:path"
 import type { Challenge } from "./challenge.ts"
+import {
+  assertTaskSlug,
+  INPUT_DIR,
+  RECORDS_DIR,
+  runID,
+  taskSlugRoot,
+  tasksRoot,
+  WORK_DIR,
+} from "./task-layout.ts"
+
+export { runID } from "./task-layout.ts"
 
 export type Workspace = {
-  /** Absolute path to `runs/<slug>/<run-id>/`; also the session's directory. */
+  /** Absolute path to `tasks/<slug>/<task-id>/`; also the session's directory. */
   directory: string
   runID: string
+  /** Task-relative name of the read-only input directory (`input/`, or legacy `challenge/`). */
+  input?: string
   /** Attachments unpacked into `work/extracted/<name>/`, relative to the workspace. */
   extracted: string[]
 }
@@ -38,28 +51,6 @@ Recover and verify the challenge flag.
 
 - Read the challenge statement and attachments.
 `
-
-/**
- * `<UTC timestamp>-<model-slug>`, for example `20260728T121459Z-deepseek-v4-flash-free`.
- *
- * Seconds are included because runs of one challenge can now start close together — a retry, or two
- * models on the same slug — and a collision would silently overwrite an existing workspace.
- */
-let previousStamp = ""
-let sameStampSequence = 0
-
-export function runID(model: string, now = new Date()) {
-  const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")
-  if (stamp === previousStamp) sameStampSequence += 1
-  else {
-    previousStamp = stamp
-    sameStampSequence = 0
-  }
-  const collisionSuffix = sameStampSequence === 0 ? "" : `-${sameStampSequence + 1}`
-  const rawModel = model.split(/[\\/]/).pop() || "model"
-  const modelSlug = rawModel.replace(/[\0-\x1f/:\\]/g, "-").replace(/\.\./g, "-")
-  return `${stamp}${collisionSuffix}-${modelSlug}`
-}
 
 /**
  * Identify an archive by content rather than extension. Real challenge attachments are frequently
@@ -595,8 +586,9 @@ with zipfile.ZipFile(src) as z:
 `
 
 /**
- * Build an isolated run workspace. Known answers never enter it; challenge inputs are copied, `work/`
- * exists before Boom starts, and NOTES.md is seeded for the agent's mandatory opening read.
+ * Build an isolated task workspace. Known answers never enter it; challenge inputs are copied into
+ * `input/`, `work/` exists before Boom starts, and NOTES.md is seeded for the agent's mandatory
+ * opening read.
  */
 export async function prepareWorkspace(
   root: string,
@@ -605,13 +597,12 @@ export async function prepareWorkspace(
   options: { initialNotes?: string } = {},
 ): Promise<Workspace> {
   const canonicalRoot = await realpath(path.resolve(root))
-  const runsPath = path.join(canonicalRoot, "runs")
-  await mkdir(runsPath, { recursive: true })
-  const runsRoot = await realpath(runsPath)
-  if (!isInside(canonicalRoot, runsRoot)) throw new Error(`Runs directory escapes Boom root: ${runsPath}`)
-  if (challenge.slug === "." || challenge.slug === ".." || /[\\/]/.test(challenge.slug))
-    throw new Error(`Invalid challenge slug: ${challenge.slug}`)
-  const parent = path.join(runsRoot, challenge.slug)
+  const tasksPath = tasksRoot(canonicalRoot)
+  await mkdir(tasksPath, { recursive: true })
+  const tasksReal = await realpath(tasksPath)
+  if (!isInside(canonicalRoot, tasksReal)) throw new Error(`Tasks directory escapes Boom root: ${tasksPath}`)
+  assertTaskSlug(challenge.slug)
+  const parent = taskSlugRoot(canonicalRoot, challenge.slug)
   await mkdir(parent, { recursive: true })
   let id = ""
   let directory = ""
@@ -625,10 +616,11 @@ export async function prepareWorkspace(
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
     }
   }
-  const challengeDirectory = path.join(directory, "challenge")
+  const inputDirectory = path.join(directory, INPUT_DIR)
 
-  await mkdir(path.join(directory, "work"), { recursive: true })
-  await mkdir(challengeDirectory, { recursive: true })
+  await mkdir(path.join(directory, WORK_DIR), { recursive: true })
+  await mkdir(path.join(directory, RECORDS_DIR), { recursive: true })
+  await mkdir(inputDirectory, { recursive: true })
 
   const sourceRoot = await realpath(challenge.directory)
   for (const file of challenge.files) {
@@ -641,22 +633,22 @@ export async function prepareWorkspace(
     const canonicalSource = await realpath(source)
     if (!isInside(sourceRoot, canonicalSource))
       throw new Error(`Challenge attachment escapes its directory: ${file}`)
-    const destination = path.join(challengeDirectory, file)
+    const destination = path.join(inputDirectory, file)
     await mkdir(path.dirname(destination), { recursive: true })
     await copyFile(canonicalSource, destination)
   }
 
   // Unpack the outer archive layer so the agent starts from the real file tree instead of spending
-  // tokens on mechanical unwrapping. The original archive stays in `challenge/`. A rejected archive
+  // tokens on mechanical unwrapping. The original archive stays in `input/`. A rejected archive
   // (traversal member, link member, quota breach, hung tool) fails the run loudly — the error text
   // reaches the job's result/detail chain — and leaves no half-extracted debris behind.
   const extracted: string[] = []
   for (const file of challenge.files) {
-    const source = path.join(challengeDirectory, file)
+    const source = path.join(inputDirectory, file)
     const kind = await archiveKind(source).catch(() => undefined)
     if (kind === undefined) continue
     const name = path.basename(file).replace(/\.[^.]*$/, "") || path.basename(file)
-    const target = path.join(directory, "work", "extracted", name)
+    const target = path.join(directory, WORK_DIR, "extracted", name)
     let unpacked = false
     try {
       unpacked = await unpack(source, kind, target)
@@ -665,11 +657,11 @@ export async function prepareWorkspace(
       const reason = error instanceof Error ? error.message : String(error)
       throw new Error(`Failed to unpack ${path.basename(file)} (${kind}): ${reason}`)
     }
-    if (unpacked) extracted.push(path.join("work", "extracted", name))
+    if (unpacked) extracted.push(path.join(WORK_DIR, "extracted", name))
   }
 
   await writeFile(
-    path.join(challengeDirectory, "challenge.json"),
+    path.join(inputDirectory, "challenge.json"),
     JSON.stringify(
       {
         slug: challenge.slug,
@@ -697,8 +689,8 @@ export async function prepareWorkspace(
   // Enforce read-only on the filesystem, not just in the prompt and edit rules. `bash` is allowed and
   // would otherwise let the agent modify or delete the original evidence, making a failed run
   // impossible to reproduce. Extraction above is already finished, so this cannot block it.
-  await protect(challengeDirectory)
-  return { directory, runID: id, extracted }
+  await protect(inputDirectory)
+  return { directory, runID: id, input: INPUT_DIR, extracted }
 }
 
 function isInside(base: string, target: string) {

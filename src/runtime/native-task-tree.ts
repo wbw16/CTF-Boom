@@ -9,6 +9,7 @@ import {
   realpath,
 } from "node:fs/promises"
 import path from "node:path"
+import { resolveInputDirectory } from "../task-layout.ts"
 import type { RuntimeEvent, RuntimeUsage } from "../runtime-contract.ts"
 import {
   addRuntimeUsage,
@@ -338,7 +339,11 @@ export class NativeTaskCoordinator {
     const taskRoot = path.join(this.storageDirectory, "tasks", taskID)
     const workspace = path.join(taskRoot, "workspace")
     await mkdir(path.join(workspace, "work"), { recursive: true })
-    await copyTree(path.join(sourceRoot, "challenge"), path.join(workspace, "challenge"))
+    await mkdir(path.join(workspace, "records"), { recursive: true })
+    // The read-only input snapshot keeps its task-relative name; legacy task directories still
+    // carry the pre-rename `challenge/` spelling.
+    const input = await resolveInputDirectory(sourceRoot)
+    await copyTree(input, path.join(workspace, path.basename(input)))
     const notes = path.join(sourceRoot, "NOTES.md")
     const notesInfo = await lstat(notes)
     if (!notesInfo.isFile() || notesInfo.isSymbolicLink()) throw new Error("Root NOTES.md is not a real file")

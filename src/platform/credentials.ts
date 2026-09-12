@@ -1,6 +1,7 @@
 import { lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { boomHomeDirectory } from "../boom-home.ts"
 
 /**
  * Per-adapter credential store. Credentials live under `$BOOM_HOME/platforms/<id>.json` with
@@ -55,12 +56,12 @@ export function normalizePlatformServerHost(label: string, value: string) {
 }
 
 export function platformCredentialPath(fileName: string) {
-  const home = path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+  const home = boomHomeDirectory()
   return path.join(home, "platforms", fileName)
 }
 
 function legacyCredentialPath(fileName: string) {
-  const home = path.resolve(process.env.BOOM_HOME ?? path.join(os.homedir(), ".config", "boom"))
+  const home = boomHomeDirectory()
   return path.join(home, fileName)
 }
 

@@ -246,3 +246,105 @@ describe("Boom runtime contract", () => {
     expect(closed).toBe(1)
   })
 })
+
+describe("Boom runtime turn sessions", () => {
+  const DIRECTORY = "/tmp/portable-session-test"
+
+  function resumableAgent(options: { fail?: string } = {}) {
+    const created: string[] = []
+    const resumed: string[] = []
+    const prompts: string[] = []
+    const agent: AgentRuntime = {
+      async createConversation() {
+        const id = `conv-${created.length}`
+        created.push(id)
+        return {
+          id,
+          async events() {
+            return { async *[Symbol.asyncIterator]() {} }
+          },
+          async prompt(input) {
+            prompts.push(input.text)
+            return { parts: [{ type: "text", text: "ok" }], usage: undefined, cost: 0, finish: "stop" }
+          },
+          async abort() {},
+        }
+      },
+      async resumeConversation(input: { id: string }) {
+        if (options.fail) throw new Error(options.fail)
+        resumed.push(input.id)
+        return {
+          id: input.id,
+          async events() {
+            return { async *[Symbol.asyncIterator]() {} }
+          },
+          async prompt(input2) {
+            prompts.push(input2.text)
+            return { parts: [{ type: "text", text: "resumed" }], usage: undefined, cost: 0, finish: "stop" }
+          },
+          async abort() {},
+        }
+      },
+    }
+    return { agent, created, resumed, prompts }
+  }
+
+  test("resumes the durable session and reports the outcome before the prompt is sent", async () => {
+    const { agent, created, resumed, prompts } = resumableAgent()
+    const seen: Array<{ id: string; resumed: boolean; reason?: string }> = []
+    const result = await completeRuntimePrompt({
+      runtime: agent,
+      directory: DIRECTORY,
+      title: "portable",
+      agent: "boom",
+      model: "test/model",
+      prompt: (session) => `mode=${session.resumed ? "resume" : "fresh"}`,
+      resumeSessionID: "conv-durable",
+      onSession: (info) => seen.push(info),
+    })
+    expect(resumed).toEqual(["conv-durable"])
+    expect(created).toEqual([])
+    expect(seen).toEqual([{ id: "conv-durable", resumed: true }])
+    // The prompt saw the real outcome, so a resumed turn can be assembled differently.
+    expect(prompts).toEqual(["mode=resume"])
+    expect(runtimeReplyText(result.parts)).toBe("resumed")
+  })
+
+  test("falls back to a fresh session and reports why resumption was impossible", async () => {
+    const { agent, created, prompts } = resumableAgent({ fail: "Session not found" })
+    const seen: Array<{ id: string; resumed: boolean; reason?: string }> = []
+    await completeRuntimePrompt({
+      runtime: agent,
+      directory: DIRECTORY,
+      title: "portable",
+      agent: "boom",
+      model: "test/model",
+      prompt: (session) => `mode=${session.resumed ? "resume" : "fresh"}`,
+      resumeSessionID: "conv-gone",
+      onSession: (info) => seen.push(info),
+    })
+    expect(created).toEqual(["conv-0"])
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ id: "conv-0", resumed: false })
+    expect(seen[0]!.reason).toContain("conv-gone")
+    expect(seen[0]!.reason).toContain("Session not found")
+    expect(prompts).toEqual(["mode=fresh"])
+  })
+
+  test("reports a runtime without resume support instead of silently starting over", async () => {
+    const seen: Array<{ id: string; resumed: boolean; reason?: string }> = []
+    const result = await completeRuntimePrompt({
+      runtime: fakeAgent([]),
+      directory: DIRECTORY,
+      title: "portable",
+      agent: "boom",
+      model: "test/model",
+      prompt: "plain prompt",
+      resumeSessionID: "conv-unsupported",
+      onSession: (info) => seen.push(info),
+    })
+    expect(seen[0]).toMatchObject({ id: "fake-conversation", resumed: false })
+    expect(seen[0]!.reason).toContain("does not support session resume")
+    expect(runtimeReplyText(result.parts)).toBe("portable reply")
+  })
+})

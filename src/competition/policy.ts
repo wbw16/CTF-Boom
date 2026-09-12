@@ -259,6 +259,10 @@ export function decideGiveUp(input: GiveUpInput): GiveUpDecision {
   const clock = matchClock(input.settings, now)
   if (input.hasCandidate) return { action: "continue" }
 
+  // Match-only time allocation must not become a hidden ceiling for ordinary projects. Until an
+  // operator starts the competition clock, the general runner's own budget/autonomy mode decides.
+  if (!clock.started) return { action: "continue" }
+
   if (clock.over)
     return { action: "give-up", reason: "比赛已结束" }
 

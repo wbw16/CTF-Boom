@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { AppProvider, type AppContextValue, type DialogName, type MenuState } from "./context"
+import {
+  AppProvider,
+  type AppContextValue,
+  type ChallengeEditorState,
+  type DialogName,
+  type MenuState,
+} from "./context"
 import { api } from "./api"
 import { setNativeAppearance } from "./bridge"
 import {
@@ -14,16 +20,20 @@ import {
 } from "./state"
 import type { ChallengeGui, GuiState, PlatformNotice, PlatformRegistry, PlatformSummary, RunnerNotification, RunHistory } from "./types"
 import { ToastStack, type ToastItem } from "./ui"
-import { TopBar } from "./TopBar"
+import { Rail } from "./Rail"
+import { HeaderUtilities } from "./HeaderUtilities"
+import { SettingsPopover } from "./SettingsPopover"
 import { Queue } from "./Queue"
 import { Detail } from "./Detail"
 import { SettingsDialog } from "./settings/SettingsDialog"
 import { ProvidersDialog } from "./providers/ProvidersDialog"
 import { McpDialog } from "./mcp/McpDialog"
 import { CompetitionDialog } from "./competition/CompetitionDialog"
+import { PentestWorkspace } from "./pentest/PentestWorkspace"
 import { NoticeDialog } from "./competition/NoticeDialog"
 import { ArmorPromptsDialog } from "./armor/ArmorPromptsDialog"
 import { DeleteDialog } from "./delete/DeleteDialog"
+import { ChallengeDialog } from "./challenge/ChallengeDialog"
 
 const REQUEST_TIMEOUT_MS = 10_000
 const EVENT_REPLAY_LIMIT = 2_000
@@ -71,7 +81,10 @@ export default function App() {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const [dialog, setDialog] = useState<DialogName>(null)
+  const [challengeEditor, setChallengeEditor] = useState<ChallengeEditorState>(null)
   const [menu, setMenu] = useState<MenuState>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [now, setNow] = useState(Date.now())
   const [notices, setNotices] = useState<PlatformNotice[]>([])
@@ -305,6 +318,8 @@ export default function App() {
   }, [loadDetail, storeDetail, toast])
 
   const refreshNotices = useCallback(async () => {
+    // Notices are a competition-platform surface; the pentest workspace stays quiet about them.
+    if (dataRef.current?.settings.mode === "pentest") return
     try {
       const registry = await api<PlatformRegistry>("/api/platform", {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -323,7 +338,7 @@ export default function App() {
   const markNoticeRead = useCallback((id: number) => {
     setReadNoticeIDs((current) => {
       if (current.includes(id)) return current
-      return [...current, id].slice(-MAX_REMEMBERED_NOTICE_IDS)
+      return [...current].slice(-MAX_REMEMBERED_NOTICE_IDS)
     })
   }, [])
 
@@ -432,9 +447,12 @@ export default function App() {
   }, [scheduleDetailRefresh, scheduleRefresh, storeDetail, toast])
 
   useEffect(() => {
+    // Only CTF surfaces show wall-clock durations; pentest timestamps come from stored data,
+    // so skip the per-second tick (and the full-tree re-render it causes) there.
+    if (data?.settings.mode === "pentest") return
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
-  }, [])
+  }, [data?.settings.mode])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -481,8 +499,18 @@ export default function App() {
     })
   }, [])
 
-  const openDialog = useCallback((name: Exclude<DialogName, null>) => setDialog(name), [])
-  const closeDialog = useCallback(() => setDialog(null), [])
+  const openDialog = useCallback((name: Exclude<DialogName, null>) => {
+    setChallengeEditor(null)
+    setDialog(name)
+  }, [])
+  const openChallengeEditor = useCallback((editor: Exclude<ChallengeEditorState, null>) => {
+    setChallengeEditor(editor)
+    setDialog("challenge")
+  }, [])
+  const closeDialog = useCallback(() => {
+    setDialog(null)
+    setChallengeEditor(null)
+  }, [])
   const requestDelete = useCallback((slug: string | null) => setDeleteTarget(slug), [])
 
   const move = useCallback(
@@ -508,8 +536,12 @@ export default function App() {
       if (event.key === "Escape") {
         if (typing) (event.target as HTMLElement).blur()
         if (menu) setMenu(null)
+        if (settingsOpen) setSettingsOpen(false)
+        if (sidebarOpen) setSidebarOpen(false)
         return
       }
+      // Queue shortcuts (j/k/c/y/r/m) are CTF-mode affordances; the pentest workspace has its own focus.
+      if (data?.settings.mode === "pentest") return
       if (typing || event.metaKey || event.ctrlKey || event.altKey) return
       if (event.key === "j" || event.key === "ArrowDown") {
         event.preventDefault()
@@ -525,14 +557,14 @@ export default function App() {
           void navigator.clipboard.writeText(verdict.textContent).then(() => toast("flag 已复制"))
       } else if (event.key === "y") {
         event.preventDefault()
-        // Copy pending flags: re-use the topbar behavior
+        // Copy pending flags: re-use the header behavior
         document.querySelector(".pending-pill")?.dispatchEvent(new MouseEvent("click", { bubbles: true }))
       } else if (event.key === "r") {
         event.preventDefault()
         document.querySelector("[data-run-action]")?.dispatchEvent(new MouseEvent("click", { bubbles: true }))
       } else if (event.key === "/") {
         event.preventDefault()
-        ;(document.querySelector(".queue-search input") as HTMLInputElement | null)?.focus()
+        ;(document.querySelector(".ctf-queue .search") as HTMLInputElement | null)?.focus()
       } else if (event.key === "m") {
         event.preventDefault()
         const challenge = data?.challenges.find((item) => item.slug === selected)
@@ -541,7 +573,7 @@ export default function App() {
     }
     document.addEventListener("keydown", onKeyDown)
     return () => document.removeEventListener("keydown", onKeyDown)
-  }, [data, dialog, menu, move, selected, toast])
+  }, [data, dialog, menu, move, selected, settingsOpen, sidebarOpen, toast])
 
   const value: AppContextValue = {
     theme,
@@ -553,7 +585,12 @@ export default function App() {
     collapsed,
     toasts,
     dialog,
+    challengeEditor,
     menu,
+    settingsOpen,
+    setSettingsOpen,
+    sidebarOpen,
+    setSidebarOpen,
     deleteTarget,
     now,
     notices,
@@ -568,21 +605,31 @@ export default function App() {
     loadDetail,
     toast,
     openDialog,
+    openChallengeEditor,
     closeDialog,
     requestDelete,
     setMenu,
   }
 
+  const pentest = data?.settings.mode === "pentest"
+
   return (
     <AppProvider value={value}>
-      <div className="app">
-        <TopBar />
-        <div className="body">
-          <Queue />
-          <Detail />
-        </div>
+      <div className={`shell${sidebarOpen ? " drawer-open" : ""}`}>
+        <Rail />
+        {data ? (
+          pentest ? (
+            <PentestWorkspace />
+          ) : (
+            <>
+              <Queue />
+              <Detail />
+            </>
+          )
+        ) : null}
       </div>
       <ToastStack toasts={toasts} />
+      <SettingsPopover />
       {dialog === "settings" ? <SettingsDialog /> : null}
       {dialog === "providers" ? <ProvidersDialog /> : null}
       {dialog === "mcp" ? <McpDialog /> : null}
@@ -590,6 +637,7 @@ export default function App() {
       {dialog === "notices" ? <NoticeDialog /> : null}
       {dialog === "armor" ? <ArmorPromptsDialog /> : null}
       {dialog === "delete" ? <DeleteDialog /> : null}
+      {dialog === "challenge" ? <ChallengeDialog /> : null}
       {menu ? (
         <div
           className="menu-backdrop"

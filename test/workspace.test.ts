@@ -24,7 +24,7 @@ describe("run workspace", () => {
       flagFormat: "flag\\{[^}]*\\}",
     }
     const workspace = await prepareWorkspace(root, challenge, "free/test")
-    const metadata = await Bun.file(path.join(workspace.directory, "challenge", "challenge.json")).json()
+    const metadata = await Bun.file(path.join(workspace.directory, "input", "challenge.json")).json()
 
     expect(metadata.flag).toBeUndefined()
     expect(metadata.flag_format).toBe(challenge.flagFormat)
@@ -34,7 +34,7 @@ describe("run workspace", () => {
     const notes = await Bun.file(path.join(workspace.directory, "NOTES.md")).text()
     expect(notes).toContain("Shared cross-turn, cross-model task memory")
     expect(notes).toContain("## Next steps")
-    expect(await Bun.file(path.join(workspace.directory, "challenge", "encoded.txt")).text()).toContain("Zmxh")
+    expect(await Bun.file(path.join(workspace.directory, "input", "encoded.txt")).text()).toContain("Zmxh")
   })
 
   test("protects attachments from edits but leaves the workspace deletable", async () => {
@@ -54,7 +54,7 @@ describe("run workspace", () => {
       },
       "free/test",
     )
-    const copied = path.join(workspace.directory, "challenge", "encoded.txt")
+    const copied = path.join(workspace.directory, "input", "encoded.txt")
     expect((await stat(copied)).mode & 0o222).toBe(0)
 
     // A read-only challenge directory would make the run undeletable, stranding every past workspace.
@@ -93,7 +93,7 @@ describe("run workspace", () => {
     try {
       await mkdir(source)
       await writeFile(path.join(source, "payload.txt"), "challenge data")
-      await symlink(outside, path.join(root, "runs"))
+      await symlink(outside, path.join(root, "tasks"))
 
       await expect(
         prepareWorkspace(
@@ -107,7 +107,7 @@ describe("run workspace", () => {
           },
           "free/test",
         ),
-      ).rejects.toThrow("Runs directory escapes Boom root")
+      ).rejects.toThrow("Tasks directory escapes Boom root")
       expect(await Bun.file(path.join(outside, "linked-runs")).exists()).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -121,7 +121,7 @@ describe("run workspace", () => {
     })
     try {
       await expect(prepareWorkspace(root, challenge, "free/test")).rejects.toThrow(/evil\.txt/)
-      expect(await containsFileNamed(path.join(root, "runs"), "evil.txt")).toBe(false)
+      expect(await containsFileNamed(path.join(root, "tasks"), "evil.txt")).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -136,7 +136,7 @@ describe("run workspace", () => {
     })
     try {
       await expect(prepareWorkspace(root, challenge, "free/test")).rejects.toThrow(/evil\.txt/)
-      expect(await containsFileNamed(path.join(root, "runs"), "evil.txt")).toBe(false)
+      expect(await containsFileNamed(path.join(root, "tasks"), "evil.txt")).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -159,7 +159,7 @@ describe("run workspace", () => {
     })
     try {
       await expect(prepareWorkspace(root, challenge, "free/test")).rejects.toThrow(/quota/i)
-      expect(await containsFileNamed(path.join(root, "runs"), "bomb.bin")).toBe(false)
+      expect(await containsFileNamed(path.join(root, "tasks"), "bomb.bin")).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

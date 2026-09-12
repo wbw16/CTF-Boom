@@ -51,7 +51,7 @@ async function boundWorkspace(executionMode: "managed" | "isolated" | "static-on
   if (profile.status !== "ready") return undefined
   const directory = await mkdtemp(path.join(os.tmpdir(), "boom-mode-ceiling-"))
   temporary.push(directory)
-  await mkdir(path.join(directory, "challenge"))
+  await mkdir(path.join(directory, "input"))
   await mkdir(path.join(directory, "work"))
   await writeFile(path.join(directory, "NOTES.md"), "# NOTES\n\nshared memory\n")
   await bindTaskEnvironment({ directory, profile, source: "task-override", executionMode })
@@ -64,7 +64,7 @@ async function pluginWorkspace(executionMode: "managed" | "isolated" | "static-o
   // hand it the canonical path.
   const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), "boom-plugin-ceiling-")))
   temporary.push(directory)
-  await mkdir(path.join(directory, "challenge"))
+  await mkdir(path.join(directory, "input"))
   await mkdir(path.join(directory, "work", ".boom"), { recursive: true })
   await writeFile(path.join(directory, "NOTES.md"), "# NOTES\n\nshared memory\n")
   await writeFile(

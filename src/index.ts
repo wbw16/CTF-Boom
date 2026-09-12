@@ -18,11 +18,16 @@ import {
 import { DEFAULT_SILENCE_MS, type Limits } from "./session.ts"
 import { aggregateEvaluation, collectEvaluationSamples, evaluationMarkdown } from "./evaluation.ts"
 import { mcpCommand } from "./mcp-command.ts"
+import { applyMigration, migrationReport, planMigration } from "./migrate.ts"
 import { GuiRunner } from "./runner.ts"
-import { readChallengeRuns, readRunHistory, type RunHistory } from "./history.ts"
+import {
+  readChallengeRuns,
+  readRunHistory,
+  taskDirectoryFromRoot,
+  type RunHistory,
+} from "./history.ts"
 
 const DEFAULTS = {
-  tokens: 1_000_000,
   repeats: 5,
   minutes: 60,
   silenceMs: DEFAULT_SILENCE_MS,
@@ -59,6 +64,7 @@ function usage(code = 1): never {
     "  mcp <action>             manage Boom MCP servers through Boom Runtime",
     "  doctor                   verify the local installation",
     "  evaluate [--root <dir>]  summarize existing run results",
+    "  migrate [--root <dir>]   move an older workspace onto the shared task layout",
     "  version                  print the installed version",
     "",
     "Run options:",
@@ -71,9 +77,9 @@ function usage(code = 1): never {
     "  --python-profile <id>    use a saved Python environment profile",
     "  --python <path>          bind to an existing Python interpreter",
     "  --execution <mode>       managed|isolated|static-only (default: managed)",
-    `  --tokens <n>             per-challenge token ceiling (default: ${DEFAULTS.tokens})`,
+    "  --tokens <n>             optional per-challenge token ceiling (default: unlimited)",
     `  --repeats <n>            abort after N identical tool calls (default: ${DEFAULTS.repeats})`,
-    `  --minutes <n>            per-challenge wall-clock ceiling (default: ${DEFAULTS.minutes})`,
+    `  --minutes <n>            turn watchdog; cumulative when --tokens is set (default: ${DEFAULTS.minutes})`,
     `  --concurrency <n>        challenges solved at once (default: ${DEFAULTS.concurrency})`,
     "  --no-network             run fully offline: refuse web tools and isolate bash/boom-exec",
     "",
@@ -81,8 +87,17 @@ function usage(code = 1): never {
     "With no slugs, run processes every challenge under the workspace root",
     "(<root>/challenges or category folders such as WEB/PWN/MISC directly inside <root>).",
     "",
-    "GUI options:",
+    "Migrate options:",
     "  --root <dir>       workspace root (default: current directory)",
+    "  --apply            write the planned moves (default: preview only)",
+    "  --json             print the plan as JSON",
+    "",
+    "Migration only renames files inside the workspace: challenge/ becomes input/, the event and",
+    "tool-run trails move under records/, and runs/ plus engagements/ move under tasks/.",
+    "Unmigrated tasks keep working, so run it when convenient.",
+    "",
+    "GUI options:",
+    "  --root <dir>       workspace root (default: reopen the last one, first run: Boom's workspace)",
     "  --port <n>         local API port (default: 0, chooses a free port)",
     "  --native           open the macOS desktop client (default on macOS)",
     "  --browser          open the compatibility browser interface",
@@ -158,7 +173,6 @@ function parse(argv: string[]): Args {
     consultModels: [],
     consultOnCompaction: true,
     limits: {
-      tokens: DEFAULTS.tokens,
       repeats: DEFAULTS.repeats,
       timeout: DEFAULTS.minutes * 60_000,
       silenceMs: DEFAULTS.silenceMs,
@@ -201,7 +215,7 @@ function parse(argv: string[]): Args {
     else args.only.push(arg)
   }
   const tokenLimit = args.limits.tokens
-  if (typeof tokenLimit !== "number" || !Number.isFinite(tokenLimit) || tokenLimit <= 0) usage()
+  if (tokenLimit !== undefined && (!Number.isFinite(tokenLimit) || tokenLimit <= 0)) usage()
   if (!Number.isFinite(args.limits.repeats) || args.limits.repeats < 2) usage()
   if (!Number.isFinite(args.limits.timeout) || args.limits.timeout <= 0) usage()
   if (!Number.isFinite(args.concurrency) || args.concurrency < 1) usage()
@@ -353,7 +367,7 @@ async function run(argv: string[]) {
       rows.push({
         challenge,
         run,
-        directory: path.join(args.root, "runs", challenge.slug, run.id),
+        directory: await taskDirectoryFromRoot(args.root, challenge.slug, run.id),
         ...(answer === undefined ? {} : { correct: run.candidates.includes(answer) }),
       })
       process.stderr.write(
@@ -371,6 +385,29 @@ async function run(argv: string[]) {
   }
 }
 
+async function migrate(argv: string[]) {
+  let root = process.cwd()
+  let apply = false
+  let asJSON = false
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === "--root" && argv[index + 1]) root = path.resolve(argv[++index]!)
+    else if (arg === "--apply") apply = true
+    else if (arg === "--json") asJSON = true
+    else if (arg === "-h" || arg === "--help") usage(0)
+    else usage()
+  }
+  const plan = await planMigration(root)
+  if (apply) {
+    const result = await applyMigration(plan)
+    process.stdout.write(asJSON ? `${JSON.stringify({ ...result.plan, applied: result.applied }, undefined, 2)}\n` : migrationReport(plan, { applied: result.applied }))
+    return
+  }
+  process.stdout.write(
+    asJSON ? `${JSON.stringify(plan, undefined, 2)}\n` : migrationReport(plan),
+  )
+}
+
 async function main() {
   const [command, ...argv] = process.argv.slice(2)
   if (command === undefined || command === "-h" || command === "--help") usage(0)
@@ -385,6 +422,7 @@ async function main() {
     return
   }
   if (command === "gui") return gui(argv)
+  if (command === "migrate") return migrate(argv)
   if (command === "mcp") return mcpCommand(argv)
   if (command === "version" || command === "--version" || command === "-v") {
     process.stdout.write(`${await packageVersion()}\n`)

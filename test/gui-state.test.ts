@@ -5,7 +5,9 @@ import os from "node:os"
 import path from "node:path"
 import {
   DEFAULT_GUI_SETTINGS,
+  loadLastGuiRoot,
   loadRootGuiState,
+  saveLastGuiRoot,
   saveRootGuiState,
 } from "../src/gui-state.ts"
 import {
@@ -23,6 +25,30 @@ import {
 import type { ChallengeGui, GuiState, RunHistory, RunnerNotification } from "../frontend/src/types.ts"
 
 describe("GUI state", () => {
+  test("remembers the last active workspace root across saves of per-root state", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "boom-gui-state-"))
+    const previous = process.env.BOOM_HOME
+    process.env.BOOM_HOME = home
+    try {
+      expect(await loadLastGuiRoot()).toBeUndefined()
+      const root = path.join(home, "题库")
+      await saveLastGuiRoot(root)
+      // A relative spelling resolves to the same remembered absolute root, and rewriting the same
+      // value must not clobber per-root state saved between the two calls.
+      await saveRootGuiState(root, {
+        settings: DEFAULT_GUI_SETTINGS,
+        challenges: { alpha: { state: "given-up" } },
+      })
+      await saveLastGuiRoot(path.join(home, ".", "题库"))
+      expect(await loadLastGuiRoot()).toBe(path.resolve(root))
+      expect((await loadRootGuiState(root)).challenges.alpha).toEqual({ state: "given-up" })
+    } finally {
+      if (previous === undefined) delete process.env.BOOM_HOME
+      else process.env.BOOM_HOME = previous
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   test("isolates settings and challenge lifecycle by canonical root", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "boom-gui-state-"))
     const previous = process.env.BOOM_HOME
@@ -104,6 +130,7 @@ describe("GUI state", () => {
         tokenBudgetEnabled: false,
         tokens: DEFAULT_GUI_SETTINGS.tokens,
       })
+      expect(DEFAULT_GUI_SETTINGS.tokenBudgetEnabled).toBe(false)
     } finally {
       if (previous === undefined) delete process.env.BOOM_HOME
       else process.env.BOOM_HOME = previous
@@ -167,6 +194,7 @@ function liveState(...runs: RunHistory[]): GuiState {
   return {
     root: "/tmp/boom-live-detail",
     settings: {
+      mode: "ctf",
       economyModel: "test/model",
       strongModel: "test/model",
       tokens: 10_000,
