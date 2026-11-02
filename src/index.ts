@@ -16,12 +16,12 @@ import {
   type ExecutionMode,
 } from "./environment.ts"
 import { DEFAULT_SILENCE_MS, type Limits } from "./session.ts"
-import { aggregateEvaluation, collectEvaluationSamples, evaluationMarkdown } from "./evaluation.ts"
+import { aggregateEvaluation, collectEvaluationSamples, compareEvaluationSamples, evaluationMarkdown } from "./evaluation.ts"
+import { normalizeExperiment } from "./experiment.ts"
 import { mcpCommand } from "./mcp-command.ts"
 import { applyMigration, migrationReport, planMigration } from "./migrate.ts"
 import { GuiRunner } from "./runner.ts"
 import {
-  readChallengeRuns,
   readRunHistory,
   taskDirectoryFromRoot,
   type RunHistory,
@@ -45,6 +45,9 @@ type Args = {
   limits: Limits
   concurrency: number
   only: string[]
+  trials: number
+  experiment?: string
+  slugsFile?: string
   pythonProfile?: string
   pythonInterpreter?: string
   executionMode: ExecutionMode
@@ -82,6 +85,9 @@ function usage(code = 1): never {
     `  --minutes <n>            turn watchdog; cumulative when --tokens is set (default: ${DEFAULTS.minutes})`,
     `  --concurrency <n>        challenges solved at once (default: ${DEFAULTS.concurrency})`,
     "  --no-network             run fully offline: refuse web tools and isolate bash/boom-exec",
+    "  --experiment <label>      tag independent evaluation trials (requires --tokens)",
+    "  --trials <n>              repeat selected challenges in fresh tasks (default: 1)",
+    "  --slugs-file <path>       read a fixed challenge list, one slug per line",
     "",
     "The main solver may request consultation itself; context compaction also triggers one.",
     "With no slugs, run processes every challenge under the workspace root",
@@ -95,6 +101,13 @@ function usage(code = 1): never {
     "Migration only renames files inside the workspace: challenge/ becomes input/, the event and",
     "tool-run trails move under records/, and runs/ plus engagements/ move under tasks/.",
     "Unmigrated tasks keep working, so run it when convenient.",
+    "",
+    "Evaluate options:",
+    "  --label <label>          select one experiment",
+    "  --baseline <label>       compare matching trials against another experiment",
+    "  --compare-root <dir>     baseline workspace (default: --root)",
+    "  --slugs-file <path>      restrict both groups to a fixed challenge list",
+    "  --json                   print scored samples, category summaries and paired comparison",
     "",
     "GUI options:",
     "  --root <dir>       workspace root (default: reopen the last one, first run: Boom's workspace)",
@@ -179,6 +192,7 @@ function parse(argv: string[]): Args {
     },
     concurrency: DEFAULTS.concurrency,
     only: [],
+    trials: 1,
     executionMode: "managed",
     network: "allow",
   }
@@ -210,6 +224,9 @@ function parse(argv: string[]): Args {
     else if (arg === "--minutes") args.limits.timeout = Number(value()) * 60_000
     else if (arg === "--concurrency") args.concurrency = Number(value())
     else if (arg === "--no-network") args.network = "deny"
+    else if (arg === "--experiment") args.experiment = value()
+    else if (arg === "--trials") args.trials = Number(value())
+    else if (arg === "--slugs-file") args.slugsFile = path.resolve(value())
     else if (arg === "-h" || arg === "--help") usage(0)
     else if (arg.startsWith("-")) usage()
     else args.only.push(arg)
@@ -219,6 +236,12 @@ function parse(argv: string[]): Args {
   if (!Number.isFinite(args.limits.repeats) || args.limits.repeats < 2) usage()
   if (!Number.isFinite(args.limits.timeout) || args.limits.timeout <= 0) usage()
   if (!Number.isFinite(args.concurrency) || args.concurrency < 1) usage()
+  if (!Number.isSafeInteger(args.trials) || args.trials < 1 || args.trials > 100) usage()
+  if (args.experiment) {
+    normalizeExperiment({ label: args.experiment, trial: 1 })
+    if (tokenLimit === undefined) throw new Error("Evaluation experiments require --tokens to keep trials comparable")
+  }
+  if (args.trials > 1 && !args.experiment) throw new Error("Repeated trials require --experiment")
   if (
     args.consultModels.length !== 0 &&
     (args.consultModels.length < CONSULT_EXPERTS.minimum ||
@@ -255,7 +278,7 @@ function report(rows: Row[]) {
     ].join(" "))
   }
   const correct = rows.filter((row) => row.correct === true).length
-  const scored = rows.filter((row) => row.correct !== undefined && score(row) !== "cut-short").length
+  const scored = rows.filter((row) => row.correct !== undefined).length
   const cutShort = rows.filter((row) => score(row) === "cut-short").length
   lines.push("".padEnd(78, "-"))
   lines.push(
@@ -291,6 +314,9 @@ async function doctor() {
     `Resources ${runtime.directory}`,
     "Agents boom / boom-worker / boom-consultant",
     "Skill ctf-workflow",
+    ...(runtime.skills.includes("reverse-engineer-anything")
+      ? ["Skill reverse-engineer-anything (REA)"]
+      : []),
     "Tools boom-exec / ctf-note / ctf-consult / ctf-submit",
     environmentLine,
     `Isolation ${container.status}${container.runtime ? ` (${container.runtime})` : ""}`,
@@ -301,6 +327,7 @@ async function doctor() {
 
 async function run(argv: string[]) {
   const args = parse(argv)
+  if (args.slugsFile) args.only.push(...await readSlugs(args.slugsFile))
   // Opening on a folder that has no workspace yet still leaves runs/ and challenges/ behind.
   await prepareWorkspaceRoot(args.root)
   const all = await discoverChallenges(args.root)
@@ -322,6 +349,8 @@ async function run(argv: string[]) {
       runIDs.set(notification.slug, notification.runID)
       process.stderr.write(`==> ${notification.slug} (${args.model}) ${notification.runID}\n`)
     } else if (notification.type === "run.error" && notification.slug && notification.detail) {
+      if (notification.runID && !notification.runID.startsWith("queued-"))
+        runIDs.set(notification.slug, notification.runID)
       process.stderr.write(`    ${notification.slug}: ${notification.detail}\n`)
     }
   })
@@ -331,48 +360,51 @@ async function run(argv: string[]) {
   process.once("SIGTERM", onTerminate)
 
   try {
-    await runner.enqueue({
-      challenges,
-      model: args.model,
-      modelPolicy: { economy: args.economyModel, strong: args.strongModel },
-      consultModels: args.consultModels,
-      consultOnCompaction: args.consultOnCompaction,
-      blindReview: args.consultModels.length > 0,
-      limits: args.limits,
-      flagFormat: "",
-      flagFormats: Object.fromEntries(challenges.map((challenge) => [challenge.slug, challenge.flagFormat])),
-      ...(args.pythonProfile ? { environmentProfileId: args.pythonProfile } : {}),
-      ...(args.pythonInterpreter ? { pythonInterpreter: args.pythonInterpreter } : {}),
-      executionMode: args.executionMode,
-      ...(args.consultModels.length >= CONSULT_EXPERTS.minimum
-        ? {
-            consultation: {
-              trigger: "planning",
-              expertModels: args.consultModels,
-              synthesizerModel: args.strongModel,
-            },
-          }
-        : {}),
-    })
-    while (runner.hasWork()) await Bun.sleep(50)
-
     const rows: Row[] = []
-    for (const challenge of challenges) {
-      const known = runIDs.get(challenge.slug)
-      const run = known
-        ? await readRunHistory(args.root, challenge.slug, known)
-        : (await readChallengeRuns(args.root, challenge.slug)).at(-1)
-      if (!run) throw new Error(`Run for ${challenge.slug} ended before creating a workspace`)
-      const answer = answers.get(challenge.slug)
-      rows.push({
-        challenge,
-        run,
-        directory: await taskDirectoryFromRoot(args.root, challenge.slug, run.id),
-        ...(answer === undefined ? {} : { correct: run.candidates.includes(answer) }),
+    for (let trial = 1; trial <= args.trials && !interrupted; trial += 1) {
+      runIDs.clear()
+      await runner.enqueue({
+        ...(args.experiment ? { experiment: { label: args.experiment, trial } } : {}),
+        challenges,
+        model: args.model,
+        modelPolicy: { economy: args.economyModel, strong: args.strongModel },
+        consultModels: args.consultModels,
+        consultOnCompaction: args.consultOnCompaction,
+        blindReview: args.consultModels.length > 0,
+        limits: args.limits,
+        flagFormat: "",
+        flagFormats: Object.fromEntries(challenges.map((challenge) => [challenge.slug, challenge.flagFormat])),
+        ...(args.pythonProfile ? { environmentProfileId: args.pythonProfile } : {}),
+        ...(args.pythonInterpreter ? { pythonInterpreter: args.pythonInterpreter } : {}),
+        executionMode: args.executionMode,
+        ...(args.consultModels.length >= CONSULT_EXPERTS.minimum
+          ? {
+              consultation: {
+                trigger: "planning",
+                expertModels: args.consultModels,
+                synthesizerModel: args.strongModel,
+              },
+            }
+          : {}),
       })
-      process.stderr.write(
-        `    ${challenge.slug}: ${run.stop}, ${run.tokens} tokens${run.detail ? ` — ${run.detail}` : ""}\n`,
-      )
+      while (runner.hasWork()) await Bun.sleep(50)
+
+      for (const challenge of challenges) {
+        const known = runIDs.get(challenge.slug)
+        if (interrupted && !known) continue
+        if (!known) throw new Error(`Run for ${challenge.slug} ended before creating a workspace`)
+        const run = await readRunHistory(args.root, challenge.slug, known)
+        const answer = answers.get(challenge.slug)
+        rows.push({
+          challenge,
+          run,
+          directory: await taskDirectoryFromRoot(args.root, challenge.slug, run.id),
+          ...(answer === undefined ? {} : { correct: (run.candidateHistory ?? run.candidates).includes(answer) }),
+        })
+        process.stderr.write(
+          `    ${challenge.slug}: ${run.stop}, ${run.tokens} tokens${run.detail ? ` — ${run.detail}` : ""}\n`,
+        )
+      }
     }
     process.stdout.write(report(rows))
     if (interrupted) process.exitCode = interrupted === "SIGINT" ? 130 : 143
@@ -383,6 +415,42 @@ async function run(argv: string[]) {
     process.removeListener("SIGTERM", onTerminate)
     await runner.close()
   }
+}
+
+async function readSlugs(file: string) {
+  const slugs = (await Bun.file(file).text()).split(/\r?\n/).map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+  if (!slugs.length || slugs.some((slug) => /[\s/\\]/.test(slug)))
+    throw new Error("Challenge list must contain one nonempty slug per line")
+  return [...new Set(slugs)]
+}
+
+async function evaluate(argv: string[]) {
+  let root = process.cwd(), baselineRoot: string | undefined, label: string | undefined
+  let baseline: string | undefined, slugs: string[] | undefined, asJSON = false
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    const value = () => { const next = argv[++index]; if (!next) usage(); return next }
+    if (arg === "--root") root = path.resolve(value())
+    else if (arg === "--label") label = value()
+    else if (arg === "--baseline") baseline = value()
+    else if (arg === "--compare-root") baselineRoot = path.resolve(value())
+    else if (arg === "--slugs-file") slugs = await readSlugs(path.resolve(value()))
+    else if (arg === "--json") asJSON = true
+    else if (arg === "--help" || arg === "-h") usage(0)
+    else usage()
+  }
+  if ((baseline && !label) || (baselineRoot && !baseline)) usage()
+  const samples = await collectEvaluationSamples(root, { label, slugs })
+  const summaries = aggregateEvaluation(samples)
+  const categories = Object.fromEntries([...new Set(samples.map((item) => item.category))].sort()
+    .map((category) => [category, aggregateEvaluation(samples.filter((item) => item.category === category))]))
+  const comparison = baseline ? compareEvaluationSamples(
+    await collectEvaluationSamples(baselineRoot ?? root, { label: baseline, slugs }), samples,
+  ) : undefined
+  process.stdout.write(asJSON
+    ? `${JSON.stringify({ schema_version: 2, summaries, categories, samples, comparison }, undefined, 2)}\n`
+    : `${evaluationMarkdown(summaries)}${comparison ? `\n\n对照结果：\n\n${JSON.stringify(comparison, undefined, 2)}` : ""}\n`)
 }
 
 async function migrate(argv: string[]) {
@@ -412,15 +480,7 @@ async function main() {
   const [command, ...argv] = process.argv.slice(2)
   if (command === undefined || command === "-h" || command === "--help") usage(0)
   if (command === "doctor") return doctor()
-  if (command === "evaluate") {
-    let root = process.cwd()
-    for (let index = 0; index < argv.length; index += 1) {
-      if (argv[index] === "--root" && argv[index + 1]) root = path.resolve(argv[++index]!)
-      else usage()
-    }
-    process.stdout.write(`${evaluationMarkdown(aggregateEvaluation(await collectEvaluationSamples(root)))}\n`)
-    return
-  }
+  if (command === "evaluate") return evaluate(argv)
   if (command === "gui") return gui(argv)
   if (command === "migrate") return migrate(argv)
   if (command === "mcp") return mcpCommand(argv)

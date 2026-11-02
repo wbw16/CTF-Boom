@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -18,6 +18,54 @@ async function workspace() {
 }
 
 describe("challenge catalog authoring", () => {
+  test("keeps legacy inputs visible when adding an attachment", async () => {
+    const space = await workspace()
+    try {
+      const directory = path.join(space.root, "challenges", "legacy")
+      await mkdir(directory)
+      await writeFile(path.join(directory, "README.md"), "legacy")
+      await writeFile(path.join(directory, "old.py"), "old")
+      const source = path.join(space.root, "new.txt")
+      await writeFile(source, "new")
+      await addChallengeAttachments(space.root, "legacy", [source])
+      expect((await loadChallenge(directory, new Map())).files).toEqual(["new.txt", "old.py"])
+    } finally { await space.close() }
+  })
+
+  test("rejects a colliding batch without changing existing attachments", async () => {
+    const space = await workspace()
+    try {
+      const created = await createChallengeInCatalog(space.root, { slug: "collision" })
+      await mkdir(path.join(space.root, "a"))
+      await mkdir(path.join(space.root, "b"))
+      const first = path.join(space.root, "a", "same.txt")
+      const second = path.join(space.root, "b", "same.txt")
+      await writeFile(first, "first")
+      await writeFile(second, "second")
+      await expect(addChallengeAttachments(space.root, "collision", [first, second])).rejects.toThrow("already exists")
+      expect((await loadChallenge(created.directory, new Map())).files).toEqual([])
+      await addChallengeAttachments(space.root, "collision", [first])
+      await expect(addChallengeAttachments(space.root, "collision", [second])).rejects.toThrow("already exists")
+      expect(await readFile(path.join(created.directory, "files", "same.txt"), "utf8")).toBe("first")
+    } finally { await space.close() }
+  })
+
+  test("deletes the exact nested path and refuses links or metadata", async () => {
+    const space = await workspace()
+    try {
+      const created = await createChallengeInCatalog(space.root, { slug: "nested" })
+      const base = path.join(created.directory, "files")
+      await mkdir(path.join(base, "a"))
+      await writeFile(path.join(base, "a", "data.txt"), "nested")
+      await writeFile(path.join(base, "data.txt"), "root")
+      await removeChallengeAttachment(space.root, "nested", "a/data.txt")
+      expect(await readFile(path.join(base, "data.txt"), "utf8")).toBe("root")
+      await symlink(space.root, path.join(base, "linked"))
+      await expect(removeChallengeAttachment(space.root, "nested", "linked/data.txt")).rejects.toThrow("real file")
+      await expect(removeChallengeAttachment(space.root, "nested", "meta.json")).rejects.toThrow("Invalid attachment")
+      await expect(removeChallengeAttachment(space.root, "nested", "a/../data.txt")).rejects.toThrow("Invalid attachment")
+    } finally { await space.close() }
+  })
   test("creates, edits, and re-reads a challenge the way discovery sees it", async () => {
     const space = await workspace()
     try {

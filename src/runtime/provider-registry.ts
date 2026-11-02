@@ -1,12 +1,12 @@
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import {
-  BOOM_CONTEXT_LIMIT,
   loadProviderStore,
   type ManagedModelConfig,
   type ManagedProviderConfig,
   type ManagedProviderDriver,
 } from "../provider-config.ts"
+import { runtimeModelLimits } from "../model-context.ts"
 import type { RuntimeModelPricing, RuntimeProviderModel } from "../runtime-contract.ts"
 
 export type BoomProviderDriverID = ManagedProviderDriver
@@ -91,7 +91,7 @@ function model(value: unknown): BoomProviderModel | undefined {
   return {
     id: item.id,
     name: item.name,
-    limit: { context: BOOM_CONTEXT_LIMIT, output: Math.floor(item.output) },
+    limit: runtimeModelLimits(item.context, item.output),
     reasoning: item.reasoning === true,
     attachment: item.attachment === true,
     ...(pricing ? { pricing } : {}),
@@ -102,7 +102,7 @@ function managedModel(value: ManagedModelConfig): BoomProviderModel {
   return {
     id: value.id,
     name: value.name,
-    limit: { context: BOOM_CONTEXT_LIMIT, output: value.output },
+    limit: runtimeModelLimits(value.context, value.output),
     reasoning: value.reasoning,
     attachment: value.attachment,
     ...(value.pricing ? { pricing: value.pricing } : {}),
@@ -197,7 +197,7 @@ export function defaultProviderModel(id: string, name = id): BoomProviderModel {
   return {
     id,
     name,
-    limit: { context: BOOM_CONTEXT_LIMIT, output: 16_384 },
+    limit: runtimeModelLimits(undefined, 16_384),
     reasoning: false,
     attachment: false,
   }

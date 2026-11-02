@@ -5,6 +5,9 @@ import path from "node:path"
 import { submitCandidate } from "../src/candidate-submission.ts"
 import { GuiRunner, recoverableRunOutcome } from "../src/runner.ts"
 import type { RuntimeHandle } from "../src/runtime-contract.ts"
+import { bindTaskEnvironment } from "../src/environment.ts"
+import { loadTaskRecord } from "../src/task.ts"
+import { prepareWorkspace } from "../src/workspace.ts"
 
 const temporary: string[] = []
 
@@ -13,6 +16,70 @@ afterEach(async () => Promise.all(
 ))
 
 describe("host-level run recovery", () => {
+  test("unbounded repeated unknown finishes pause after three turns and an explicit retry can recover", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "boom-recovery-circuit-"))
+    temporary.push(root)
+    const source = path.join(root, "challenges", "broken-provider")
+    await mkdir(source, { recursive: true })
+    await writeFile(path.join(source, "README.md"), "Analyze the handout")
+    const challenge = { slug: "broken-provider", directory: source, description: "Analyze the handout", files: [], flagFormat: "" }
+    const workspace = await prepareWorkspace(root, challenge, "task")
+    await bindTaskEnvironment({ directory: workspace.directory, source: "task-override", profile: {
+      id: "test-python", displayName: "Test Python", kind: "python", interpreter: "/usr/bin/python3",
+      pythonVersion: "test", architecture: "test", packages: {}, installPolicy: "deny",
+      fingerprint: "test-fingerprint", status: "ready",
+    } })
+    let prompts = 0, fixed = false
+    const handle: RuntimeHandle = {
+      backend: "fake", version: "test",
+      capabilities: { eventStreaming: true, toolCalls: true, reasoning: false, attachments: false,
+        web: false, cancellation: true, providerManagement: false, providerOAuth: false, compaction: false },
+      agent: { async createConversation(input) {
+        const id = `circuit-${prompts}`
+        return {
+          id, async events() { return { async *[Symbol.asyncIterator]() {} } },
+          async prompt() {
+            prompts += 1
+            if (fixed) await submitCandidate({ directory: input.directory, sessionID: id, candidate: "candidate-after-fix" })
+            return { finish: fixed ? "stop" as const : "unknown" as const,
+              rawFinish: fixed ? undefined : "gateway-special-end",
+              usage: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0,
+              parts: [{ type: "text" as const, text: fixed ? "candidate submitted" : "partial response" }] }
+          }, async abort() {},
+        }
+      } }, close() {},
+    }
+    const waitForIdle = async (runner: GuiRunner) => {
+      for (let i = 0; i < 700 && runner.hasWork(); i += 1) await Bun.sleep(10)
+      expect(runner.hasWork()).toBe(false)
+    }
+    const enqueue = (runner: GuiRunner) => runner.enqueue({ challenges: [challenge], model: "test/model",
+      limits: { repeats: 3, timeout: 30_000 }, flagFormat: "", workspaces: { [challenge.slug]: workspace.runID } })
+    const runner = new GuiRunner(root, async () => handle)
+    try {
+      await enqueue(runner)
+      await waitForIdle(runner)
+      const task = await loadTaskRecord(workspace.directory)
+      expect(prompts).toBe(6) // One in-session retry per turn, then the task-wide circuit.
+      expect(task).toMatchObject({ status: "paused", recovery: { consecutiveFailures: 3, blocked: true } })
+      expect(task?.turns).toHaveLength(3)
+      expect(task?.turns.every((turn) => turn.rawFinish === "gateway-special-end")).toBe(true)
+      const events = await readFile(path.join(workspace.directory, "records", "events.jsonl"), "utf8")
+      expect(events).toContain("run.recovery.backoff")
+      expect(events).toContain("run.recovery.blocked")
+    } finally { await runner.close() }
+    fixed = true
+    const resumed = new GuiRunner(root, async () => handle)
+    try {
+      await enqueue(resumed)
+      await waitForIdle(resumed)
+      const task = await loadTaskRecord(workspace.directory)
+      expect(prompts).toBe(7)
+      expect(task?.recovery).toBeUndefined()
+      expect(task?.status).toBe("candidate-found")
+    } finally { await resumed.close() }
+  }, 15_000)
+
   test("retries provider silence, ambiguous finishes, and guard-terminated loops", () => {
     expect(recoverableRunOutcome({ stop: "silent" })).toBe(true)
     expect(recoverableRunOutcome({ stop: "timeout" })).toBe(true)

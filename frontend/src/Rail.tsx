@@ -13,7 +13,8 @@ export function Rail() {
     if (switching || !data || data.settings.mode === next) return
     setSwitching(true)
     try {
-      await patchJSON<{ settings: { mode: "ctf" | "pentest" } }>("/api/settings", { mode: next })
+      const saved = await patchJSON<{ applied?: boolean; applyError?: string }>("/api/settings", { mode: next })
+      if (saved.applied === false) toast(`模式已保存；Runtime 应用失败：${saved.applyError ?? "请检查运行配置后重试"}`, "error")
       await refresh()
     } catch (error) {
       toast((error as Error).message, "error")

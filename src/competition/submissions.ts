@@ -1,4 +1,4 @@
-import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { unwrapFlagValue } from "../platform/adapter.ts"
 
@@ -39,25 +39,25 @@ function empty(slug: string): SubmissionLedger {
 }
 
 function parse(slug: string, value: unknown): SubmissionLedger {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return empty(slug)
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid submission ledger")
   const input = value as Record<string, unknown>
-  if (input.version !== 1) return empty(slug)
-  const attempts = Array.isArray(input.attempts) ? input.attempts : []
+  if (input.version !== 1 || input.slug !== slug || !Array.isArray(input.attempts)) throw new Error("Invalid submission ledger header")
+  const attempts = input.attempts
   return {
     version: 1,
     slug,
-    attempts: attempts.flatMap((raw) => {
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return []
+    attempts: attempts.map((raw) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Invalid submission attempt")
       const item = raw as Record<string, unknown>
-      if (typeof item.value !== "string" || typeof item.at !== "string") return []
+      if (typeof item.value !== "string" || typeof item.at !== "string" || !Number.isFinite(Date.parse(item.at))) throw new Error("Invalid submission attempt")
       const verdict = item.verdict
-      if (verdict !== "accepted" && verdict !== "rejected" && verdict !== "pending") return []
-      return [{
+      if (verdict !== "accepted" && verdict !== "rejected" && verdict !== "pending") throw new Error("Invalid submission verdict")
+      return {
         value: item.value,
         verdict,
         at: item.at,
         ...(typeof item.detail === "string" ? { detail: item.detail } : {}),
-      }]
+      }
     }),
   }
 }
@@ -74,30 +74,38 @@ function ledgerPath(root: string, slug: string) {
 
 export async function loadSubmissionLedger(root: string, slug: string) {
   const target = ledgerPath(root, slug)
-  const info = await lstat(target).catch(() => undefined)
+  const info = await lstat(target).catch((error) => {
+    if (error.code === "ENOENT") return undefined
+    throw error
+  })
   if (!info) return empty(slug)
   if (!info.isFile() || info.isSymbolicLink())
     throw new Error(`Submission ledger is not a real file: ${target}`)
   try {
     return parse(slug, JSON.parse(await readFile(target, "utf8")))
-  } catch {
-    // A corrupt ledger must not block solving; treat it as empty but keep the cap conservative.
-    return empty(slug)
+  } catch (error) {
+    throw new Error(`Submission ledger cannot be read; automatic submission is paused: ${target}`, { cause: error })
   }
 }
 
 export async function saveSubmissionLedger(root: string, ledger: SubmissionLedger) {
+  parse(ledger.slug, ledger)
   const target = ledgerPath(root, ledger.slug)
   await mkdir(path.dirname(target), { recursive: true })
   const existing = await lstat(target).catch(() => undefined)
   if (existing && (!existing.isFile() || existing.isSymbolicLink()))
     throw new Error(`Submission ledger is not a real file: ${target}`)
   const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`
-  await writeFile(temporary, `${JSON.stringify(ledger, undefined, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  })
-  await rename(temporary, target)
+  try {
+    await writeFile(temporary, `${JSON.stringify(ledger, undefined, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    })
+    await rename(temporary, target)
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {})
+  }
   return ledger
 }
 

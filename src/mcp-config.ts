@@ -7,7 +7,11 @@ import { boomHomeDirectory } from "./boom-home.ts"
 export const BOOM_MCP_AGENT_IDS = [
   "boom",
   "boom-worker",
+  "boom-worker-pro",
   "boom-consultant",
+  "boom-pentest",
+  "boom-flag-hunt",
+  "boom-pentest-worker",
 ] as const
 
 export type BoomMcpAgentID = (typeof BOOM_MCP_AGENT_IDS)[number]

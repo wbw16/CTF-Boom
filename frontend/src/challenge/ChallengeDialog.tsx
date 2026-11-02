@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { FilePlus, Paperclip, Pencil, X } from "lucide-react"
 import { useApp } from "../context"
 import { api, del, patchJSON, postJSON } from "../api"
 import { chooseFiles } from "../bridge"
-import { Modal, Select, Toggle } from "../ui"
+import { Modal, Select, Toggle, useDraftGuard } from "../ui"
 import { CATEGORY_ORDER, categoryOf } from "../state"
 
 const DIFFICULTIES = ["easy", "medium", "hard", "insane"]
@@ -60,21 +60,34 @@ export function ChallengeDialog() {
   const [additions, setAdditions] = useState<string[]>([])
   const [removals, setRemovals] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
+  const answerDirty = useRef(false)
+  const [answerError, setAnswerError] = useState("")
+  const [answerLoading, setAnswerLoading] = useState(!!editSlug)
+  const [answerRequest, setAnswerRequest] = useState(0)
+  const fields = { slug, category, difficulty, description, remote, serviceRequired, flagFormat }
+  const baseline = useRef(JSON.stringify(fields))
+  const guard = useDraftGuard(JSON.stringify(fields) !== baseline.current || answerDirty.current || additions.length > 0 || removals.length > 0, saving)
+  const cancel = () => guard(closeDialog)
 
   // The answer lives in `<root>/eval/answers.txt` and is deliberately absent from the queue state,
   // so the edit dialog reads it once for this one challenge.
   useEffect(() => {
     if (!editSlug) return
     let cancelled = false
-    void api<{ answer: string | null }>(`/api/challenges/${encodeURIComponent(editSlug)}`)
+    const controller = new AbortController()
+    setAnswerLoading(true)
+    setAnswerError("")
+    void api<{ answer: string | null }>(`/api/challenges/${encodeURIComponent(editSlug)}`, { signal: controller.signal })
       .then((result) => {
-        if (!cancelled) setAnswer(result.answer ?? "")
+        if (!cancelled && !answerDirty.current) setAnswer(result.answer ?? "")
       })
-      .catch(() => {})
+      .catch((error) => { if (!cancelled) setAnswerError((error as Error).message) })
+      .finally(() => { if (!cancelled) setAnswerLoading(false) })
     return () => {
       cancelled = true
+      controller.abort()
     }
-  }, [editSlug])
+  }, [editSlug, answerRequest])
 
   if (!data || !challengeEditor) return null
 
@@ -82,7 +95,7 @@ export function ChallengeDialog() {
     ? [categoryOf(current), ...CATEGORY_ORDER]
     : [...CATEGORY_ORDER]
   const attachments = current
-    ? current.files.filter((file) => !file.directory && !removals.includes(fileName(file.path)))
+    ? current.files.filter((file) => !file.directory && !removals.includes(file.path))
     : []
 
   const pickAttachments = async () => {
@@ -111,12 +124,16 @@ export function ChallengeDialog() {
           flagFormat,
           serviceRequired,
           remote,
-          answer,
+          ...(answerDirty.current ? { answer } : {}),
         })
-        for (const removed of removals)
+        for (const removed of removals) {
           await del(`/api/challenges/${encodeURIComponent(editSlug)}/files/${encodeURIComponent(removed)}`)
-        if (additions.length > 0)
+          setRemovals((items) => items.filter((item) => item !== removed))
+        }
+        if (additions.length > 0) {
           await postJSON(`/api/challenges/${encodeURIComponent(editSlug)}/files`, { sources: additions })
+          setAdditions([])
+        }
         toast(
           `已保存 ${editSlug}${removals.length || additions.length ? `（附件 ${attachments.length + additions.length} 个）` : ""}`,
         )
@@ -149,6 +166,7 @@ export function ChallengeDialog() {
 
   return (
     <Modal
+      busy={saving}
       title={editSlug ? `编辑题目 · ${editSlug}` : "新建题目"}
       subtitle={
         editSlug
@@ -156,7 +174,7 @@ export function ChallengeDialog() {
           : "直接在 Boom 工作目录里创建题目，不需要手动准备目录结构。"
       }
       icon={editSlug ? <Pencil size={16} /> : <FilePlus size={16} />}
-      onClose={closeDialog}
+      onClose={cancel}
       footer={
         <>
           <span className="field-hint" style={{ margin: 0, flex: 1 }}>
@@ -164,7 +182,7 @@ export function ChallengeDialog() {
               ? current?.storagePath
               : `将创建 challenges/${category}/${slug.trim() || "<题目 ID>"}/`}
           </span>
-          <button type="button" className="btn" onClick={closeDialog}>取消</button>
+          <button type="button" className="btn" disabled={saving} onClick={cancel}>取消</button>
           <button type="button" className="btn btn-primary" disabled={saving} onClick={() => void save()}>
             {saving ? "保存中…" : editSlug ? "保存修改" : "创建题目"}
           </button>
@@ -268,9 +286,11 @@ export function ChallengeDialog() {
               placeholder="可留空"
               maxLength={500}
               value={answer}
-              onChange={(event) => setAnswer(event.target.value)}
+              onChange={(event) => { answerDirty.current = true; setAnswer(event.target.value) }}
             />
             <p className="field-hint">写入 eval/answers.txt，供自动判题使用。</p>
+            {answerLoading ? <p className="field-hint">正在读取原答案；未编辑此字段不会覆盖原答案。</p> : null}
+            {answerError ? <p role="alert" className="field-hint">原答案读取失败：{answerError} <button type="button" className="btn" onClick={() => setAnswerRequest((value) => value + 1)}>重试读取</button></p> : null}
           </div>
         </div>
 
@@ -297,14 +317,14 @@ export function ChallengeDialog() {
               <>
                 {attachments.map((file) => (
                   <div className="challenge-file" key={file.path}>
-                    <span className="mono">{fileName(file.path)}</span>
+                    <span className="mono">{file.path}</span>
                     <span className="spacer" />
                     <span className="challenge-file-size">{sizeLabel(file.size)}</span>
                     <button
                       type="button"
                       className="icon-button"
-                      aria-label={`移除 ${fileName(file.path)}`}
-                      onClick={() => setRemovals((previous) => [...previous, fileName(file.path)])}
+                      aria-label={`移除 ${file.path}`}
+                      onClick={() => setRemovals((previous) => [...previous, file.path])}
                     >
                       <X size={13} />
                     </button>

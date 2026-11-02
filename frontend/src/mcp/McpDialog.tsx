@@ -1,15 +1,15 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Cable, Plus } from "lucide-react"
 import { useApp } from "../context"
 import { api, del, putJSON } from "../api"
-import { Modal, Segmented, Select, Toggle } from "../ui"
-import type { McpServer, McpServerDetails } from "../types"
-
-const AGENTS = ["boom", "boom-worker", "boom-consultant"]
+import { Modal, Segmented, Select, Toggle, useDraftGuard } from "../ui"
+import type { McpPreset, McpServer, McpServerDetails } from "../types"
 
 export function McpDialog() {
   const { toast, openDialog } = useApp()
   const [servers, setServers] = useState<McpServerDetails[]>([])
+  const [agents, setAgents] = useState<string[]>([])
+  const [presets, setPresets] = useState<McpPreset[]>([])
   const [draft, setDraft] = useState<McpServerDetails | null>(null)
   const [selected, setSelected] = useState("")
   const [isNew, setIsNew] = useState(false)
@@ -17,8 +17,16 @@ export function McpDialog() {
   const [commandText, setCommandText] = useState("")
   const [environmentText, setEnvironmentText] = useState("")
   const [headersText, setHeadersText] = useState("")
+  const baseline = useRef("")
+  const guard = useDraftGuard(!!draft && JSON.stringify({ draft, headersText, commandText, environmentText }) !== baseline.current, saving)
 
   const applyDraft = (server: McpServerDetails) => {
+    baseline.current = JSON.stringify({
+      draft: server,
+      headersText: JSON.stringify(server.type === "remote" ? server.headers : {}, null, 2),
+      commandText: JSON.stringify(server.type === "local" ? server.command : [], null, 2),
+      environmentText: JSON.stringify(server.type === "local" ? server.environment : {}, null, 2),
+    })
     setDraft(structuredClone(server))
     setHeadersText(JSON.stringify(server.type === "remote" ? server.headers : {}, null, 2))
     setCommandText(JSON.stringify(server.type === "local" ? server.command : [], null, 2))
@@ -31,8 +39,10 @@ export function McpDialog() {
 
   const load = async (select = "") => {
     try {
-      const result = await api<{ servers: McpServerDetails[] }>("/api/mcp")
+      const result = await api<{ servers: McpServerDetails[]; agents: string[]; presets?: McpPreset[] }>("/api/mcp")
+      setAgents(result.agents)
       setServers(result.servers)
+      setPresets(result.presets ?? [])
       const next =
         result.servers.find((server) => server.id === select) ??
         result.servers.find((server) => server.id === selected) ??
@@ -64,6 +74,28 @@ export function McpDialog() {
       oauth: false,
       runtime: { status: "尚未保存" },
     } as McpServerDetails)
+  }
+
+  const addPreset = (preset: McpPreset) => {
+    const existing = servers.find((server) => server.id === preset.server.id)
+    if (existing) {
+      guard(() => {
+        setSelected(existing.id)
+        setIsNew(false)
+        applyDraft(existing)
+        toast(`${preset.name} 已配置`)
+      })
+      return
+    }
+    guard(() => {
+      setSelected("")
+      setIsNew(true)
+      applyDraft({
+        ...structuredClone(preset.server),
+        runtime: { status: "尚未保存" },
+      } as McpServerDetails)
+      toast(`已填入 ${preset.name} 预设，请检查后保存`)
+    })
   }
 
   const parseJSON = (text: string, fallback: unknown, kind: string): unknown => {
@@ -202,10 +234,11 @@ export function McpDialog() {
 
   return (
     <Modal
+      busy={saving}
       title="MCP Server"
       subtitle="Boom 管理独立配置并注入隔离的 Boom Runtime；不会读取用户或项目 OpenCode MCP 配置。"
       icon={<Cable size={16} />}
-      onClose={() => openDialog("settings")}
+      onClose={() => guard(() => openDialog("settings"))}
       footer={
         <>
           <span className="field-hint" style={{ margin: 0, flex: 1 }}>
@@ -239,17 +272,35 @@ export function McpDialog() {
             onChange={(value) => {
               const server = servers.find((item) => item.id === value)
               if (server) {
-                setSelected(value)
-                setIsNew(false)
-                applyDraft(server)
+                guard(() => {
+                  setSelected(value)
+                  setIsNew(false)
+                  applyDraft(server)
+                })
               }
             }}
             placeholder="— 选择已有 Server —"
             ariaLabel="MCP Server"
           />
           <button type="button" className="btn" onClick={() => void load()}>重新读取</button>
-          <button type="button" className="btn" onClick={newServer}><Plus size={13} /> 新建</button>
+          <button type="button" className="btn" onClick={() => guard(newServer)}><Plus size={13} /> 新建</button>
         </div>
+        {presets.length > 0 ? (
+          <div className="inline-row" style={{ marginTop: 8, flexWrap: "wrap" }}>
+            <span className="field-hint" style={{ margin: 0 }}>内置集成</span>
+            {presets.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                className="btn"
+                title={preset.description}
+                onClick={() => addPreset(preset)}
+              >
+                <Plus size={13} /> 添加 {preset.name}
+              </button>
+            ))}
+          </div>
+        ) : null}
         <div className="platform-status" style={{ marginTop: 8 }}>
           <span className={`badge${status === "connected" ? " good" : status === "error" ? " bad" : ""}`}>{status}</span>
           <span>{draft?.name || "新 MCP Server"} · {draft?.type ?? "remote"}</span>
@@ -301,7 +352,7 @@ export function McpDialog() {
           <div className="field" style={{ gridColumn: "1 / -1" }}>
             <div className="field-label"><span className="req">可调用此 Server 的 Boom Agent</span></div>
             <div className="inline-row">
-              {AGENTS.map((agent) => (
+              {agents.map((agent) => (
                 <label key={agent} style={{ display: "flex", alignItems: "center", gap: 5, color: "var(--mu)", font: "10px var(--mono)" }}>
                   <input
                     type="checkbox"

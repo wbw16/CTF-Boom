@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { Plug, Plus, Search, Trash2 } from "lucide-react"
 import { useApp } from "../context"
 import { api, del, putJSON } from "../api"
-import { Modal, Select } from "../ui"
+import { Modal, Select, useDraftGuard } from "../ui"
 import type {
   ArmorPromptPreset,
   ManagedProviderConfig,
@@ -23,9 +23,16 @@ export function ProvidersDialog() {
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
   const [apiKey, setApiKey] = useState("")
+  const selection = useRef(0)
+  const selectedRef = useRef("")
+  const controllerRef = useRef<AbortController | null>(null)
+  const baseline = useRef("")
+  const dirty = !!draft && (JSON.stringify(draft) !== baseline.current || apiKey !== "")
+  const guard = useDraftGuard(dirty, saving)
 
   useEffect(() => {
     void load()
+    return () => { selection.current += 1; controllerRef.current?.abort() }
   }, [])
 
   const load = async () => {
@@ -38,7 +45,7 @@ export function ProvidersDialog() {
       setProviders(providerResult.providers)
       setArmorPrompts(armorResult.prompts)
       const next =
-        providerResult.providers.find((provider) => provider.id === selected)?.id ??
+        providerResult.providers.find((provider) => provider.id === selectedRef.current)?.id ??
         providerResult.providers.find((provider) => provider.configured)?.id ??
         providerResult.providers[0]?.id ??
         ""
@@ -52,26 +59,43 @@ export function ProvidersDialog() {
   }
 
   const selectProvider = async (id: string) => {
+    if (saving) return
+    if (dirty && !window.confirm("当前 Provider 有未保存的修改，确定放弃修改？")) return
+    const request = ++selection.current
+    controllerRef.current?.abort()
+    const controller = new AbortController()
+    controllerRef.current = controller
+    selectedRef.current = id
     setSelected(id)
+    setApiKey("")
     setIsNew(false)
     setDetailLoading(true)
     setDraft(null)
     try {
-      const result = await api<{ provider: ProviderDetails }>(`/api/providers/${encodeURIComponent(id)}`)
+      const result = await api<{ provider: ProviderDetails }>(`/api/providers/${encodeURIComponent(id)}`, { signal: controller.signal })
+      if (request !== selection.current) return
+      baseline.current = JSON.stringify(result.provider)
       setDraft(structuredClone(result.provider))
     } catch (error) {
+      if (request !== selection.current) return
       setDraft(null)
       toast((error as Error).message, "error")
     } finally {
-      setDetailLoading(false)
+      if (request === selection.current) setDetailLoading(false)
     }
   }
 
   const newProvider = () => {
+    if (saving) return
+    if (dirty && !window.confirm("当前 Provider 有未保存的修改，确定放弃修改？")) return
+    selection.current += 1
+    controllerRef.current?.abort()
+    selectedRef.current = ""
+    setApiKey("")
     setSelected("")
     setIsNew(true)
     setDetailLoading(false)
-    setDraft({
+    const next: ProviderDetails = {
       id: "",
       name: "",
       custom: true,
@@ -86,7 +110,9 @@ export function ProvidersDialog() {
       api: "",
       baseURL: "",
       models: [],
-    })
+    }
+    baseline.current = JSON.stringify(next)
+    setDraft(next)
   }
 
   const setModel = (index: number, patch: Partial<ProviderModel>) => {
@@ -110,7 +136,7 @@ export function ProvidersDialog() {
       id: model.id.trim(),
       ...(model.catalogID ? { catalogID: model.catalogID } : {}),
       name: model.name.trim(),
-      context: Number(model.context) || 300000,
+      context: Number(model.context) || 128000,
       output: Number(model.output) || 16384,
       reasoning: model.reasoning,
       attachment: model.attachment,
@@ -136,7 +162,7 @@ export function ProvidersDialog() {
   }
 
   const save = async (apply = false) => {
-    if (!draft) return
+    if (!draft || detailLoading || (!isNew && draft.id !== selectedRef.current)) return
     const provider = readProvider()
     if (!provider) return
     if (!provider.id) {
@@ -171,6 +197,8 @@ export function ProvidersDialog() {
         authMethods: nextDraft.authMethods,
       }
       setSelected(nextDraft.id)
+      selectedRef.current = nextDraft.id
+      baseline.current = JSON.stringify(nextDraft)
       setIsNew(false)
       setDraft(structuredClone(nextDraft))
       setProviders((current) => {
@@ -264,12 +292,13 @@ export function ProvidersDialog() {
 
   return (
     <Modal
+      busy={saving}
       title="Provider 与模型"
       subtitle="可随时修改；运行中使用该 Provider 的任务会在下一消息或工具结果边界保留上下文并接管。"
       icon={<Plug size={16} />}
       wide
       className="provider-modal"
-      onClose={() => openDialog("settings")}
+      onClose={() => guard(() => openDialog("settings"))}
       nav={
         <nav className="modal-nav provider-nav">
           <div className="select-search" style={{ marginBottom: 6 }}>
@@ -406,7 +435,7 @@ export function ProvidersDialog() {
               </span>
               <p>目录模型和自定义模型都可编辑；修改目录模型的 Model ID 会保留原目录映射，并在应用后刷新选择器。</p>
             </div>
-            <button type="button" className="btn btn-tiny" onClick={() => setDraft({ ...draft, models: [...draft.models, { id: "", name: "", context: 300000, output: 16384, reasoning: false, attachment: false, armorPrompt: undefined, pricing: undefined, enabled: true, source: "custom" }] })}>
+            <button type="button" className="btn btn-tiny" onClick={() => setDraft({ ...draft, models: [...draft.models, { id: "", name: "", context: 128000, output: 16384, reasoning: false, attachment: false, armorPrompt: undefined, pricing: undefined, enabled: true, source: "custom" }] })}>
               <Plus size={12} /> 模型
             </button>
           </div>
@@ -439,6 +468,10 @@ export function ProvidersDialog() {
                   ) : <span className="model-source-tag">目录模型 · 可编辑</span>}
                 </div>
                 <div className="model-card-settings">
+                  <label className="model-field">
+                    <span>上下文容量</span>
+                    <input type="number" value={model.context || 128000} min={2} title="填写 Provider 的真实容量；目录未提供时默认 128000，可手动校准" onChange={(event) => setModel(index, { context: Number(event.target.value) })} />
+                  </label>
                   <label className="model-field">
                     <span>最大输出</span>
                     <input type="number" value={model.output || 16384} min={1} onChange={(event) => setModel(index, { output: Number(event.target.value) })} />

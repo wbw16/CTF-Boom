@@ -9,8 +9,8 @@ import {
   wrapLocalIdaProxy,
   type McpStore,
 } from "./mcp-config.ts"
+import { installReaSkill, wrapLocalReaBridge } from "./rea.ts"
 import {
-  BOOM_CONTEXT_LIMIT,
   loadProviderStore,
   mergeRuntimeProviderConfig,
   type RuntimeProviderConfig,
@@ -381,6 +381,8 @@ function promptResult(value: unknown): RuntimePromptResult {
     ...(usage ? { usage } : {}),
     cost: typeof info?.cost === "number" ? info.cost : 0,
     ...(finish ? { finish } : {}),
+    ...(finish === "unknown" && typeof info?.finish === "string"
+      ? { rawFinish: redactedText(info.finish, 160) } : {}),
     ...(error === undefined ? {} : { error: runtimeFailure(error) }),
   }
 }
@@ -440,6 +442,7 @@ export function normalizeOpenCodeRuntimeEvent(
     return {
       type: "step-finish",
       sessionID: part.sessionID,
+      ...(typeof part.id === "string" ? { stepID: part.id } : {}),
       usage,
       cost: typeof part.cost === "number" ? part.cost : 0,
       ...(normalizeRuntimeFinish(part.reason) ? { reason: normalizeRuntimeFinish(part.reason) } : {}),
@@ -494,8 +497,7 @@ export function normalizeOpenCodeRuntimeEvent(
  * Route one OpenCode event for a root conversation. Child sessions created by `task` share the
  * root's engagement and cancellation tree. Their visible text/tool events stay inside the task
  * result, while their step usage is remapped to the root so Boom's run budget and consumption
- * include every worker. OpenCode reports cost per step; the router exposes its running tree total
- * because the provider-neutral turn reconciler treats event cost as a cumulative snapshot.
+ * include every worker. Usage and cost both describe one step; the prompt collector owns totals.
  */
 export function createOpenCodeConversationEventRouter(
   rootSessionID: string,
@@ -511,7 +513,6 @@ export function createOpenCodeConversationEventRouter(
     messageRoles: new Map(),
   }
   const sessions = new Set([rootSessionID])
-  let totalCost = 0
   return (value: unknown): RuntimeEvent | undefined => {
     const input = object(value)
     if (input?.type === "session.created") {
@@ -526,12 +527,7 @@ export function createOpenCodeConversationEventRouter(
     if (!event || !sessions.has(event.sessionID)) return undefined
     if (event.sessionID !== rootSessionID) {
       if (event.type !== "step-finish") return undefined
-      totalCost += event.cost
-      return { ...event, sessionID: rootSessionID, cost: totalCost }
-    }
-    if (event.type === "step-finish") {
-      totalCost += event.cost
-      return { ...event, cost: totalCost }
+      return { ...event, sessionID: rootSessionID }
     }
     return event
   }
@@ -562,7 +558,35 @@ export function createOpenCodeAgentRuntime(baseUrl: string): AgentRuntime {
     return {
       id,
       async events(signal) {
-        const subscription = await client.event.subscribe({ signal })
+        // The SDK cancels its reader on abort. Keep fetch cancellation scoped to the headers
+        // handshake so abort does not also error that same reader and reject its cancel promise.
+        const eventOptions = {
+          signal,
+          fetch: Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const request = new Request(input, init)
+            const connection = new AbortController()
+            const cancel = () => connection.abort(request.signal.reason)
+            request.signal.addEventListener("abort", cancel, { once: true })
+            if (request.signal.aborted) cancel()
+            try {
+              const response = await fetch(new Request(request, { signal: connection.signal }))
+              if (request.signal.aborted) {
+                await response.body?.cancel().catch(() => {})
+                request.signal.throwIfAborted()
+              }
+              return response
+            } finally {
+              request.signal.removeEventListener("abort", cancel)
+            }
+          }, { preconnect: fetch.preconnect }),
+          sseSleepFn: (ms: number) => new Promise<void>((resolve) => {
+            if (signal?.aborted) { resolve(); return }
+            const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); resolve() }
+            const timer = setTimeout(finish, ms)
+            signal?.addEventListener("abort", finish, { once: true })
+          }),
+        }
+        const subscription = await contextClient.event.subscribe({ directory }, eventOptions)
         const stream = subscription.stream
         const routeEvent = createOpenCodeConversationEventRouter(id, descendants)
         return {
@@ -878,9 +902,17 @@ async function installProviders(directory: string, mcpStore: McpStore) {
   const idaProxyAvailable = await lstat(idaProxyScript)
     .then((info) => info.isFile() && !info.isSymbolicLink())
     .catch(() => false)
-  config.mcp = wrapLocalIdaProxy(compileOpenCodeMcpConfig(mcpStore), {
+  const reaBridgeScript = path.join(PACKAGE_ROOT, "src", "runtime", "rea-bridge.ts")
+  const reaBridgeAvailable = await lstat(reaBridgeScript)
+    .then((info) => info.isFile() && !info.isSymbolicLink())
+    .catch(() => false)
+  const compiledMcp = wrapLocalIdaProxy(compileOpenCodeMcpConfig(mcpStore), {
     bunExecutable: process.execPath,
     proxyScript: idaProxyAvailable ? idaProxyScript : "",
+  })
+  config.mcp = wrapLocalReaBridge(compiledMcp, {
+    bunExecutable: process.execPath,
+    bridgeScript: reaBridgeAvailable ? reaBridgeScript : "",
   })
   await Bun.write(path.join(directory, "boom.json"), JSON.stringify(config, undefined, 2) + "\n")
   return Object.keys(config.provider)
@@ -909,6 +941,7 @@ async function installRuntime(
   }
   if (!visionModel) await unlink(path.join(directory, VISION_PLUGIN.target)).catch(() => {})
   await Promise.all(LEGACY_TOOL_PLUGINS.map((target) => unlink(path.join(directory, target)).catch(() => {})))
+  await installReaSkill(RESOURCE_ROOT, directory, Object.values(mcpStore.servers))
   const agents = await installOpenCodeAgentResources(
     RESOURCE_ROOT,
     directory,
@@ -964,7 +997,7 @@ export async function startOpenCodeRuntime(options?: {
         models: Object.fromEntries(Object.entries(provider.models).map(([id, model]) => [id, {
           id: model.id,
           name: model.name,
-          limit: { context: BOOM_CONTEXT_LIMIT, output: model.limit.output },
+          limit: { ...model.limit },
           reasoning: model.reasoning,
           attachment: model.attachment,
         }])),
@@ -1232,6 +1265,7 @@ export async function inspectRuntime() {
         models: Object.keys(provider.models).length,
       })),
       mcp: mcp.data,
+      skills: skills.map((skill) => skill.name),
     }
   } finally {
     await started.server.close()

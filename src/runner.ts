@@ -50,6 +50,7 @@ import {
   type ProgressSnapshot,
 } from "./orchestration/progress.ts"
 import { buildHandoffSummary } from "./orchestration/handoff.ts"
+import { recordRecoveryFailure, waitForRecovery, RECOVERY_FAILURE_LIMIT } from "./orchestration/recovery.ts"
 import {
   reviewCandidateBlind,
   selectReviewer,
@@ -79,7 +80,6 @@ import {
   loadCompetitionAdapter,
 } from "./platform/registry.ts"
 import {
-  BOOM_CONTEXT_LIMIT,
   loadProviderStore,
   normalizeManagedProvider,
   normalizeProviderDiscovery,
@@ -117,13 +117,14 @@ import {
   archiveTask,
   loadOrCreateTask,
   rejectTaskFlag,
-  saveTaskRecord,
+  updateTaskRecord,
   taskTotals,
   type TaskRecord,
   type TaskTurn,
 } from "./task.ts"
 import { prepareWorkspace, type Workspace } from "./workspace.ts"
 import { taskSlugRoot } from "./task-layout.ts"
+import { fingerprintInput, normalizeExperiment, type Experiment } from "./experiment.ts"
 
 export type ModelInfo = {
   id: string
@@ -197,6 +198,7 @@ export type RunnerNotification = {
 }
 
 export type EnqueueRunsInput = {
+  experiment?: Experiment
   challenges: Challenge[]
   model: string
   models?: Record<string, string>
@@ -263,6 +265,9 @@ type TestPlatformAdapters = {
 }
 
 type Job = {
+  experiment?: Experiment
+  inputFingerprint?: string
+  environmentFingerprint?: string
   queueID: string
   challenge: Challenge
   model: string
@@ -274,6 +279,7 @@ type Job = {
   writeupAttempts: number
   /** Consecutive host-level recovery turns; reset by non-recovery transitions. */
   recoveryAttempts: number
+  automaticFollowup?: boolean
   modelPolicy: ModelPolicy
   /** Shared second-opinion pool. A blind review draws one reviewer from it; empty disables review. */
   consultModels: string[]
@@ -313,6 +319,7 @@ type Job = {
   lastTool?: string
   platformSubmission?: FlagSubmissionResult
   eventWrites: Promise<void>
+  completion?: Promise<void>
   /** Runtime generation pinned for this job so a live Provider reload cannot invalidate it. */
   runtime?: RuntimeHandle
   /** Separate from user cancellation: observed only at a safe message/tool boundary. */
@@ -469,7 +476,7 @@ function recoveryHint(
   return [
     action,
     unbounded
-      ? `This is recovery attempt ${attempt}; this task has no cumulative budget and will keep recovering until completion or user cancellation.`
+      ? `This is recovery attempt ${attempt}; the task has no cumulative token budget, but repeated identical runtime failures without completed tools will pause automatic recovery.`
       : `This is recovery attempt ${attempt}/${RUN_RECOVERY_ATTEMPTS}; prior results in work/ and NOTES.md are unchanged.`,
     outcome.detail ? `Original stop reason: ${outcome.detail}` : "",
     "Check the durable state first and continue from the last incomplete step; do not redo from scratch.",
@@ -634,12 +641,25 @@ function asResult(job: Job, outcome: Outcome, finishedAt: number) {
     runtime_backend: job.runtimeBackend,
     runtime_version: job.runtimeVersion,
     prompt_version: job.promptVersion,
+    experiment: job.task?.experiment,
+    input_fingerprint: job.inputFingerprint,
+    environment_fingerprint: job.environmentFingerprint,
+    execution_mode: job.executionMode,
+    experiment_limits: {
+      tokens: job.autonomyBudget.tokens ?? null,
+      timeout_ms: job.autonomyBudget.timeout,
+      repeats: job.limits.repeats,
+    },
+    model_policy: job.modelPolicy,
     orchestration_variant: job.consultation
       ? "consultation"
       : job.autonomyEscalations.length > 0
         ? "autonomy-escalated"
         : "autonomy-l0",
     stop: outcome.stop,
+    finish: outcome.finish,
+    raw_finish: outcome.rawFinish,
+    recovery: job.task?.recovery,
     tokens: totals.tokens,
     billable_tokens: totals.billableTokens,
     cost: totals.cost,
@@ -711,7 +731,6 @@ function asResult(job: Job, outcome: Outcome, finishedAt: number) {
               cost: item.cost,
             })),
           },
-    finish: outcome.finish,
     parts: outcome.parts,
     retries: outcome.retries?.length ? outcome.retries : undefined,
     detail: outcome.detail,
@@ -724,6 +743,7 @@ export class GuiRunner {
   private runtime?: RuntimeHandle
   private runtimePromise?: Promise<RuntimeHandle>
   private retiredRuntimes = new Set<RuntimeHandle>()
+  private runtimeLeases = new Map<RuntimeHandle, number>()
   private launchRuntime: RuntimeLauncher
   /** Host-wide network switch applied to the runtime and its tool sandboxes. */
   private network: "allow" | "deny" = "allow"
@@ -845,6 +865,8 @@ export class GuiRunner {
     workspace: Workspace
     candidate: string
     signal?: AbortSignal
+    /** Persist the intent before any network request; a failed write must prevent sending. */
+    beforeAttempt?: (attempt: number) => Promise<void> | void
     /** Invoked after every live adapter response; each response consumes a platform submission. */
     onAttempt?: (result: FlagSubmissionResult, attempt: number) => Promise<void> | void
   }): Promise<FlagSubmissionResult> {
@@ -863,11 +885,10 @@ export class GuiRunner {
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         if (attempt > 1) await new Promise<void>((resolve) => setTimeout(resolve, this.platformSubmissionRetryDelayMs))
         if (input.signal?.aborted) break
+        await input.beforeAttempt?.(attempt)
+        let result: FlagSubmissionResult
         try {
-          const result = await adapter.submitFlag(input)
-          last = result
-          await input.onAttempt?.(result, attempt)
-          if (result.verdict !== "pending" || attempt === 2) return result
+          result = await adapter.submitFlag(input)
         } catch (error) {
           if (attempt === 2) {
             return {
@@ -877,7 +898,12 @@ export class GuiRunner {
               submittedAt: new Date().toISOString(),
             }
           }
+          continue
         }
+        last = result
+        // Persistence failures are not provider errors and must never trigger a resend.
+        await input.onAttempt?.(result, attempt)
+        if (result.verdict !== "pending" || attempt === 2) return result
       }
       return last ?? {
         adapter: platformEntry.id,
@@ -889,6 +915,7 @@ export class GuiRunner {
 
     // Challenges without a registered platform adapter fall through to injected unit-test fakes.
     if (this.testPlatformAdapters) {
+      await input.beforeAttempt?.(1)
       const result = await this.testPlatformAdapters.submitFlagWithRetry({ root: this.root, ...input }, {
         retryDelayMs: this.platformSubmissionRetryDelayMs,
       })
@@ -1130,6 +1157,8 @@ export class GuiRunner {
     const pinned = new Set(
       [...this.active.values()].flatMap((job) => job.runtime ? [job.runtime] : []),
     )
+    for (const [runtime, count] of this.runtimeLeases)
+      if (count > 0) pinned.add(runtime)
     for (const runtime of this.retiredRuntimes) {
       if (pinned.has(runtime)) continue
       this.retiredRuntimes.delete(runtime)
@@ -1154,7 +1183,7 @@ export class GuiRunner {
   getRuntimeState(): RuntimeState {
     return {
       status: this.runtimeStatus,
-      active: this.active.size,
+      active: this.active.size + [...this.runtimeLeases.values()].reduce((sum, count) => sum + count, 0),
       queued: this.queue.length,
       concurrency: this.concurrency,
       ...(this.runtime
@@ -1220,6 +1249,35 @@ export class GuiRunner {
         throw error
       })
     return this.runtimePromise
+  }
+
+  async acquireRuntime() {
+    for (;;) {
+      const handle = await this.ensureRuntime()
+      // A reload may have retired this generation while the launch promise was resolving.
+      if (handle !== this.runtime) continue
+      this.runtimeLeases.set(handle, (this.runtimeLeases.get(handle) ?? 0) + 1)
+      let released = false
+      return { handle, release: () => {
+        if (released) return
+        released = true
+        const count = (this.runtimeLeases.get(handle) ?? 1) - 1
+        if (count > 0) this.runtimeLeases.set(handle, count)
+        else this.runtimeLeases.delete(handle)
+        this.closeUnusedRetiredRuntimes()
+      } }
+    }
+  }
+
+  /** Stop only the reviewed task and wait for its final writes before scheduling its continuation. */
+  async stopTask(slug: string, runID: string) {
+    const active = this.active.get(slug)
+    if (active && (active.workspace?.runID ?? active.resumeRunID) === runID) {
+      this.stop(slug)
+      await active.completion
+    } else if (this.queue.some((job) => job.challenge.slug === slug && job.resumeRunID === runID)) {
+      this.stop(slug)
+    }
   }
 
   private async refreshModels() {
@@ -1436,7 +1494,7 @@ export class GuiRunner {
         id,
         ...(configured ? { catalogID: item.id } : {}),
         name: configured?.name ?? item.name,
-        context: BOOM_CONTEXT_LIMIT,
+        context: configured?.context ?? item.limit.context,
         output: configured?.output ?? item.limit.output,
         reasoning: configured?.reasoning ?? item.reasoning,
         attachment: configured?.attachment ?? item.attachment,
@@ -1504,7 +1562,7 @@ export class GuiRunner {
     return models.map((model) => ({
       id: model.id,
       name: model.name,
-      context: BOOM_CONTEXT_LIMIT,
+      context: model.limit.context,
       output: model.limit.output,
       reasoning: model.reasoning,
       attachment: model.attachment,
@@ -1817,6 +1875,15 @@ export class GuiRunner {
   }
 
   async enqueue(input: EnqueueRunsInput) {
+    if (input.experiment) {
+      normalizeExperiment(input.experiment)
+      if (input.limits.tokens === undefined || !Number.isFinite(input.limits.tokens) || input.limits.tokens <= 0)
+        throw new Error("Evaluation experiments require a finite token budget")
+      if (Object.values(input.workspaces ?? {}).some(Boolean))
+        throw new Error("Evaluation experiments require fresh independent tasks")
+      if (input.challenges.some((challenge) => challenge.platform))
+        throw new Error("Evaluation experiments require challenges without a live submission adapter; score on the host")
+    }
     if (input.challenges.length === 0) throw new Error("No challenges selected")
     // Validate models and adopt the explicit policy before the runtime launches, so tier-declared
     // worker agents resolve to this policy's models. Duplicate checks stay in the queueing loop.
@@ -1856,6 +1923,7 @@ export class GuiRunner {
       const model = input.models?.[challenge.slug] ?? input.model
       const event: RunEvent = { at: Date.now(), type: "status", status: "queued" }
       const job: Job = {
+        experiment: input.experiment,
         queueID: `queued-${crypto.randomUUID()}`,
         challenge,
         model,
@@ -2087,6 +2155,7 @@ export class GuiRunner {
           void this.releaseEnvironmentFor(job).finally(() => this.pump())
         })
       this.executions.add(execution)
+      job.completion = execution
       void execution.then(
         () => this.executions.delete(execution),
         () => this.executions.delete(execution),
@@ -2221,7 +2290,7 @@ export class GuiRunner {
     consultation?: NonNullable<Outcome["consultationRequest"]>
   }) {
     const job = input.source
-    if (!job.workspace || !job.task || job.controller.signal.aborted) return false
+    if (!job.workspace || !job.task || job.controller.signal.aborted || job.task.recovery?.blocked) return false
     const limits = input.purpose === "writeup"
       ? writeupLimits(job)
       : this.remainingAutonomyLimits(job)
@@ -2258,6 +2327,7 @@ export class GuiRunner {
       purpose: input.purpose,
       writeupAttempts: input.writeupAttempts ?? job.writeupAttempts,
       recoveryAttempts: input.recoveryAttempts ?? 0,
+      automaticFollowup: true,
       modelPolicy: job.modelPolicy,
       consultModels: job.consultModels,
       blindReview: job.blindReview,
@@ -2364,6 +2434,7 @@ export class GuiRunner {
       purpose: "solve",
       writeupAttempts: job.writeupAttempts,
       recoveryAttempts: 0,
+      automaticFollowup: true,
       modelPolicy: job.modelPolicy,
       consultModels: job.consultModels,
       blindReview: job.blindReview,
@@ -2497,14 +2568,16 @@ export class GuiRunner {
     outcome.tokens += escalation.tokens
     outcome.billable += escalation.billable
     outcome.cost += escalation.cost
-    const turn = job.task.turns.find((item) => item.id === job.turnID)
-    if (turn) {
-      turn.tokens += escalation.tokens
-      turn.billableTokens += escalation.billable
-      turn.cost += escalation.cost
-      job.task.updatedAt = new Date().toISOString()
-      await saveTaskRecord(job.workspace.directory, job.task)
-    }
+    job.task = await updateTaskRecord(job.workspace.directory, (current) => {
+      const turn = current.turns.find((item) => item.id === job.turnID)
+      if (turn) {
+        turn.tokens += escalation.tokens
+        turn.billableTokens += escalation.billable
+        turn.cost += escalation.cost
+        current.updatedAt = new Date().toISOString()
+      }
+      return current
+    })
     this.recordEvent(job, {
       at: Date.now(),
       type: "status",
@@ -2559,10 +2632,25 @@ export class GuiRunner {
         createdAt: legacy?.startedAt,
         legacyTurn: legacy ? legacyTurn(legacy) : undefined,
       })
+      if (job.experiment) job.task.experiment ??= normalizeExperiment(job.experiment)
+      if (job.task.experiment && !job.automaticFollowup && job.task.turns.length)
+        job.task.experiment.invalidated = true
+      if (job.task.experiment) job.inputFingerprint = await fingerprintInput(job.workspace.directory)
       if (job.task.status === "archived")
         throw new Error("Archived tasks cannot be continued; start a new task instead")
       if (job.task.status === "solved" && job.purpose !== "writeup")
         throw new Error("This task already has an accepted flag and is waiting for its final writeup")
+      // Setup failures after task creation are turns too; their retries must share the circuit.
+      job.turnID = `turn-${job.task.turns.length + 1}-${crypto.randomUUID().slice(0, 8)}`
+      // Explicit user starts/continues are a new recovery episode. Automatic transitions retain it.
+      if (!job.automaticFollowup) delete job.task.recovery
+      if (job.automaticFollowup && job.task.recovery && !job.task.recovery.blocked) {
+        this.recordEvent(job, {
+          at: Date.now(), type: "status", status: "run.recovery.backoff",
+          text: `等待恢复重试：${job.task.recovery.consecutiveFailures}/${RECOVERY_FAILURE_LIMIT}`,
+        })
+        await waitForRecovery(job.task.recovery.retryAt, job.controller.signal)
+      }
       let environment = await loadTaskEnvironment(job.workspace.directory)
       if (!environment) {
         if (job.continuation && !job.environmentProfileId && !job.pythonInterpreter)
@@ -2579,6 +2667,17 @@ export class GuiRunner {
         })
       }
       const prior = taskTotals(job.task)
+      job.environmentFingerprint = environment.fingerprint
+      if (job.task.experiment && !job.task.experiment.conditions && job.autonomyBudget.tokens !== undefined) {
+        job.task.experiment.conditions = {
+          model: job.model, economyModel: job.modelPolicy.economy, strongModel: job.modelPolicy.strong,
+          tokens: job.autonomyBudget.tokens, timeoutMs: job.autonomyBudget.timeout, repeats: job.limits.repeats,
+          inputFingerprint: job.inputFingerprint!, environmentFingerprint: environment.fingerprint,
+          executionMode: job.executionMode, consultModels: [...job.consultModels].sort(),
+          blindReview: job.blindReview, consultOnCompaction: job.consultOnCompaction,
+          planningConsultation: !!job.consultationInput, network: this.network,
+        }
+      }
       job.autonomyBaseline ??= {
         billableTokens: prior.billableTokens,
         activeSolveMs: activeSolveTimeMs(job.task.turns),
@@ -2586,11 +2685,16 @@ export class GuiRunner {
       job.priorTokens = prior.tokens
       job.priorBillableTokens = prior.billableTokens
       job.priorCost = prior.cost
-      job.turnID = `turn-${job.task.turns.length + 1}-${crypto.randomUUID().slice(0, 8)}`
       job.task.status = job.purpose === "writeup" ? "solved" : "active"
       job.task.currentModel = job.model
       job.task.updatedAt = new Date(job.startedAt).toISOString()
-      await saveTaskRecord(job.workspace.directory, job.task)
+      const preparedTask = job.task
+      job.task = await updateTaskRecord(job.workspace.directory, (current) => {
+        if (current.status === "archived" || (current.acceptedFlag && job.purpose !== "writeup"))
+          throw new Error("This task was completed while the turn was starting")
+        return { ...current, status: preparedTask.status, currentModel: preparedTask.currentModel,
+          updatedAt: preparedTask.updatedAt, recovery: preparedTask.recovery, experiment: preparedTask.experiment }
+      })
       await loadOrCreateAutonomyState(job.workspace.directory, job.startedAt)
       for (const event of job.events) await appendRunEvent(job.workspace.directory, event)
       const started: RunEvent = {
@@ -2897,16 +3001,19 @@ export class GuiRunner {
         // Anti-brute-force gate. The platform allows 50 submissions per challenge and forbids
         // brute-forcing, so Boom keeps a far lower ceiling and never resends a value it already tried.
         // The ledger is durable, so restarting mid-match cannot reset the count.
-        let ledger = await loadSubmissionLedger(this.root, job.challenge.slug).catch(() =>
-          ({ version: 1 as const, slug: job.challenge.slug, attempts: [] }))
+        let ledgerError: string | undefined
+        let ledger = await loadSubmissionLedger(this.root, job.challenge.slug).catch((error) => {
+          ledgerError = errorText(error)
+          return { version: 1 as const, slug: job.challenge.slug, attempts: [] }
+        })
         const platformAdapter = await this.competitionAdapter(
           findPlatformAdapterEntry(job.challenge.platform?.adapter)?.id,
         ).catch(() => undefined)
-        const gate = gateSubmission({
+        const maxSubmissions = platformAdapter?.limits.maxSubmissionsPerChallenge ?? DEFAULT_MAX_SUBMISSIONS_PER_CHALLENGE
+        const gate = ledgerError ? { allowed: false as const, reason: `提交账本不可读，自动提交已暂停：${ledgerError}` } : gateSubmission({
           ledger,
           candidate: outcome.primaryCandidate,
-          maxSubmissions: platformAdapter?.limits.maxSubmissionsPerChallenge
-            ?? DEFAULT_MAX_SUBMISSIONS_PER_CHALLENGE,
+          maxSubmissions,
         })
         if (!gate.allowed) {
           job.platformSubmission = {
@@ -2922,6 +3029,7 @@ export class GuiRunner {
             text: gate.reason,
           })
         } else try {
+          let pendingIndex = -1
           // Every adapter response is a real platform submission, so each one enters the ledger as
           // it happens — the first pending verdict included, tagged with its attempt number.
           // Recording only the final verdict used to undercount whenever the pending retry re-sent
@@ -2931,14 +3039,25 @@ export class GuiRunner {
             workspace: job.workspace!,
             candidate: outcome.primaryCandidate,
             signal: job.controller.signal,
-            onAttempt: async (result, attempt) => {
+            beforeAttempt: async (attempt) => {
+              if (ledger.attempts.length >= maxSubmissions) throw new Error(`已达到每题提交上限 ${maxSubmissions}`)
+              pendingIndex = ledger.attempts.length
               ledger = recordAttempt(ledger, {
+                value: gate.value,
+                verdict: "pending",
+                at: new Date().toISOString(),
+                detail: `[attempt ${attempt}] 提交意图已记录；等待平台响应`,
+              })
+              await saveSubmissionLedger(this.root, ledger)
+            },
+            onAttempt: async (result, attempt) => {
+              ledger.attempts[pendingIndex] = {
                 value: gate.value,
                 verdict: result.verdict,
                 at: result.submittedAt,
                 detail: `[attempt ${attempt}] ${result.detail}`.slice(0, 500),
-              })
-              await saveSubmissionLedger(this.root, ledger).catch(() => {})
+              }
+              await saveSubmissionLedger(this.root, ledger)
             },
           })
         } catch (error) {
@@ -3005,9 +3124,13 @@ export class GuiRunner {
         }
         finishedAt = Date.now()
       }
-      job.task.turns.push({
+      const finishedTurn = {
         id: job.turnID,
         model: job.model,
+        purpose: job.purpose,
+        tier: job.model === job.modelPolicy.strong ? "strong" : job.model === job.modelPolicy.economy ? "economy" : undefined,
+        finish: outcome.finish,
+        rawFinish: outcome.rawFinish,
         ...(job.hint?.trim() ? { prompt: job.hint.trim() } : {}),
         startedAt: new Date(job.startedAt!).toISOString(),
         finishedAt: new Date(finishedAt).toISOString(),
@@ -3018,19 +3141,35 @@ export class GuiRunner {
         candidates: outcome.candidates,
         ...(outcome.primaryCandidate ? { primaryCandidate: outcome.primaryCandidate } : {}),
         ...(outcome.detail ? { detail: outcome.detail } : {}),
-      })
-      job.task.status = job.purpose === "writeup" && job.task.acceptedFlag
-        ? "solved"
-        : candidateDisposition === "accepted"
+      } satisfies import("./task.ts").TaskTurn
+      job.task = await updateTaskRecord(job.workspace!.directory, (current) => {
+        if (!current.turns.some((turn) => turn.id === finishedTurn.id)) current.turns.push(finishedTurn)
+        current.status = current.status === "archived" ? "archived" : current.acceptedFlag
           ? "solved"
-          : candidateDisposition === "pending"
-            ? "candidate-found"
-            : "paused"
-      job.task.currentModel = job.model
-      job.task.updatedAt = new Date(finishedAt).toISOString()
-      await saveTaskRecord(job.workspace!.directory, job.task)
+          : candidateDisposition === "accepted"
+            ? "solved"
+            : candidateDisposition === "pending"
+              ? "candidate-found"
+              : "paused"
+        current.currentModel = job.model
+        current.recovery = recordRecoveryFailure({
+          previous: current.recovery,
+          model: job.model,
+          outcome,
+          recoverable: recoverableRunOutcome(outcome),
+          events: job.events.slice(job.progressEventOffset ?? 0),
+        })
+        if (current.recovery?.blocked && !job.controller.signal.aborted) {
+          this.recordEvent(job, {
+            at: finishedAt, type: "status", status: "run.recovery.blocked",
+            text: `同类运行故障连续 ${current.recovery.consecutiveFailures} 轮没有已完成工具调用，已暂停自动恢复。检查 Provider 和模型配置后继续。${outcome.detail ? ` 原因：${outcome.detail}` : ""}`,
+          })
+        }
+        current.updatedAt = new Date(finishedAt).toISOString()
+        return current
+      })
 
-      if (outcome.primaryCandidate && candidateDisposition === "accepted") {
+      if (outcome.primaryCandidate && candidateDisposition === "accepted" && !job.task.acceptedFlag) {
         const platformAccepted = job.platformSubmission?.verdict === "accepted"
         job.task = await acceptTaskFlag({
           directory: job.workspace!.directory,
@@ -3042,7 +3181,7 @@ export class GuiRunner {
             ? job.platformSubmission!.detail
             : outcome.verification?.detail ?? "Candidate accepted",
         })
-      } else if (outcome.primaryCandidate && candidateDisposition === "rejected") {
+      } else if (outcome.primaryCandidate && candidateDisposition === "rejected" && !job.task.acceptedFlag) {
         job.task = await rejectTaskFlag(
           job.workspace!.directory,
           outcome.primaryCandidate,
@@ -3371,6 +3510,7 @@ export class GuiRunner {
       candidateDisposition === "none" &&
       job.purpose === "solve" &&
       job.recoveryAttempts < RUN_RECOVERY_ATTEMPTS &&
+      !job.task?.recovery?.blocked &&
       recoverableRunOutcome(outcome)
     ) {
       const attempt = job.recoveryAttempts + 1
@@ -3383,7 +3523,7 @@ export class GuiRunner {
       })
     }
 
-    if (!queuedProductFollowup && !remoteURLBlocked && candidateDisposition === "none" && job.purpose === "solve") {
+    if (!queuedProductFollowup && !remoteURLBlocked && !job.task?.recovery?.blocked && candidateDisposition === "none" && job.purpose === "solve") {
       await this.queueAutonomyFollowup(job, outcome).catch((error) => {
         this.notify({
           at: Date.now(),

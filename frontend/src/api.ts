@@ -10,6 +10,7 @@ export class ApiError extends Error {
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     ...options,
+    signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
     headers: options.body
       ? { "Content-Type": "application/json", ...(options.headers ?? {}) }
       : options.headers,

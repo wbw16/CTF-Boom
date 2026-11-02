@@ -6,6 +6,7 @@ import {
   type BoomMcpAgentID,
   type ManagedMcpServer,
 } from "./mcp-config.ts"
+import { mcpPresets } from "./mcp-presets.ts"
 import { startOpenCodeRuntime } from "./runtime.ts"
 
 function usage(): never {
@@ -14,12 +15,18 @@ function usage(): never {
     "",
     "Actions:",
     "  list                              list Boom-managed MCP servers and runtime status",
+    "  presets                           list built-in MCP integrations",
+    "  install <preset> [options]        add or replace a built-in MCP integration",
     "  add <id> --url <url> [options]    add or replace a remote MCP server",
     "  add <id> [options] -- <command>   add or replace a local MCP server",
     "  enable <id>                       enable a configured MCP server",
     "  disable <id>                      disable a configured MCP server",
     "  test <id>                         connect and report the Boom Runtime MCP status",
     "  remove <id>                       remove a configured MCP server",
+    "",
+    "Install options:",
+    "  --agent <boom-agent>    allow this Boom role; may be repeated",
+    "  --disabled              save without connecting on runtime startup",
     "",
     "Add options:",
     "  --name <label>          display name",
@@ -105,8 +112,48 @@ async function add(argv: string[]) {
   process.stdout.write(`Saved MCP server ${server.id} (${server.type}, ${server.enabled ? "enabled" : "disabled"})\n`)
 }
 
-async function setEnabled(argv: string[], enabled: boolean) {
-  const serverID = id(argv)
+function listPresets() {
+  const presets = mcpPresets()
+  if (presets.length === 0) {
+    process.stdout.write("No built-in MCP presets.\n")
+    return
+  }
+  for (const preset of presets)
+    process.stdout.write(`${preset.id}\t${preset.name}\t${preset.description}\n`)
+}
+
+async function installPreset(argv: string[]) {
+  const presetID = id(argv)
+  const preset = mcpPresets().find((item) => item.id === presetID)
+  if (!preset)
+    throw new Error(`No such MCP preset: ${presetID}. Run "boom mcp presets" to list them.`)
+  let enabled = true
+  const agents: BoomMcpAgentID[] = []
+  for (let index = 2; index < argv.length; index += 1) {
+    const option = argv[index]!
+    const value = () => {
+      const next = argv[++index]
+      if (!next) usage()
+      return next
+    }
+    if (option === "--disabled") enabled = false
+    else if (option === "--agent") agents.push(value() as BoomMcpAgentID)
+    else usage()
+  }
+  const server = normalizeManagedMcpServer({
+    ...preset.server,
+    enabled,
+    ...(agents.length ? { agents } : {}),
+  })
+  const store = await loadMcpStore()
+  store.servers[server.id] = server
+  await saveMcpStore(store)
+  process.stdout.write(
+    `Saved MCP preset ${preset.id} as server ${server.id} (${server.enabled ? "enabled" : "disabled"})\n`,
+  )
+}
+
+async function setEnabled(argv: string[], enabled: boolean) {  const serverID = id(argv)
   if (argv.length !== 2) usage()
   const store = await loadMcpStore()
   const current = store.servers[serverID]
@@ -179,6 +226,11 @@ export async function mcpCommand(argv: string[]) {
     if (argv.length !== 1) usage()
     return list()
   }
+  if (action === "presets") {
+    if (argv.length !== 1) usage()
+    return listPresets()
+  }
+  if (action === "install") return installPreset(argv)
   if (action === "add") return add(argv)
   if (action === "enable") return setEnabled(argv, true)
   if (action === "disable") return setEnabled(argv, false)

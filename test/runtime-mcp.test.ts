@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { normalizeManagedMcpServer, saveMcpStore } from "../src/mcp-config.ts"
+import { reaMcpServer } from "../src/rea.ts"
 import { startOpenCodeRuntime } from "../src/runtime.ts"
 
 const temporary: string[] = []
@@ -77,6 +78,42 @@ test("Boom compiles and connects its managed local MCP through the isolated Open
       id: conversation.id,
     })
     expect(resumed?.id).toBe(conversation.id)
+  } finally {
+    await runtime?.close()
+    if (previous === undefined) delete process.env.BOOM_HOME
+    else process.env.BOOM_HOME = previous
+  }
+}, 30_000)
+
+test("Boom wraps a managed REA server in its bridge and installs the matching skill", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "boom-runtime-rea-"))
+  temporary.push(home)
+  const previous = process.env.BOOM_HOME
+  process.env.BOOM_HOME = home
+  let runtime: Awaited<ReturnType<typeof startOpenCodeRuntime>> | undefined
+  try {
+    const upstream = path.join(import.meta.dir, "fixtures", "rea-upstream.ts")
+    const server = normalizeManagedMcpServer({
+      ...reaMcpServer(),
+      command: [process.execPath, upstream],
+    })
+    await saveMcpStore({ version: 1, servers: { rea: server } })
+    runtime = await startOpenCodeRuntime()
+
+    expect(await runtime.mcp?.status()).toEqual({ rea: { status: "connected" } })
+    const config = JSON.parse(await readFile(path.join(home, "runtime", "boom.json"), "utf8"))
+    expect(config.mcp.rea.type).toBe("local")
+    expect(config.mcp.rea.command[0]).toBe(process.execPath)
+    expect(config.mcp.rea.command[1]).toContain("rea-bridge.ts")
+    expect(config.mcp.rea.command.slice(2)).toEqual([process.execPath, upstream])
+
+    expect(await Bun.file(
+      path.join(home, "runtime", "skills", "reverse-engineer-anything", "SKILL.md"),
+    ).exists()).toBe(true)
+    expect(await readFile(path.join(home, "runtime", "agent", "boom-consultant.md"), "utf8"))
+      .toContain('"rea_*": "deny"')
+    expect(await readFile(path.join(home, "runtime", "agent", "boom.md"), "utf8"))
+      .not.toContain('"rea_*": "deny"')
   } finally {
     await runtime?.close()
     if (previous === undefined) delete process.env.BOOM_HOME

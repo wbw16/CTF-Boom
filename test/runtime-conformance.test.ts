@@ -367,7 +367,7 @@ describe("OpenCode adapter normalization", () => {
           tokens: { input: 20, output: 4, reasoning: 1, cache: { read: 0, write: 0 } },
         },
       },
-    })).toMatchObject({ sessionID: "root", cost: 0.5, usage: { input: 20, output: 4, reasoning: 1 } })
+    })).toMatchObject({ sessionID: "root", cost: 0.3, usage: { input: 20, output: 4, reasoning: 1 } })
     // The conversation can abort the workers it discovered; a pause must not leave one behind.
     expect(descendants).toEqual(new Set(["worker"]))
   })
@@ -802,6 +802,8 @@ describe("OpenCode adapter normalization", () => {
       ) as Record<string, { parameters?: unknown }>
       expect(Object.keys(toolDefinitions).sort()).toEqual([
         "bash", "boom-exec", "ctf-consult", "ctf-note", "ctf-submit", "edit", "glob", "grep", "list",
+        "pentest-asset", "pentest-evidence", "pentest-finding", "pentest-flag", "pentest-note",
+        "pentest-observation",
         "read", "skill", "task", "todowrite", "webfetch", "write",
       ])
       const neutralCatalog = neutralRegistry.catalog

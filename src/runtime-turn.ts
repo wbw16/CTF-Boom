@@ -51,6 +51,31 @@ function billableUsage(usage: RuntimeUsage) {
   return usage.input + usage.output + usage.reasoning + usage.cache.write + usage.cache.read * 0.1
 }
 
+/** Reconcile a prompt's streamed steps with its aggregate result, including late events. */
+export class PromptUsageCollector {
+  private readonly streamed = EMPTY_USAGE()
+  private fallback = EMPTY_USAGE()
+  private streamedCost = 0
+  private fallbackCost = 0
+  private readonly seen = new Set<string>()
+
+  step(usage: RuntimeUsage, cost: number, id?: string) {
+    if (id && this.seen.has(id)) return
+    if (id) this.seen.add(id)
+    addUsage(this.streamed, usage)
+    this.streamedCost += cost
+  }
+
+  result(result: RuntimePromptResult) {
+    this.fallback = result.usage ?? EMPTY_USAGE()
+    this.fallbackCost = result.cost
+  }
+
+  snapshot() {
+    return { usage: maxUsage(this.streamed, this.fallback), cost: Math.max(this.streamedCost, this.fallbackCost) }
+  }
+}
+
 /**
  * One billable-token number for a usage snapshot, using the same weighting the runtime budget
  * check applies. Exported so callers that persist consumption records stay consistent with it.
@@ -194,6 +219,7 @@ export async function completeRuntimePrompt(input: {
     void conversation.abort().catch(() => {})
   }
   const usage = EMPTY_USAGE()
+  const collector = new PromptUsageCollector()
   let usageSteps = 0
   let observedCost = 0
   let budgetError: string | undefined
@@ -208,8 +234,10 @@ export async function completeRuntimePrompt(input: {
           if (event.sessionID !== conversation.id) continue
           if (event.type === "step-finish") {
             usageSteps += 1
-            addUsage(usage, event.usage)
-            observedCost = Math.max(observedCost, event.cost)
+            collector.step(event.usage, event.cost, event.stepID)
+            const snapshot = collector.snapshot()
+            Object.assign(usage, snapshot.usage)
+            observedCost = snapshot.cost
             const billable = billableUsage(usage)
             if (input.tokenBudget !== undefined && billable > input.tokenBudget && !budgetError) {
               budgetError = `runtime prompt token budget exceeded: ${Math.round(billable)} > ${input.tokenBudget}`
@@ -256,6 +284,14 @@ export async function completeRuntimePrompt(input: {
       await Promise.race([terminalEvent, watching, trailingEventWindow()]).catch(() => {})
     }
     if (budgetError) throw new RuntimePromptFailure(budgetError, usage, observedCost)
+    collector.result(result)
+    const reconciled = collector.snapshot()
+    if (input.tokenBudget !== undefined && billableUsage(reconciled.usage) > input.tokenBudget)
+      throw new RuntimePromptFailure(
+        `runtime prompt token budget exceeded: ${Math.round(billableUsage(reconciled.usage))} > ${input.tokenBudget}`,
+        reconciled.usage,
+        reconciled.cost,
+      )
     if (usageSteps === 0) {
       // Providers that emit no step events must still respect the ask ceiling: fall back to the
       // result's own usage so a silent single-shot provider cannot dodge the budget check.
@@ -275,8 +311,8 @@ export async function completeRuntimePrompt(input: {
     // or double-counted.
     return {
       ...result,
-      usage: result.usage ? maxUsage(usage, result.usage) : usage,
-      cost: Math.max(result.cost, observedCost),
+      usage: reconciled.usage,
+      cost: reconciled.cost,
     }
   } finally {
     input.signal?.removeEventListener("abort", abort)

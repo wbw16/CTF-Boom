@@ -15,6 +15,7 @@ import {
   applyRunnerNotification,
   candidateValues,
   displayFlagRun,
+  detailRun,
   label,
   latestFlagRun,
   primary,
@@ -25,6 +26,17 @@ import {
 import type { ChallengeGui, GuiState, RunHistory, RunnerNotification } from "../frontend/src/types.ts"
 
 describe("GUI state", () => {
+  test("execution controls follow the live task ahead of archived history", () => {
+    const old = { id: "old", stop: "completed", taskStatus: "archived", confirmedFlag: "flag{old}" } as RunHistory
+    const current = { id: "new", stop: "running" } as RunHistory
+    const challenge = { slug: "sample", runs: [old, current] } as ChallengeGui
+    expect(detailRun(challenge, { slug: "sample", id: old.id })).toBe(current)
+    expect(displayFlagRun(challenge, current)).toBe(old)
+    current.stop = "queued"
+    expect(detailRun(challenge)).toBe(current)
+    current.stop = "budget"
+    expect(detailRun(challenge, { slug: "sample", id: current.id })).toBe(current)
+  })
   test("remembers the last active workspace root across saves of per-root state", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "boom-gui-state-"))
     const previous = process.env.BOOM_HOME

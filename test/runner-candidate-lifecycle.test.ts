@@ -16,6 +16,7 @@ afterEach(async () => Promise.all(
 async function fixture(input: {
   candidates: string[]
   verdicts?: Array<"accepted" | "rejected" | "pending">
+  corruptLedger?: boolean
 }) {
   const interpreter = Bun.which("python3")
   if (!interpreter) throw new Error("python3 is required for this test")
@@ -25,6 +26,10 @@ async function fixture(input: {
   const source = path.join(root, "challenges", "sample")
   await mkdir(source, { recursive: true })
   await writeFile(path.join(source, "README.md"), "Recover a flag")
+  if (input.corruptLedger) {
+    await mkdir(path.join(root, "competition", "submissions"), { recursive: true })
+    await writeFile(path.join(root, "competition", "submissions", "sample.json"), "{broken")
+  }
 
   let solveTurns = 0
   const prompts: string[] = []
@@ -75,10 +80,15 @@ async function fixture(input: {
     close() {},
   }
   const verdicts = [...(input.verdicts ?? [])]
+  let submissionCalls = 0
+  let intentRecordedBeforeSend = false
   const adapters = verdicts.length
     ? new MockSubmissionGateway([{
         id: "test",
         async submitFlag() {
+          submissionCalls += 1
+          const ledger = JSON.parse(await readFile(path.join(root, "competition", "submissions", "sample.json"), "utf8"))
+          intentRecordedBeforeSend = ledger.attempts.some((attempt: { verdict: string }) => attempt.verdict === "pending")
           const verdict = verdicts.shift() ?? "pending"
           return {
             adapter: "test",
@@ -111,10 +121,30 @@ async function fixture(input: {
   for (let attempt = 0; attempt < 500 && runner.hasWork(); attempt += 1) await Bun.sleep(10)
   const [runID] = await readdir(path.join(root, "tasks", "sample"))
   const run = path.join(root, "tasks", "sample", runID!)
-  return { runner, root, run, prompts }
+  return { runner, root, run, prompts, get submissionCalls() { return submissionCalls }, get intentRecordedBeforeSend() { return intentRecordedBeforeSend } }
 }
 
 describe("candidate lifecycle", () => {
+  test("persists submission intent before sending and updates that same ledger row", async () => {
+    const one = await fixture({ candidates: ["flag{ledger}"], verdicts: ["accepted"] })
+    try {
+      expect(one.intentRecordedBeforeSend).toBe(true)
+      expect(one.submissionCalls).toBe(1)
+      const ledger = JSON.parse(await readFile(path.join(one.root, "competition", "submissions", "sample.json"), "utf8"))
+      expect(ledger.attempts).toHaveLength(1)
+      expect(ledger.attempts[0]).toMatchObject({ value: "ledger", verdict: "accepted" })
+    } finally { await one.runner.close() }
+  })
+  test("a corrupt submission ledger preserves the candidate and prevents sending", async () => {
+    const one = await fixture({ candidates: ["flag{ledger}"], verdicts: ["accepted"], corruptLedger: true })
+    try {
+      expect(one.submissionCalls).toBe(0)
+      const result = JSON.parse(await readFile(path.join(one.run, "result.json"), "utf8"))
+      expect(result.primary_candidate).toBe("flag{ledger}")
+      expect(result.platform_submission).toMatchObject({ verdict: "pending", detail: expect.stringContaining("自动提交已暂停") })
+      expect(await readFile(path.join(one.root, "competition", "submissions", "sample.json"), "utf8")).toBe("{broken")
+    } finally { await one.runner.close() }
+  })
   test("stops at manual review when no submission adapter is configured", async () => {
     const one = await fixture({ candidates: ["flag{manual}"] })
     try {

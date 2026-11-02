@@ -92,6 +92,20 @@ export const displayFlagRun = (challenge: ChallengeGui, preferred = currentRun(c
   return activeCandidateValues(run).length ? run : latestFlagRun(challenge)
 }
 
+export function queueFlag(challenge: ChallengeGui, flagFormat = "") {
+  const run = displayFlagRun(challenge)
+  const value = primary(run)
+  if (!run || !value) return undefined
+  const confirmed = value === run.confirmedFlag || value === run.acceptedFlag
+  const status = confirmed ? "confirmed" : formatMismatch(run, value, flagFormat) ? "mismatch" : "pending"
+  return {
+    value,
+    status,
+    label: confirmed ? "Flag 已确认" : status === "mismatch" ? "Flag 格式不符" : "Flag 待验证",
+    historical: run !== currentRun(challenge),
+  } as const
+}
+
 export const flagEntries = (challenge: ChallengeGui, preferred = currentRun(challenge)) => {
   const newest = preferred
   const seen = new Set<string>()
@@ -168,6 +182,12 @@ export function orderedChallenges(
   )
 }
 
+export function detailRun(challenge: ChallengeGui, focused?: { slug: string; id: string } | null) {
+  return [...challenge.runs].reverse().find((run) => run.stop === "running") ??
+    [...challenge.runs].reverse().find((run) => run.stop === "queued") ??
+    challenge.runs.find((run) => focused?.slug === challenge.slug && run.id === focused.id) ?? currentRun(challenge)
+}
+
 export function label(challenge: ChallengeGui, flagFormat = "") {
   if (challenge.state === "given-up") return ["已放弃", "c-dim"] as const
   if (challenge.state === "removed") return ["已移出", "c-dim"] as const
@@ -179,7 +199,7 @@ export function label(challenge: ChallengeGui, flagFormat = "") {
   if (isRemoteURLBlocked(run))
     return [challenge.remote?.trim() ? "待继续" : "等待服务地址", "c-warn"] as const
   if (confirmedRun(challenge)) return ["已归档", "c-ok"] as const
-  if (run.taskStatus === "solved") return ["写作中", "c-warn"] as const
+  if (run.taskStatus === "solved") return ["待生成 Writeup", "c-warn"] as const
   if (activeCandidate(run))
     return [formatMismatch(run, activeCandidate(run), flagFormat) ? "格式不符" : "待确认", "c-warn"] as const
   return (

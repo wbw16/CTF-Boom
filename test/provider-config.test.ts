@@ -3,7 +3,6 @@ import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
-  BOOM_CONTEXT_LIMIT,
   loadProviderStore,
   mergeRuntimeProviderConfig,
   normalizeArmorPromptPresets,
@@ -70,13 +69,13 @@ describe("provider configuration", () => {
         reasoner: {
           name: "Reasoner",
           reasoning: true,
-          limit: { context: BOOM_CONTEXT_LIMIT, output: 8_000 },
+          limit: { context: 64_000, input: 49_600, output: 8_000 },
         },
       },
     })
     expect(JSON.stringify(merged)).not.toContain("apiKey")
     expect(provider.driver).toBe("openai-compatible")
-    expect(provider.models[0]?.context).toBe(BOOM_CONTEXT_LIMIT)
+    expect(provider.models[0]?.context).toBe(64_000)
     expect(provider.models[0]?.pricing).toEqual({ input: 0.25, output: 1.5 })
     expect(normalizeManagedProvider({
       id: "native-only",

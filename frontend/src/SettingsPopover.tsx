@@ -46,7 +46,7 @@ export function SettingsPopover() {
       <h3>当前运行配置</h3>
       <div className="setting-row"><span>Agent</span><b>{pentest ? "boom-pentest" : "boom"}</b></div>
       <div className="setting-row"><span>主模型</span><b title={data.settings.strongModel}>{data.settings.strongModel}</b></div>
-      <div className="setting-row"><span>并发上限</span><b>{data.settings.concurrency}</b></div>
+      <div className="setting-row"><span>CTF 并发上限</span><b>{data.settings.concurrency}</b></div>
       <div className="setting-row">
         <span>执行环境</span>
         <b title={defaultProfile?.displayName ?? "本机"}>

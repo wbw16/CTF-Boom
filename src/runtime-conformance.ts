@@ -480,6 +480,7 @@ export async function captureRuntimeTrace(input: {
   let terminal = false
   let resolveTerminal: (() => void) | undefined
   const terminalEvent = new Promise<void>((resolve) => { resolveTerminal = resolve })
+  let streamError: unknown
   const watching = (async () => {
     try {
       for await (const event of stream) {
@@ -494,7 +495,7 @@ export async function captureRuntimeTrace(input: {
         }
       }
     } catch (error) {
-      if (!subscription.signal.aborted) throw error
+      if (!subscription.signal.aborted) streamError = error
     }
   })()
   try {
@@ -514,6 +515,7 @@ export async function captureRuntimeTrace(input: {
     }
     subscription.abort()
     await watching
+    if (streamError) throw streamError
     const workspace = await realpath(input.directory).catch(() => input.directory)
     return normalizeRuntimeTrace({ events, result, workspace })
   } finally {

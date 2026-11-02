@@ -18,6 +18,7 @@
 
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { constants } from "node:fs"
 import { normalizeChallengeCategory, resolveChallengeCatalog } from "./challenge.ts"
 
 const META_NAME = "meta.json"
@@ -137,19 +138,53 @@ async function writeMetadata(directory: string, metadata: Record<string, unknown
   }
 }
 
-/** Copy operator-selected files into `<directory>/files/`, never following a link. */
-async function copyAttachments(directory: string, attachments: string[]) {
-  if (attachments.length === 0) return []
+const PROTECTED_INPUT_NAMES = new Set(["meta.json", "readme.md", "readme.txt", "prompt.md", "prompt.txt", "题面.md", "题面.txt"])
+
+function attachmentSegments(name: string) {
+  const segments = name.split("/")
+  if (name.includes("\\") || name.includes("\0") || segments.some((part) => !part || part.startsWith(".")) ||
+      segments.some((part) => part.toLowerCase() === META_NAME) ||
+      PROTECTED_INPUT_NAMES.has(segments[0]!.toLowerCase()))
+    throw new Error(`Invalid attachment name: ${name}`)
+  return segments
+}
+
+/** Imported challenges retain their flat layout; creating files/ would hide their old inputs. */
+async function attachmentDirectory(directory: string) {
   const target = path.join(directory, FILES_DIR)
-  await mkdir(target, { recursive: true })
-  const copied: string[] = []
+  const info = await lstat(target).catch((error) => {
+    if (error.code === "ENOENT") return undefined
+    throw error
+  })
+  if (!info) return directory
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Attachment directory is not a real directory: ${target}`)
+  return target
+}
+
+/** Preflight the complete batch, refuse collisions, and roll back only files copied by this call. */
+async function copyAttachments(target: string, attachments: string[]) {
+  const sources: Array<{ source: string; name: string }> = []
+  const names = new Set<string>()
   for (const source of attachments) {
     const canonical = await realFile(path.resolve(source))
     const name = path.basename(canonical)
-    if (name === "" || name === "." || name === ".." || name.includes(path.sep))
-      throw new Error(`Attachment has an invalid name: ${source}`)
-    await copyFile(canonical, path.join(target, name))
-    copied.push(name)
+    attachmentSegments(name)
+    if (names.has(name) || await lstat(path.join(target, name)).catch((error) => {
+      if (error.code === "ENOENT") return undefined
+      throw error
+    })) throw new Error(`Attachment already exists: ${name}`)
+    names.add(name)
+    sources.push({ source: canonical, name })
+  }
+  const copied: string[] = []
+  try {
+    for (const { source, name } of sources) {
+      await copyFile(source, path.join(target, name), constants.COPYFILE_EXCL)
+      copied.push(name)
+    }
+  } catch (error) {
+    await Promise.all(copied.map((name) => rm(path.join(target, name), { force: true })))
+    throw error
   }
   return copied
 }
@@ -182,8 +217,9 @@ export async function createChallengeInCatalog(
       `# ${slug}\n\n${description ?? "（暂无题面，点击「编辑题目」补充。）"}\n`,
       "utf8",
     )
-    const files = await copyAttachments(directory, draft.attachments ?? [])
-    if (files.length > 0) await mkdir(path.join(directory, FILES_DIR), { recursive: true })
+    const attachmentBase = path.join(directory, FILES_DIR)
+    await mkdir(attachmentBase)
+    const files = await copyAttachments(attachmentBase, draft.attachments ?? [])
     if (draft.answer !== undefined) await writeAnswer(root, slug, draft.answer)
     return { slug, category, directory, files }
   } catch (error) {
@@ -279,29 +315,28 @@ async function moveChallengeToCategory(catalog: string, directory: string, categ
 export async function addChallengeAttachments(root: string, slug: string, attachments: string[]) {
   assertChallengeSlug(slug)
   const directory = await findChallengeDirectory(root, slug)
-  const existing = await lstat(path.join(directory, FILES_DIR)).catch(() => undefined)
-  // A challenge without `files/` keeps its attachments beside the description (imported layouts);
-  // adding the first one through Boom creates the directory so the two kinds never mix silently.
-  if (!existing) await mkdir(path.join(directory, FILES_DIR), { recursive: true })
-  const copied = await copyAttachments(directory, attachments)
-  return { slug, files: copied, directory: path.join(directory, FILES_DIR) }
+  const target = await attachmentDirectory(directory)
+  const copied = await copyAttachments(target, attachments)
+  return { slug, files: copied, directory: target }
 }
 
-/** Remove one attachment by name. Only a single, non-dot path segment is accepted. */
+/** Remove one relative attachment path without following symlinks in any component. */
 export async function removeChallengeAttachment(root: string, slug: string, name: string) {
   assertChallengeSlug(slug)
-  if (name === "" || name.startsWith(".") || name.includes("/") || name.includes("\\") || name.includes("\0"))
-    throw new Error(`Invalid attachment name: ${name}`)
+  const segments = attachmentSegments(name)
   const directory = await findChallengeDirectory(root, slug)
-  for (const base of [path.join(directory, FILES_DIR), directory]) {
-    const target = path.join(base, name)
-    const info = await lstat(target).catch(() => undefined)
-    if (!info) continue
-    if (!info.isFile() || info.isSymbolicLink()) throw new Error(`Attachment is not a real file: ${name}`)
-    await rm(target)
-    return { slug, removed: name }
+  let target = await attachmentDirectory(directory)
+  for (const [index, segment] of segments.entries()) {
+    target = path.join(target, segment)
+    const info = await lstat(target).catch((error) => {
+      if (error.code === "ENOENT") throw new Error(`No such attachment: ${name}`)
+      throw error
+    })
+    if (info.isSymbolicLink() || (index === segments.length - 1 ? !info.isFile() : !info.isDirectory()))
+      throw new Error(`Attachment is not a real file: ${name}`)
   }
-  throw new Error(`No such attachment: ${name}`)
+  await rm(target)
+  return { slug, removed: name }
 }
 
 /**

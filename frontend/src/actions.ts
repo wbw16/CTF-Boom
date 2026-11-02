@@ -62,7 +62,7 @@ export function useActions() {
 
   const reviewFlag = useCallback(
     async (slug: string, run: RunHistory, flag: string, correct: boolean, hint = "") => {
-      if (correct && !window.confirm(`确认 ${slug} 的 flag 正确并归档任务？\n\n${flag}`)) return
+      if (correct && !window.confirm(`确认 ${slug} 的 flag 正确并结束当前解题回合？\n\n${flag}`)) return
       try {
         await postJSON("/api/flags", {
           slug,

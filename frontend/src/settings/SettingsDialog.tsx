@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react"
+import { useMemo, useRef, useState, type ReactNode } from "react"
 import {
   Archive,
   Blocks,
@@ -18,7 +18,7 @@ import {
 import { useApp } from "../context"
 import { chooseDirectory } from "../bridge"
 import { patchJSON, postJSON } from "../api"
-import { Modal, Segmented, Select, Toggle, type SelectOption } from "../ui"
+import { Modal, Segmented, Select, Toggle, useDraftGuard, type SelectOption } from "../ui"
 import type { GuiSettings } from "../types"
 
 const SECTIONS = [
@@ -41,7 +41,17 @@ export function SettingsDialog() {
   const [envId, setEnvId] = useState(() => data?.environments.defaultProfileId ?? "")
   const [saving, setSaving] = useState(false)
   const [migratingCredentials, setMigratingCredentials] = useState(false)
+  const [environmentBusy, setEnvironmentBusy] = useState<"" | "add" | "discover">("")
   const [interpreterPath, setInterpreterPath] = useState("")
+  const [rootDraft, setRootDraft] = useState(() => data?.root ?? "")
+  const [backupName, setBackupName] = useState("")
+  const [workspaceBusy, setWorkspaceBusy] = useState<"" | "root" | "backup" | "clear">("")
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [lastBackup, setLastBackup] = useState("")
+  const baseline = useRef(JSON.stringify({ draft, envId }))
+  const busy = saving || !!workspaceBusy || migratingCredentials || !!environmentBusy
+  const guard = useDraftGuard(JSON.stringify({ draft, envId }) !== baseline.current || rootDraft !== data?.root || interpreterPath !== "", busy)
+  const cancel = () => guard(closeDialog)
 
   const modelOptions = useMemo(() => {
     if (!data) return []
@@ -157,11 +167,20 @@ export function SettingsDialog() {
     try {
       const saved = await patchJSON<{
         switches?: { active: number; queued: number; warnings: string[] }
+        applied?: boolean
+        applyError?: string
       }>("/api/settings", {
         ...draft,
         flagFormat: draft.flagFormat.trim(),
+        defaultProfileId: profileId,
       })
-      await patchJSON("/api/environments/default", { profileId })
+      baseline.current = JSON.stringify({ draft, envId: profileId })
+      setEnvId(profileId)
+      if (saved.applied === false) {
+        toast(`设置和默认环境已保存；Runtime 应用失败：${saved.applyError ?? "请检查运行配置后重试"}`, "error")
+        await refresh()
+        return
+      }
       const active = saved.switches?.active ?? 0
       const compatibility = saved.switches?.warnings ?? []
       toast(
@@ -183,6 +202,7 @@ export function SettingsDialog() {
       toast("请输入 Python 解释器路径", "error")
       return
     }
+    setEnvironmentBusy("add")
     try {
       const result = await postJSON<{ profile: { id: string } }>("/api/environments", {
         interpreter: interpreterPath.trim(),
@@ -194,10 +214,13 @@ export function SettingsDialog() {
       await refresh()
     } catch (error) {
       toast((error as Error).message, "error")
+    } finally {
+      setEnvironmentBusy("")
     }
   }
 
   const discoverConda = async () => {
+    setEnvironmentBusy("discover")
     try {
       const result = await postJSON<{ discovered: number; store: { defaultProfileId?: string } }>(
         "/api/environments/discover",
@@ -207,6 +230,8 @@ export function SettingsDialog() {
       await refresh()
     } catch (error) {
       toast((error as Error).message, "error")
+    } finally {
+      setEnvironmentBusy("")
     }
   }
 
@@ -233,11 +258,6 @@ export function SettingsDialog() {
     }
   }
 
-  const [rootDraft, setRootDraft] = useState(() => data?.root ?? "")
-  const [backupName, setBackupName] = useState("")
-  const [workspaceBusy, setWorkspaceBusy] = useState<"" | "root" | "backup" | "clear">("")
-  const [confirmClear, setConfirmClear] = useState(false)
-  const [lastBackup, setLastBackup] = useState("")
 
   /**
    * The workspace panel owns the Chinese phrasing of its own refusals: the API answers in one
@@ -330,11 +350,12 @@ export function SettingsDialog() {
 
   return (
     <Modal
+      busy={busy}
       title="运行设置"
       subtitle="模型 / Provider 修改会在运行中的下一消息或工具边界热切换；预算与超时只约束新的一轮。"
       icon={<Cpu size={16} />}
       className="settings-modal"
-      onClose={closeDialog}
+      onClose={cancel}
       nav={
         <nav className="modal-nav">
           {SECTIONS.map(({ id, label, icon: Icon }) => (
@@ -354,7 +375,7 @@ export function SettingsDialog() {
           <span className="note" style={{ margin: 0, flex: 1 }}>
             模型更改在安全边界立即接管
           </span>
-          <button type="button" className="btn" onClick={closeDialog}>取消</button>
+          <button type="button" className="btn" disabled={saving} onClick={cancel}>取消</button>
           <button type="button" className="btn btn-primary" disabled={saving} onClick={() => void save()}>
             {saving ? "保存中…" : "保存设置"}
           </button>
@@ -508,15 +529,15 @@ export function SettingsDialog() {
               value={interpreterPath}
               onChange={(event) => setInterpreterPath(event.target.value)}
             />
-            <button type="button" className="btn" onClick={() => void addInterpreter()}>测试并添加</button>
-            <button type="button" className="btn btn-ghost" onClick={() => void discoverConda()}>发现 Conda</button>
+            <button type="button" className="btn" onClick={() => void addInterpreter()}>{environmentBusy === "add" ? "测试中…" : "测试并添加"}</button>
+            <button type="button" className="btn btn-ghost" onClick={() => void discoverConda()}>{environmentBusy === "discover" ? "发现中…" : "发现 Conda"}</button>
           </div>
         </div>
         <Toggle
           checked={draft.network === "deny"}
           onChange={(checked) => set("network", checked ? "deny" : "allow")}
           title="完全离线运行"
-          desc="关闭后拒绝 webfetch / websearch，并隔离 bash / boom-exec 的网络访问；开启后照常联网（查文档、下载工具、访问远程服务）。"
+          desc="约束 agent 的 webfetch / websearch 与受控命令联网。手动启动的后台扫描工具使用宿主网络，仍按任务授权范围执行。"
         />
       </section>
 
@@ -552,7 +573,7 @@ export function SettingsDialog() {
             </div>
           </div>
           <div className="field">
-            <div className="field-label"><span className="req">并发任务</span></div>
+            <div className="field-label"><span className="req">CTF 任务并发</span></div>
             <div className="num-wrap">
               <input type="number" value={draft.concurrency} min={1} max={32} onChange={(event) => set("concurrency", Number(event.target.value))} />
               <span className="unit">任务</span>
@@ -565,7 +586,7 @@ export function SettingsDialog() {
           title="启用 token 预算"
           desc="默认关闭：任务不设累计 token/时间上限，并在正常让出或单轮卡死后自动续跑，直到拿到结果或你手动停止。单轮分钟数、重复调用、无活动监测与输出上限仍作为自愈 watchdog；此模式可能持续产生模型调用费用。"
         />
-        <div className="note">repeats 至少为 2；并发上限 32。启用 token 预算后，它是本次任务链的累计硬上限；设置只约束新开始的一轮。</div>
+        <div className="note">repeats 至少为 2；CTF 并发上限 32，渗透任务独立调度。启用 token 预算后，它是本次任务链的累计硬上限；设置只约束新开始的一轮。</div>
       </section>
 
       <section className={`modal-section${section === "flag" ? " active" : ""}`}>
@@ -682,7 +703,7 @@ export function SettingsDialog() {
       <section className={`modal-section${section === "integrations" ? " active" : ""}`}>
         <h3 style={{ marginTop: 0 }}>集成</h3>
         <div className="integ-grid">
-          <IntegrationCard icon={<Plug size={15} />} title="Provider 与模型" desc="连接或移除凭据，自定义兼容端点，控制模型是否出现在上方选择器。" onClick={() => openDialog("providers")} />
+          <IntegrationCard icon={<Plug size={15} />} title="Provider 与模型" desc="连接或移除凭据，自定义兼容端点，控制模型是否出现在上方选择器。" onClick={() => guard(() => openDialog("providers"))} />
           <IntegrationCard
             icon={<KeyRound size={15} />}
             title={migratingCredentials ? "正在迁移凭据…" : "从 OpenCode 迁移凭据"}
@@ -690,9 +711,9 @@ export function SettingsDialog() {
             disabled={migratingCredentials}
             onClick={() => void migrateOpenCodeCredentials()}
           />
-          <IntegrationCard icon={<Cable size={15} />} title="MCP Server" desc="Boom 保存独立配置并注入隔离的 Boom Runtime，不读取用户或项目 OpenCode 配置。" onClick={() => openDialog("mcp")} />
-          <IntegrationCard icon={<Timer size={15} />} title="比赛平台控制台" desc="平台接入、AccessKey、自动拉题、线上资源与比赛大模型网关。" onClick={() => openDialog("competition")} />
-          <IntegrationCard icon={<Shield size={15} />} title="破甲提示词" desc="维护可复用的置顶系统提示词；然后在每个 Provider 模型上选择一项。" onClick={() => openDialog("armor")} />
+          <IntegrationCard icon={<Cable size={15} />} title="MCP Server" desc="Boom 保存独立配置并注入隔离的 Boom Runtime，不读取用户或项目 OpenCode 配置。" onClick={() => guard(() => openDialog("mcp"))} />
+          <IntegrationCard icon={<Timer size={15} />} title="比赛平台控制台" desc="平台接入、AccessKey、自动拉题、线上资源与比赛大模型网关。" onClick={() => guard(() => openDialog("competition"))} />
+          <IntegrationCard icon={<Shield size={15} />} title="破甲提示词" desc="维护可复用的置顶系统提示词；然后在每个 Provider 模型上选择一项。" onClick={() => guard(() => openDialog("armor"))} />
         </div>
       </section>
 

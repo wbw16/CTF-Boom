@@ -1,19 +1,26 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Plus, Shield } from "lucide-react"
 import { useApp } from "../context"
 import { api, putJSON } from "../api"
-import { Modal } from "../ui"
+import { Modal, useDraftGuard } from "../ui"
 import type { ArmorPromptPreset } from "../types"
 
 export function ArmorPromptsDialog() {
   const { toast, openDialog, refresh } = useApp()
   const [draft, setDraft] = useState<ArmorPromptPreset[]>([])
   const [saving, setSaving] = useState(false)
+  const baseline = useRef("[]")
+  const guard = useDraftGuard(JSON.stringify(draft) !== baseline.current, saving)
+  const cancel = () => guard(() => openDialog("settings"))
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    void api<{ prompts: ArmorPromptPreset[] }>("/api/armor-prompts")
-      .then((result) => setDraft(structuredClone(result.prompts)))
-      .catch((error) => toast((error as Error).message, "error"))
+    const controller = new AbortController()
+    void api<{ prompts: ArmorPromptPreset[] }>("/api/armor-prompts", { signal: controller.signal })
+      .then((result) => { if (!controller.signal.aborted) { baseline.current = JSON.stringify(result.prompts); setDraft(structuredClone(result.prompts)) } })
+      .catch((error) => { if (!controller.signal.aborted) toast((error as Error).message, "error") })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false) })
+    return () => controller.abort()
   }, [toast])
 
   const add = () => {
@@ -43,24 +50,25 @@ export function ArmorPromptsDialog() {
 
   return (
     <Modal
+      busy={saving}
       title="破甲提示词"
       subtitle="这里维护具名提示词。模型选中后，内容会置于该模型每次调用的 Agent 系统提示词之前。"
       icon={<Shield size={16} />}
-      onClose={() => openDialog("settings")}
+      onClose={cancel}
       footer={
         <>
           <span className="field-hint" style={{ margin: 0, flex: 1 }}>
             删除并保存一个提示词时，引用它的模型会自动改为“不使用”。
           </span>
-          <button type="button" className="btn" onClick={() => openDialog("settings")}>取消</button>
-          <button type="button" className="btn btn-primary" disabled={saving} onClick={() => void save()}>
+          <button type="button" className="btn" disabled={saving} onClick={cancel}>取消</button>
+          <button type="button" className="btn btn-primary" disabled={saving || loading} onClick={() => void save()}>
             {saving ? "保存中…" : "保存提示词"}
           </button>
         </>
       }
     >
       <div className="inline-row" style={{ justifyContent: "flex-end", marginBottom: 10 }}>
-        <button type="button" className="btn btn-tiny" onClick={add}><Plus size={12} /> 提示词</button>
+        <button type="button" className="btn btn-tiny" disabled={loading || saving} onClick={add}><Plus size={12} /> 提示词</button>
       </div>
       <div className="armor-list">
         {draft.length === 0 ? (

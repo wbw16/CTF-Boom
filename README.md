@@ -332,6 +332,39 @@ boom mcp test remote-tools
 可以重复使用 `--agent`，将 MCP Server 限定给 `boom`、`boom-worker`、`boom-consultant`、
 `boom-pentest`、`boom-flag-hunt` 或 `boom-pentest-worker` 等指定角色。
 
+### REA 逆向工程集成
+
+Boom 内置 [REA](https://github.com/morluto/rea)（Reverse Engineer Anything）MCP 预设。REA 覆盖
+原生二进制、Electron/JavaScript、.NET、Android、固件、浏览器与运行时取证等约 170 个工具。
+Boom 不会把这些工具的完整 schema 注入模型上下文，而是通过两个桥接工具访问：
+
+- `rea_tools`：按关键字列出 REA 工具，或获取指定工具的完整输入 schema；
+- `rea_call`：以 `{tool, arguments}` 调用任意 REA 工具。
+
+桌面端在 **设置 → MCP Server → 内置集成 → 添加 REA** 中添加；命令行等价于：
+
+```sh
+boom mcp presets
+boom mcp install rea
+boom mcp test rea
+```
+
+预设默认授权给 `boom`、`boom-worker`、`boom-worker-pro`，超时为 120000ms。REA 通过
+`npx -y rea-agents@6.4.0 mcp` 启动，需要 Node.js 22.19+、24.11+ 或 26+（包含 `npx`）。
+
+使用本地源码（例如上级目录的 `rea` checkout）时：
+
+```sh
+# 验证并注册本地 checkout；--build 会在缺少产物时执行 npm ci && npm run build:cached
+bun scripts/install-rea.ts --source ../rea --build
+
+# 已构建的 checkout 可以省略 --build
+bun scripts/install-rea.ts --source ../rea
+```
+
+启用 `rea` Server 后，Boom 才会把 REA 技能安装到隔离 Runtime；禁用或删除该 Server 会同时移除
+技能。架构、权限边界与故障排查见 [REA 集成说明](./docs/REA.md)。
+
 ## 运行产物
 
 每次任务运行都会写入：
@@ -352,6 +385,10 @@ Boom 不把完整分析塞进聊天记录；可复现证据保留在 `work/`，�
 ```sh
 boom evaluate --root ./ctf
 ```
+
+重复试验支持 `boom run --experiment <label> --trials 3 --tokens <n> --slugs-file <path>`；
+每次创建独立任务，记录原始解题条件。用 `boom evaluate --label <新组> --baseline <基线组> --json`
+比较条件一致的试验。指标定义、固定题单和完整命令见 [解题评测说明](./SOLVER_EVALUATION.md)。
 
 ## 开发与验证
 

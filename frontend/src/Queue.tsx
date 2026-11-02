@@ -1,5 +1,5 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react"
-import { FolderInput, Pencil, Plus, Search } from "lucide-react"
+import { CheckCheck, Copy, Flag, FolderInput, Pencil, Plus, Search } from "lucide-react"
 import { useApp } from "./context"
 import { useActions } from "./actions"
 import { chooseDirectory } from "./bridge"
@@ -10,6 +10,8 @@ import {
   bucket,
   categoryOf,
   confirmedRun,
+  currentRun,
+  queueFlag,
   label,
   last,
   matches,
@@ -243,9 +245,9 @@ export function Queue() {
 function statusClasses(challenge: ChallengeGui, flagFormat: string) {
   const [statusText, statusColor] = label(challenge, flagFormat)
   if (statusColor === "c-run") return { statusText, statusClass: "running", dot: "running" }
-  if (statusColor === "c-ok") return { statusText, statusClass: "solved", dot: "running" }
+  if (statusColor === "c-ok") return { statusText, statusClass: "solved", dot: "confirmed" }
   if (statusColor === "c-err") return { statusText, statusClass: "failed", dot: "failed" }
-  if (statusColor === "c-warn") return { statusText, statusClass: "candidate", dot: "paused" }
+  if (statusColor === "c-warn") return { statusText, statusClass: "warn", dot: "paused" }
   return { statusText, statusClass: "queued", dot: "" }
 }
 
@@ -260,11 +262,20 @@ function QueueItem({
   onSelect: () => void
   onMenu: (x: number, y: number) => void
 }) {
-  const { data } = useApp()
+  const { data, toast } = useApp()
   const flagFormat = data?.settings.flagFormat ?? ""
-  const run = last(challenge)
-  const solved = !!confirmedRun(challenge)
+  const run = currentRun(challenge)
+  const flag = queueFlag(challenge, flagFormat)
   const { statusText, statusClass, dot } = statusClasses(challenge, flagFormat)
+  const copyFlag = async () => {
+    if (!flag) return
+    try {
+      await navigator.clipboard.writeText(flag.value)
+      toast("Flag 已复制")
+    } catch {
+      toast("复制失败，请在详情中手动复制 Flag", "error")
+    }
+  }
   const rounds = run?.turns?.length
     ? `第 ${run.turns.length} 轮`
     : challenge.runs.length > 1
@@ -273,34 +284,54 @@ function QueueItem({
 
   return (
     <article
-      className={`ctf-challenge${selected ? " selected" : ""}${solved ? " solved" : ""}`}
-      role="button"
-      tabIndex={0}
+      className={`ctf-challenge${selected ? " selected" : ""}${flag ? ` has-flag flag-${flag.status}` : ""}`}
+      aria-label={challenge.slug}
       data-slug={challenge.slug}
       onClick={onSelect}
-      onKeyDown={(event) => {
-        if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
-          event.preventDefault()
-          onSelect()
-        }
-      }}
       onContextMenu={(event) => {
         event.preventDefault()
         onMenu(event.clientX, event.clientY)
       }}
     >
-      <div className="ctf-challenge-row">
-        <i className={`state-dot ${dot}`} />
-        <span className="ctf-challenge-name">{challenge.slug}</span>
-        <span className="spacer" />
-        <span className={`ctf-status ${statusClass}`}>{statusText}</span>
-      </div>
-      <div className="ctf-challenge-info">
-        <span>{challenge.files.length} 个附件</span>
-        <span>·</span>
-        <span>{rounds}</span>
-        {run ? <span className="mono">{compactNumber(run.tokens)} tok</span> : null}
-      </div>
+      <button
+        type="button"
+        className="ctf-challenge-select"
+        aria-label={`查看题目 ${challenge.slug}`}
+        aria-current={selected ? "true" : undefined}
+        onClick={(event) => { event.stopPropagation(); onSelect() }}
+      >
+        <span className="ctf-challenge-row">
+          <i className={`state-dot ${dot}`} aria-hidden="true" />
+          <span className="ctf-challenge-name" title={challenge.slug}>{challenge.slug}</span>
+          <span className="spacer" />
+          <span className={`ctf-status ${statusClass}`}>{statusText}</span>
+        </span>
+        <span className="ctf-challenge-info">
+          <span>{challenge.files.length} 个附件</span>
+          <span>·</span>
+          <span>{rounds}</span>
+          {run ? <span className="mono">{compactNumber(run.tokens)} tok</span> : null}
+        </span>
+      </button>
+      {flag ? (
+        <div className="ctf-flag-result">
+          <div className="ctf-flag-label">
+            {flag.status === "confirmed" ? <CheckCheck size={14} /> : <Flag size={14} />}
+            <strong>{flag.label}</strong>
+            {flag.historical ? <span>历史任务</span> : null}
+          </div>
+          <button
+            type="button"
+            className="ctf-flag-copy"
+            aria-label={`复制 ${challenge.slug} 的 Flag`}
+            title={`${flag.value}\n点击复制完整 Flag`}
+            onClick={(event) => { event.stopPropagation(); void copyFlag() }}
+          >
+            <code>{flag.value}</code>
+            <span><Copy size={13} />复制</span>
+          </button>
+        </div>
+      ) : null}
     </article>
   )
 }

@@ -50,6 +50,7 @@ export type AppContextValue = {
   platform: PlatformSummary | null
   unreadNoticeCount: number
   select: (slug: string) => void
+  selectRun?: (id: string) => void
   setFilter: (value: string) => void
   toggleCollapsed: (category: string) => void
   refresh: () => Promise<void>

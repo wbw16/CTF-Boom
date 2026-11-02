@@ -32,7 +32,8 @@ import type {
   ArmorPromptPreset,
   ManagedProviderConfig,
 } from "./provider-config.ts"
-import type { ManagedMcpServer } from "./mcp-config.ts"
+import { BOOM_MCP_AGENT_IDS, type ManagedMcpServer } from "./mcp-config.ts"
+import { mcpPresets } from "./mcp-presets.ts"
 import {
   appendRunEvent,
   assertPathWithin,
@@ -140,6 +141,8 @@ export type GuiRunnerBackend = Pick<
   setCompetitionSettings?: GuiRunner["setCompetitionSettings"]
   getCompetitionState?: GuiRunner["getCompetitionState"]
   closeAllEnvironments?: GuiRunner["closeAllEnvironments"]
+  acquireRuntime?: GuiRunner["acquireRuntime"]
+  stopTask?: GuiRunner["stopTask"]
 }
 
 export type StartGuiOptions = {
@@ -288,7 +291,9 @@ function settingsFrom(input: Record<string, unknown>, fallback: GuiSettings): Gu
     typeof input.tokenBudgetEnabled === "boolean"
       ? input.tokenBudgetEnabled
       : fallback.tokenBudgetEnabled
-  const network = input.network === "deny" ? "deny" : "allow"
+  if (input.network !== undefined && input.network !== "deny" && input.network !== "allow")
+    throw new HttpError(400, "network must be allow or deny")
+  const network = input.network === undefined ? fallback.network : input.network
   // An explicit mode always wins so the top-bar switch can move in both directions; the fallback
   // only fills in roots whose saved state predates the mode axis.
   const mode = input.mode === "pentest" || input.mode === "ctf"
@@ -891,6 +896,7 @@ export async function startGuiServer(options: StartGuiOptions) {
   const pentestAgents = new PentestAgentManager({
     root: () => root,
     ensureRuntime: () => runner.ensureRuntime(),
+    acquireRuntime: runner.acquireRuntime ? () => runner.acquireRuntime!() : undefined,
     model: () => persisted.settings.strongModel,
     tokenBudget: () => (persisted.settings.tokenBudgetEnabled ? persisted.settings.tokens : undefined),
     onEvent: (slug) => {
@@ -1241,6 +1247,10 @@ export async function startGuiServer(options: StartGuiOptions) {
           const input = await body(request)
           return await exclusive(async () => {
             const settings = settingsFrom(input, persisted.settings)
+            const previousEnvironment = input.defaultProfileId === undefined ? undefined : await loadEnvironmentStore()
+            if (previousEnvironment && (typeof input.defaultProfileId !== "string" ||
+                !previousEnvironment.profiles.some((profile) => profile.id === input.defaultProfileId)))
+              throw new HttpError(400, "defaultProfileId must be an existing environment profile")
             if (settings.visionModel) {
               const models = await runner.getModels()
               if (!models.some((model) =>
@@ -1249,14 +1259,30 @@ export async function startGuiServer(options: StartGuiOptions) {
             }
             const nextPersisted: RootGuiState = { ...persisted, settings }
             await saveRootGuiState(root, nextPersisted)
+            if (previousEnvironment) {
+              try {
+                await saveEnvironmentStore({ ...previousEnvironment, defaultProfileId: input.defaultProfileId as string })
+              } catch (error) {
+                await saveRootGuiState(root, persisted)
+                throw error
+              }
+            }
             persisted = nextPersisted
             runner.setConcurrency(settings.concurrency)
             // Optional so an injected test backend need not implement the competition scheduler.
             runner.setCompetitionSettings?.(settings.competition)
             autopilot.setIntervalMs((settings.competition.refreshIntervalMinutes ?? 10) * 60_000)
-            const switches = await runner.applyLiveModelSettings(settings)
+            let switches: Awaited<ReturnType<GuiRunnerBackend["applyLiveModelSettings"]>> | undefined
+            try {
+              switches = await runner.applyLiveModelSettings(settings)
+            } catch (error) {
+              broadcast({ at: Date.now(), type: "settings.changed" })
+              if (previousEnvironment) broadcast({ at: Date.now(), type: "environments.changed" })
+              return json({ settings, saved: true, applied: false, applyError: error instanceof Error ? error.message : String(error) })
+            }
             broadcast({ at: Date.now(), type: "settings.changed" })
-            return json({ settings, switches })
+            if (previousEnvironment) broadcast({ at: Date.now(), type: "environments.changed" })
+            return json({ settings, switches, saved: true, applied: true })
           })
         }
 
@@ -2012,7 +2038,11 @@ export async function startGuiServer(options: StartGuiOptions) {
         }
 
         if (request.method === "GET" && url.pathname === "/api/mcp")
-          return json({ servers: await runner.getMcpServers() })
+          return json({
+            servers: await runner.getMcpServers(),
+            agents: BOOM_MCP_AGENT_IDS,
+            presets: mcpPresets(),
+          })
 
         const mcpTestMatch = /^\/api\/mcp\/([^/]+)\/test$/.exec(url.pathname)
         if (request.method === "POST" && mcpTestMatch) {
@@ -2581,6 +2611,7 @@ export async function startGuiServer(options: StartGuiOptions) {
                 source: "user",
                 detail: "User confirmed candidate outside the solver workspace",
               })
+              await runner.stopTask?.(found.slug, selected.id)
               broadcast({
                 at: Date.now(),
                 type: "task.flag-accepted",
@@ -2590,6 +2621,7 @@ export async function startGuiServer(options: StartGuiOptions) {
               return json({ ok: true }, 202)
             }
 
+            await runner.stopTask?.(found.slug, selected.id)
             await rejectTaskFlag(directory, flag)
             const settings = persisted.settings
             const model = settings.strongModel

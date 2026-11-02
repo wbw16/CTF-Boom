@@ -569,6 +569,13 @@ export type McpServerDetails = McpServer & {
   runtime: McpRuntimeStatus
 }
 
+export type McpPreset = {
+  id: string
+  name: string
+  description: string
+  server: McpServer
+}
+
 export type RunnerNotification = {
   instanceID?: string
   at: number

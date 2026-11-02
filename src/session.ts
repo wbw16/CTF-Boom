@@ -13,6 +13,7 @@ import type {
   RuntimeUsage,
 } from "./runtime-contract.ts"
 import { compilePromptText, createPromptBundle } from "./runtime/prompt.ts"
+import { PromptUsageCollector } from "./runtime-turn.ts"
 import type { Workspace } from "./workspace.ts"
 
 export type Limits = {
@@ -78,6 +79,7 @@ export type Outcome = {
   detail?: string
   /** Provider finish reason. Only `stop` is a normal ending; `length` means truncated or throttled. */
   finish?: string
+  rawFinish?: string
   /** Part-type histogram for the final message, for diagnosing runs that produced nothing. */
   parts?: Record<string, number>
   /** One entry per retry, recording what failed. Empty when the run needed none. */
@@ -683,7 +685,19 @@ export async function runChallenge(input: {
   /** Same usage with cache reads discounted; only this is compared against the limit. */
   let billable = 0
   let cost = 0
-  let steps = 0
+  let promptUsage = new PromptUsageCollector()
+  let priorTokens = 0
+  let priorBillable = 0
+  let priorCost = 0
+  let promptCount = 0
+  let terminalPrompt: (() => void) | undefined
+  let terminalSeen = false
+  const reconcileUsage = () => {
+    const snapshot = promptUsage.snapshot()
+    tokens = priorTokens + messageTokens(snapshot.usage)
+    billable = priorBillable + budgetTokens(snapshot.usage)
+    cost = priorCost + snapshot.cost
+  }
   let stop: Outcome["stop"] | undefined
   let detail: string | undefined
   let previous: string | undefined
@@ -1007,6 +1021,11 @@ export async function runChallenge(input: {
       // Any event at all is proof the runtime is still alive, so the watchdog restarts here rather
       // than per event type.
       armSilence()
+      if (event.type === "finish" || event.type === "cancelled" ||
+          (event.type === "conversation-state" && ["completed", "cancelled", "failed"].includes(event.state))) {
+        terminalSeen = true
+        terminalPrompt?.()
+      }
       if (event.type === "compaction") {
         await emit({
           type: "status",
@@ -1033,10 +1052,8 @@ export async function runChallenge(input: {
         // Each step-finish reports that step's own usage — upstream overwrites `tokens` per step and
         // only accumulates `cost`. Summing is therefore required to bound a whole session; taking the
         // maximum would charge a multi-step run for its single largest step.
-        steps += 1
-        tokens += messageTokens(event.usage)
-        billable += budgetTokens(event.usage)
-        cost = Math.max(cost, event.cost)
+        promptUsage.step(event.usage, event.cost, event.stepID)
+        reconcileUsage()
         if (input.limits.tokens !== undefined && billable > input.limits.tokens)
           await abort(
             "budget",
@@ -1122,6 +1139,7 @@ export async function runChallenge(input: {
       ) {
         markDurable()
         toolsSinceDurable = 0
+        noteGatePending = false
       }
       if (
         event.state.status !== "running" &&
@@ -1201,7 +1219,9 @@ export async function runChallenge(input: {
       if (repeats >= input.limits.repeats)
         await abort("stalled", `repeated the same ${event.tool} call ${repeats}x: ${signature.slice(0, 120)}`)
     }
-  })()
+  })().catch(async (error) => {
+    if (!subscription.signal.aborted) await abort("error", `runtime event stream failed: ${describe(error)}`)
+  })
 
   // Transient provider failures — a TLS handshake, a 5xx, a rate limit — otherwise kill the whole
   // challenge on first contact and burn its entire budget for nothing. Retrying continues the same
@@ -1216,13 +1236,34 @@ export async function runChallenge(input: {
   const cancelSources = [input.signal, subscription.signal].filter(
     (signal): signal is AbortSignal => signal !== undefined,
   )
-  const sendPrompt = (text: string) =>
-    conversation.prompt({
+  const sendPrompt = async (text: string) => {
+    if (promptCount++ > 0) {
+      priorTokens = tokens
+      priorBillable = billable
+      priorCost = cost
+      promptUsage = new PromptUsageCollector()
+      terminalSeen = false
+    }
+    const terminal = new Promise<void>((resolve) => { terminalPrompt = resolve })
+    if (terminalSeen) terminalPrompt?.()
+    const message = await conversation.prompt({
       agent: AGENT,
       model: input.model,
       text,
       ...(cancelSources.length > 0 ? { signal: AbortSignal.any(cancelSources) } : {}),
     })
+    // Retain each request's fallback before recovery can replace it. A bounded terminal drain
+    // lets late step events reconcile with that fallback instead of being charged twice.
+    promptUsage.result(message)
+    reconcileUsage()
+    let drain: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([terminal, watching.catch(() => {}), new Promise<void>((resolve) => {
+      drain = setTimeout(resolve, 250)
+    })])
+    if (drain) clearTimeout(drain)
+    reconcileUsage()
+    return message
+  }
   const retried: string[] = []
   const retryBaseMs = Math.max(0, Math.floor(input.limits.retryBaseMs ?? 2_000))
   const promptWithProviderRecovery = async (initialText: string, label: string) => {
@@ -1237,6 +1278,11 @@ export async function runChallenge(input: {
         lastResult = undefined
       }
       const failure = thrown ?? lastResult?.error
+      if (input.limits.tokens !== undefined && billable > input.limits.tokens && stop === undefined &&
+        lastResult?.finish !== "length") {
+        await abort("budget", `token budget exceeded: ${Math.round(billable)} > ${input.limits.tokens}`)
+        return lastResult
+      }
       if (failure === undefined) return lastResult
 
       // A rejected attachment is permanent for that file but not for the challenge: the agent can
@@ -1351,8 +1397,7 @@ export async function runChallenge(input: {
       finish,
       result?.parts ?? [],
     ).catch(() => {})
-    const finalUsage = result?.usage
-    const estimatedBillable = billable + (steps === 0 && finalUsage ? budgetTokens(finalUsage) : 0)
+    const estimatedBillable = billable
     const remainingTime = input.limits.timeout - (Date.now() - runStarted)
     if (input.limits.tokens !== undefined && estimatedBillable >= input.limits.tokens) {
       await abort("budget", `${finish} recovery skipped because no billable token budget remains`)
@@ -1402,15 +1447,8 @@ export async function runChallenge(input: {
   ])
 
   const message = result
-  if (message) {
-    // `message.tokens` holds only the final step's usage, so it must not overwrite the running sum.
-    // It is the sole source when no step-finish event arrived — a single-step or aborted run.
-    if (steps === 0) {
-      tokens = message.usage ? messageTokens(message.usage) : 0
-      billable = message.usage ? budgetTokens(message.usage) : 0
-    }
-    cost = Math.max(cost, message.cost)
-  }
+  if (input.limits.tokens !== undefined && billable > input.limits.tokens && stop === undefined)
+    await abort("budget", `token budget exceeded: ${Math.round(billable)} > ${input.limits.tokens}`)
   if (result?.error && stop === undefined) {
     stop = "error"
     detail = `${classifyProviderFailure(result.error)}: ${describe(result.error)}`
@@ -1433,7 +1471,7 @@ export async function runChallenge(input: {
   const finish = message?.finish
   if (stop === undefined && finish !== undefined && finish !== "stop" && finish !== "tool-calls") {
     stop = "error"
-    detail = `provider finish reason: ${finish}`
+    detail = `provider finish reason: ${finish}${message?.rawFinish ? ` (${message.rawFinish})` : ""}`
   }
   // Zero text and zero tool calls means the model never engaged with the challenge. Reporting that as
   // `completed` hid roughly a fifth of all runs as "finished with no result".
@@ -1520,6 +1558,7 @@ export async function runChallenge(input: {
     verification,
     detail,
     finish,
+    ...(message?.rawFinish ? { rawFinish: message.rawFinish } : {}),
     parts: histogram,
     retries: retried,
     consultationRequest,

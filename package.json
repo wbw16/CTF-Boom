@@ -43,6 +43,7 @@
     "prototype/boom-gui-v3.js",
     "resources",
     "scripts/import-ctftiny.ts",
+    "scripts/install-rea.ts",
     "src"
   ],
   "scripts": {
@@ -50,7 +51,7 @@
     "build:web": "vite build",
     "dev:web": "vite",
     "gui": "bun src/index.ts gui",
-    "test": "bun run build:web && bun test test/",
+    "test": "bun run build:web && bun test ./test",
     "typecheck": "tsc --noEmit && tsc --noEmit -p frontend/tsconfig.json",
     "prepack": "bun run typecheck && bun run test",
     "pack:check": "bun scripts/verify-package.ts"

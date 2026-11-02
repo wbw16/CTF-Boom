@@ -4,7 +4,8 @@ import { gunzipSync } from "node:zlib"
 import os from "node:os"
 import path from "node:path"
 import { guardUnhandledRejections, mergeTransient, resolveInitialWorkspaceRoot, startGuiServer, type GuiRunnerBackend } from "../src/gui.ts"
-import { DEFAULT_GUI_SETTINGS, loadLastGuiRoot, saveLastGuiRoot, saveRootGuiState } from "../src/gui-state.ts"
+import { DEFAULT_GUI_SETTINGS, loadLastGuiRoot, loadRootGuiState, saveLastGuiRoot, saveRootGuiState } from "../src/gui-state.ts"
+import { loadEnvironmentStore, saveEnvironmentStore, type PythonEnvironmentProfile } from "../src/environment.ts"
 import type { RunHistory } from "../src/history.ts"
 import { GuiRunner, type McpServerDetails } from "../src/runner.ts"
 
@@ -15,6 +16,7 @@ type HarnessOptions = {
   freshRoot?: boolean
   /** Put category folders directly under the root without a wrapping challenges/. */
   categoryRoot?: boolean
+  applyFailure?: string
 }
 
 async function exists(target: string) {
@@ -133,6 +135,7 @@ async function harness(options: HarnessOptions = {}) {
       return value
     },
     async applyLiveModelSettings() {
+      if (options.applyFailure) throw new Error(options.applyFailure)
       return { active: 0, queued: 0, warnings: [] }
     },
     hasWork: () => false,
@@ -352,6 +355,56 @@ describe("GUI host survival", () => {
 })
 
 describe("GUI HTTP surface", () => {
+  test("validates and saves settings with the default environment in one request", async () => {
+    const one = await harness()
+    try {
+      const profile: PythonEnvironmentProfile = {
+        id: "fixture-python-a", displayName: "Fixture Python", kind: "python",
+        interpreter: "/fixture/python", pythonVersion: "3.12", architecture: "arm64",
+        packages: {}, installPolicy: "deny", fingerprint: "fixture", status: "ready",
+      }
+      await saveEnvironmentStore({ version: 1, defaultProfileId: profile.id, profiles: [
+        profile, { ...profile, id: "fixture-python-b" },
+      ] })
+      const invalid = await request(one, "/api/settings", "PATCH", {
+        network: "deny", defaultProfileId: "missing-profile",
+      })
+      expect(invalid.status).toBe(400)
+      expect((await loadRootGuiState(await realpath(one.root))).settings.network).toBe("allow")
+      expect((await loadEnvironmentStore()).defaultProfileId).toBe(profile.id)
+      const saved = await request(one, "/api/settings", "PATCH", {
+        network: "deny", defaultProfileId: "fixture-python-b",
+      })
+      expect(saved.status).toBe(200)
+      expect(await saved.json()).toMatchObject({ saved: true, applied: true, settings: { network: "deny" } })
+      expect((await loadRootGuiState(await realpath(one.root))).settings.network).toBe("deny")
+      expect((await loadEnvironmentStore()).defaultProfileId).toBe("fixture-python-b")
+    } finally { await one.close() }
+  })
+
+  test("reports saved settings separately from a failed runtime apply", async () => {
+    const one = await harness({ applyFailure: "fixture runtime reload failed" })
+    try {
+      const response = await request(one, "/api/settings", "PATCH", { network: "deny", concurrency: 2 })
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({
+        saved: true, applied: false, applyError: "fixture runtime reload failed", settings: { network: "deny", concurrency: 2 },
+      })
+      expect((await loadRootGuiState(await realpath(one.root))).settings.network).toBe("deny")
+      expect((await request(one, "/api/state")).status).toBe(200)
+    } finally { await one.close() }
+  })
+
+  test("partial settings updates preserve the saved network policy", async () => {
+    const one = await harness()
+    try {
+      expect((await request(one, "/api/settings", "PATCH", { network: "deny" })).status).toBe(200)
+      const response = await request(one, "/api/settings", "PATCH", { mode: "pentest" })
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({ settings: { mode: "pentest", network: "deny" } })
+      expect((await request(one, "/api/settings", "PATCH", { network: "invalid" })).status).toBe(400)
+    } finally { await one.close() }
+  })
   test("manages pentest task lifecycle and creates evidence-backed Flag objectives", async () => {
     const one = await harness()
     try {
@@ -1469,11 +1522,12 @@ describe("GUI challenge authoring", () => {
       const added = await request(one, "/api/challenges/alpha/files", "POST", { sources: [source] })
       expect(added.status).toBe(201)
       expect((await added.json()) as { files: string[] }).toMatchObject({ files: ["second.bin"] })
-      expect(await readFile(path.join(one.challenge, "files", "second.bin"), "utf8")).toBe("second")
+      expect(await readFile(path.join(one.challenge, "second.bin"), "utf8")).toBe("second")
+      expect(await readFile(path.join(one.challenge, "payload.txt"), "utf8")).toBe("payload")
 
       const removed = await request(one, "/api/challenges/alpha/files/second.bin", "DELETE")
       expect(removed.status).toBe(200)
-      expect(await exists(path.join(one.challenge, "files", "second.bin"))).toBe(false)
+      expect(await exists(path.join(one.challenge, "second.bin"))).toBe(false)
 
       const missing = await request(one, "/api/challenges/alpha/files/absent.bin", "DELETE")
       expect(missing.status).toBe(404)

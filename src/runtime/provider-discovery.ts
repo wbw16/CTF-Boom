@@ -2,7 +2,7 @@ import type {
   RuntimeProviderDiscoveryInput,
   RuntimeProviderModel,
 } from "../runtime-contract.ts"
-import { BOOM_CONTEXT_LIMIT } from "../provider-config.ts"
+import { runtimeModelLimits } from "../model-context.ts"
 import {
   anthropicProviderBaseURL,
   providerFailure,
@@ -20,13 +20,16 @@ function discoverableOpenAIModel(id: string) {
   return /^(?:gpt-|o\d|chatgpt-|codex-|computer-use-|deep-research-)/.test(id)
 }
 
-function defaultModel(id: string, name: string): RuntimeProviderModel {
+function defaultModel(id: string, name: string, metadata: Record<string, unknown>): RuntimeProviderModel {
+  const limit = object(metadata.limit)
+  const context = limit?.context ?? metadata.context_length ?? metadata.context_window ?? metadata.context
+  const output = limit?.output ?? metadata.max_output_tokens
   return {
     id,
     name,
-    limit: { context: BOOM_CONTEXT_LIMIT, output: 16_384 },
-    reasoning: false,
-    attachment: false,
+    limit: runtimeModelLimits(context, typeof output === "number" && output > 0 ? output : 16_384),
+    reasoning: metadata.reasoning === true,
+    attachment: metadata.attachment === true,
   }
 }
 
@@ -76,7 +79,7 @@ export async function discoverRemoteProviderModels(
       : typeof item?.name === "string" && item.name.trim()
         ? item.name.trim()
         : id
-    return [defaultModel(id, name)]
+    return [defaultModel(id, name, item!)]
   })
   const unique = [...new Map(models.map((model) => [model.id, model])).values()]
     .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))

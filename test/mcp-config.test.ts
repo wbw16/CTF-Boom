@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import {
   compileOpenCodeMcpConfig,
+  BOOM_MCP_AGENT_IDS,
   loadMcpStore,
   managedMcpAvailableToAgent,
   mcpStorePath,
@@ -13,6 +14,14 @@ import {
 } from "../src/mcp-config.ts"
 
 describe("Boom-managed MCP configuration", () => {
+  test("every shipped agent can be explicitly granted MCP access", () => {
+    const server = normalizeManagedMcpServer({ id: "all-agents", type: "remote", url: "https://example.test/mcp", agents: [...BOOM_MCP_AGENT_IDS] })
+    expect(server.agents).toEqual([...BOOM_MCP_AGENT_IDS])
+    expect(server.agents).toContain("boom-worker-pro")
+    expect(server.agents).toContain("boom-pentest")
+    expect(server.agents).toContain("boom-flag-hunt")
+    expect(server.agents).toContain("boom-pentest-worker")
+  })
   test("normalizes remote and local servers and compiles OpenCode environment references", () => {
     const remote = normalizeManagedMcpServer({
       id: "github",

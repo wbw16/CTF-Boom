@@ -139,7 +139,7 @@ describe("Boom runtime contract", () => {
               async *[Symbol.asyncIterator]() {
                 const usage = { input: 4, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }
                 yield { type: "step-finish", sessionID: "budgeted", usage, cost: 0.1 } as const
-                yield { type: "step-finish", sessionID: "budgeted", usage, cost: 0.2 } as const
+                yield { type: "step-finish", sessionID: "budgeted", usage, cost: 0.1 } as const
                 yield { type: "finish", sessionID: "budgeted", reason: "cancelled" } as const
               },
             }

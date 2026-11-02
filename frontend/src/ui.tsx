@@ -12,6 +12,20 @@ export type SelectOption<T extends string = string> = {
   group?: string
 }
 
+export function useDraftGuard(dirty: boolean, busy = false) {
+  useEffect(() => {
+    if (!dirty) return
+    const beforeUnload = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = "" }
+    window.addEventListener("beforeunload", beforeUnload)
+    return () => window.removeEventListener("beforeunload", beforeUnload)
+  }, [dirty])
+  return (operation: () => void) => {
+    if (busy) return
+    if (dirty && !window.confirm("有未保存的修改，确定放弃修改？")) return
+    operation()
+  }
+}
+
 type SelectProps<T extends string> = {
   value?: T
   selected?: T[]
@@ -42,6 +56,7 @@ export function Select<T extends string>({
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState("")
   const rootRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
   const multi = multiple || !!onToggle
   const picked = multi ? (selected ?? []) : value
@@ -51,20 +66,18 @@ export function Select<T extends string>({
     const onPointerDown = (event: PointerEvent) => {
       if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false)
     }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false)
-    }
     document.addEventListener("pointerdown", onPointerDown)
-    document.addEventListener("keydown", onKeyDown)
     return () => {
       document.removeEventListener("pointerdown", onPointerDown)
-      document.removeEventListener("keydown", onKeyDown)
     }
   }, [open])
 
   useEffect(() => {
-    if (open) searchRef.current?.focus()
-  }, [open])
+    if (!open) return
+    if (searchable) searchRef.current?.focus()
+    else (rootRef.current?.querySelector<HTMLButtonElement>(".select-option[aria-selected='true']:not([disabled])") ??
+      rootRef.current?.querySelector<HTMLButtonElement>(".select-option:not([disabled])"))?.focus()
+  }, [open, searchable])
 
   const needle = query.trim().toLowerCase()
   const visible = options.filter(
@@ -89,12 +102,47 @@ export function Select<T extends string>({
       onChange?.(option.value)
       setOpen(false)
       setQuery("")
+      triggerRef.current?.focus()
     }
   }
 
   return (
-    <div className={`select ${className}`} ref={rootRef}>
+    <div className={`select ${className}`} ref={rootRef} onKeyDown={(event) => {
+      if (!open) {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault()
+          setQuery("")
+          setOpen(true)
+        }
+        return
+      }
+      if (event.key === "Escape") {
+        event.preventDefault()
+        event.stopPropagation()
+        setOpen(false)
+        triggerRef.current?.focus()
+        return
+      }
+      const choices = [...(rootRef.current?.querySelectorAll<HTMLButtonElement>(".select-option:not([disabled])") ?? [])]
+      const index = choices.indexOf(document.activeElement as HTMLButtonElement)
+      if (event.key === "Enter" && event.target === searchRef.current) {
+        event.preventDefault()
+        choices[0]?.click()
+        return
+      }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault()
+        if (!choices.length) return
+        const next = index < 0 ? (event.key === "ArrowDown" ? 0 : choices.length - 1)
+          : (index + (event.key === "ArrowDown" ? 1 : -1) + choices.length) % choices.length
+        choices[next]?.focus()
+      } else if ((event.key === "Home" || event.key === "End") && index >= 0) {
+        event.preventDefault()
+        ;(event.key === "Home" ? choices[0] : choices.at(-1))?.focus()
+      }
+    }}>
       <button
+        ref={triggerRef}
         type="button"
         className={`select-trigger${open ? " open" : ""}`}
         aria-haspopup="listbox"
@@ -113,7 +161,7 @@ export function Select<T extends string>({
         <span className="select-caret">{open ? <ChevronDown size={15} /> : <ChevronsUpDown size={15} />}</span>
       </button>
       {open ? (
-        <div className="select-popover" role="listbox">
+        <div className="select-popover" role="listbox" aria-multiselectable={multi || undefined}>
           {searchable ? (
             <div className="select-search">
               <Search size={13} aria-hidden="true" />
@@ -121,6 +169,7 @@ export function Select<T extends string>({
                 ref={searchRef}
                 type="search"
                 placeholder="搜索…"
+                aria-label="搜索选项"
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
               />
@@ -177,12 +226,34 @@ type ModalProps = {
   nav?: ReactNode
   wide?: boolean
   className?: string
+  busy?: boolean
 }
 
-export function Modal({ title, subtitle, icon, onClose, children, footer, nav, wide, className = "" }: ModalProps) {
+export function Modal({ title, subtitle, icon, onClose, children, footer, nav, wide, busy = false, className = "" }: ModalProps) {
+  const modalRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null
+    const modal = modalRef.current
+    const first = modal?.querySelector<HTMLElement>("input:not([disabled]), textarea:not([disabled]), select:not([disabled]), button:not([disabled])")
+    ;(first ?? modal)?.focus()
+    return () => { if (previous?.isConnected) previous.focus() }
+  }, [])
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !(event.target as HTMLElement).closest?.(".select")) onClose()
+      if (event.key === "Escape" && !event.defaultPrevented) { event.preventDefault(); onClose() }
+      if (event.key !== "Tab") return
+      const modal = modalRef.current
+      if (!modal) return
+      const targets = [...modal.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex='0']")]
+        .filter((item) => item.getClientRects().length > 0 && !item.closest("[inert]"))
+      const first = targets[0]
+      const last = targets.at(-1)
+      if (!first) { event.preventDefault(); modal.focus(); return }
+      if (event.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) {
+        event.preventDefault(); last?.focus()
+      } else if (!event.shiftKey && (document.activeElement === last || !modal.contains(document.activeElement))) {
+        event.preventDefault(); first.focus()
+      }
     }
     document.addEventListener("keydown", onKeyDown)
     return () => document.removeEventListener("keydown", onKeyDown)
@@ -192,7 +263,7 @@ export function Modal({ title, subtitle, icon, onClose, children, footer, nav, w
     <div className="modal-backdrop" onPointerDown={(event) => {
       if (event.target === event.currentTarget) onClose()
     }}>
-      <div className={`modal${wide ? " wide" : ""}${className ? ` ${className}` : ""}`} role="dialog" aria-modal="true" aria-label={title}>
+      <div ref={modalRef} tabIndex={-1} className={`modal${wide ? " wide" : ""}${className ? ` ${className}` : ""}`} role="dialog" aria-modal="true" aria-label={title}>
         <div className="modal-head">
           {icon ? <span className="integ-icon">{icon}</span> : null}
           <div>
@@ -200,15 +271,15 @@ export function Modal({ title, subtitle, icon, onClose, children, footer, nav, w
             {subtitle ? <p>{subtitle}</p> : null}
           </div>
           <span className="spacer" />
-          <button type="button" className="icon-btn" aria-label="关闭" onClick={onClose}>
+          <button type="button" className="icon-btn" aria-label="关闭" disabled={busy} onClick={onClose}>
             <X size={16} />
           </button>
         </div>
-        <div className={`modal-body${nav ? " split" : ""}`}>
+        <div className={`modal-body${nav ? " split" : ""}`} inert={busy || undefined} aria-busy={busy}>
           {nav}
           <div className="modal-main">{children}</div>
         </div>
-        {footer ? <div className="modal-foot">{footer}</div> : null}
+        {footer ? <div className="modal-foot" inert={busy || undefined}>{footer}</div> : null}
       </div>
     </div>
   )

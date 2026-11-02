@@ -32,13 +32,45 @@ function hasDurableNotes(notes: string) {
     "NOTES",
     "Shared cross-turn, cross-model task memory. Maintained by the ctf-note tool.",
     "这是跨轮次、跨模型共享的任务记忆。由 ctf-note 工具维护。",
+    "Recover and verify the challenge flag.",
+    "- None yet.",
+    "- Read the challenge statement and attachments.",
   ])
   return notes.split(/\r?\n/).some((line) => {
     const trimmed = line.trim()
-    return trimmed !== "" && !structuralLines.has(trimmed)
+    return trimmed !== "" && !/^#{1,6}\s/.test(trimmed) && !structuralLines.has(trimmed)
   })
 }
 
+/** Retain every core state section and the newest appended notes when the checkpoint is long. */
+function compactNotes(notes: string) {
+  if (notes.length <= MAX_NOTES) return notes.trim()
+  const sections = notes.split(/(?=^## )/m)
+  const priority = (section: string) => {
+    const title = section.split("\n", 1)[0]!.toLowerCase()
+    if (/current goal|目标|block|阻塞/.test(title)) return 0
+    if (/next steps|下一步/.test(title)) return 1
+    if (/confirmed facts|已确认|确认事实/.test(title)) return 2
+    if (/hypotheses|假设/.test(title)) return 3
+    if (/ruled.out|已排除/.test(title)) return 4
+    if (/key artifacts|关键产物|证据/.test(title)) return 5
+    return 6
+  }
+  const selected = sections.map((text, index) => ({ text, index }))
+    .filter(({ text }) => text.startsWith("## "))
+    .sort((a, b) => priority(a.text) - priority(b.text) || b.index - a.index)
+    .slice(0, 8)
+  if (!selected.length) {
+    const half = Math.floor((MAX_NOTES - 120) / 2)
+    return `${notes.slice(0, half)}\n[中间内容省略；完整记录见 NOTES.md]\n${notes.slice(-half)}`
+  }
+  const limit = Math.floor((MAX_NOTES - 120) / selected.length)
+  return selected.map(({ text }) => {
+    if (text.length <= limit) return text.trim()
+    const half = Math.floor((limit - 50) / 2)
+    return `${text.slice(0, half)}\n[本节中间内容省略]\n${text.slice(-half)}`
+  }).join("\n\n") + "\n[摘要经过截取；完整记录见 NOTES.md]"
+}
 /** A minimal, defensive view of one task event record. */
 type EventLogLine = {
   at: number
@@ -183,7 +215,7 @@ export async function buildHandoffSummary(input: {
     "## Current task state",
     `Status: ${input.task.status} · ${input.task.turns.length} turns run · ${input.task.rejectedFlags.length} candidates excluded.`,
   ]
-  if (durableNotes) lines.push("", "## Durable checkpoint (NOTES.md)", bounded(notes, MAX_NOTES))
+  if (durableNotes) lines.push("", "## Durable checkpoint (NOTES.md)", compactNotes(notes))
   if (!durableNotes && activity) {
     lines.push(
       "",

@@ -78,7 +78,10 @@ export type RuntimeEvent =
   | {
       type: "step-finish"
       sessionID: string
+      /** Stable step id when the transport can replay updates. */
+      stepID?: string
       usage: RuntimeUsage
+      /** Cost of this step, before prompt/session aggregation. */
       cost: number
       reason?: RuntimeFinishReason
     }
@@ -148,6 +151,8 @@ export type RuntimePromptResult = {
   usage?: RuntimeUsage
   cost: number
   finish?: RuntimeFinishReason
+  /** Bounded, redacted provider finish value, retained when normalization reports unknown. */
+  rawFinish?: string
   error?: RuntimeFailure
   requestID?: string
 }
@@ -240,7 +245,7 @@ export type RuntimeModelPricing = {
 export type RuntimeProviderModel = {
   id: string
   name: string
-  limit: { context: number; output: number }
+  limit: { context: number; output: number; input?: number }
   reasoning: boolean
   attachment: boolean
   pricing?: RuntimeModelPricing
@@ -333,6 +338,12 @@ export interface RuntimeHandle {
   readonly provider?: ProviderRuntime
   readonly mcp?: McpRuntime
   close(): void | Promise<void>
+}
+
+/** A consumer keeps its runtime generation alive until its current operation finishes. */
+export type RuntimeLease = {
+  handle: RuntimeHandle
+  release: () => void
 }
 
 export type RuntimeLauncherOptions = {

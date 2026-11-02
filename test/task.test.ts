@@ -4,14 +4,44 @@ import os from "node:os"
 import path from "node:path"
 import {
   archiveTask,
+  acceptTaskFlag,
   loadOrCreateTask,
   loadTaskRecord,
   rejectTaskFlag,
   saveTaskRecord,
   taskTotals,
+  updateTaskRecord,
 } from "../src/task.ts"
 
 describe("durable task metadata", () => {
+  test("refuses to overwrite corrupt task history or mutate its identity", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "boom-task-corrupt-"))
+    try {
+      const seed = { id: "task", slug: "sample", model: "test/model" }
+      await loadOrCreateTask(directory, seed)
+      await expect(updateTaskRecord(directory, (task) => { task.id = "wrong"; return task }))
+        .rejects.toThrow("identity")
+      expect((await loadTaskRecord(directory))?.id).toBe("task")
+      await writeFile(path.join(directory, "task.json"), "{broken")
+      await expect(loadOrCreateTask(directory, seed)).rejects.toThrow("refusing to replace")
+      expect(await Bun.file(path.join(directory, "task.json")).text()).toBe("{broken")
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+  test("concurrent turn updates merge with manual acceptance", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "boom-task-race-"))
+    try {
+      await loadOrCreateTask(directory, { id: "task", slug: "sample", model: "test/model" })
+      await Promise.all([
+        acceptTaskFlag({ directory, flag: "flag{manual}", source: "manual", detail: "reviewed" }),
+        updateTaskRecord(directory, (task) => {
+          task.currentModel = "test/next"
+          task.status = task.acceptedFlag ? "solved" : "paused"
+          return task
+        }),
+      ])
+      expect(await loadTaskRecord(directory)).toMatchObject({ status: "solved", currentModel: "test/next", acceptedFlag: { value: "flag{manual}" } })
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
   test("keeps multiple model turns in one workspace and aggregates their usage", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "boom-task-"))
     try {

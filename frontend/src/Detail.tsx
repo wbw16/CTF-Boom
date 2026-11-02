@@ -8,6 +8,7 @@ import { renderMarkdown } from "./markdown"
 import { HeaderUtilities } from "./HeaderUtilities"
 import {
   alternatives,
+  activeCandidate,
   categoryOf,
   currentRun,
   displayFlagRun,
@@ -43,7 +44,7 @@ function hms(ms: number) {
 
 /** CTF-mode main surface: the pinned competition strip, the challenge header, flag verdict, and the three panes. */
 export function Detail() {
-  const { data, selected, detail, now, toast, refresh, loadDetail, openDialog, openChallengeEditor, platform, unreadNoticeCount, setSidebarOpen } = useApp()
+  const { data, selected, detail, now, toast, refresh, loadDetail, openDialog, openChallengeEditor, platform, unreadNoticeCount, setSidebarOpen, selectRun } = useApp()
   const actions = useActions()
   const [tab, setTab] = useState<Tab>("activity")
   const [hint, setHint] = useState("")
@@ -233,27 +234,28 @@ export function Detail() {
       </main>
     )
   }
-  const run = detail
+  const latest = currentRun(challenge)
+  const run = isLive(latest) ? latest : detail
     ? challenge.runs.find((item) => item.id === detail.id) ?? currentRun(challenge)
     : currentRun(challenge)
   const live = isLive(run)
   const settings = data.settings
-  const flagRun = displayFlagRun(challenge, run)
+  const flagRun = activeCandidate(run) ? run : displayFlagRun(challenge, run)
   const flag = primary(flagRun)
   const mismatch = flag && formatMismatch(flagRun, flag, settings.flagFormat)
   const archived = flagRun?.taskStatus === "archived" || !!flagRun?.confirmedFlag
   const accepted = flagRun?.taskStatus === "solved" || !!flagRun?.acceptedFlag || archived
-  const pendingCandidate = !!flag && !mismatch && !accepted && !live
+  const pendingCandidate = !!flag && !mismatch && !accepted && !live && flagRun?.id === run?.id
   const primaryKind = live
     ? "stop"
     : pendingCandidate
       ? "confirm"
-      : accepted && !archived
+      : run?.acceptedFlag && run.taskStatus !== "archived"
         ? "writeup"
         : "run"
 
   const rerun = async () => {
-    await actions.runChallenges([challenge.slug], { hint, runID: run?.id, settings })
+    await actions.runChallenges([challenge.slug], { hint, runID: run?.taskStatus === "archived" ? undefined : run?.id, settings })
     setHint("")
   }
 
@@ -298,7 +300,7 @@ export function Detail() {
     if (primaryKind === "stop") await actions.stopRun(challenge.slug)
     if (primaryKind === "confirm" && flagRun)
       await actions.reviewFlag(challenge.slug, flagRun, flag, true, hint)
-    if (primaryKind === "writeup" && flagRun) await actions.writeupRun(challenge.slug, flagRun.id)
+    if (primaryKind === "writeup" && run) await actions.writeupRun(challenge.slug, run.id)
     if (primaryKind === "run") await rerun()
   }
 
@@ -310,7 +312,7 @@ export function Detail() {
     ) : primaryKind === "writeup" ? (
       <><FileText className="icon sm" /> <span className="button-label">生成 Writeup</span></>
     ) : (
-      <><Play className="icon sm" /> <span className="button-label">{run ? "继续任务" : "开始任务"}</span></>
+      <><Play className="icon sm" /> <span className="button-label">{run?.taskStatus === "archived" ? "新建任务" : run ? "继续任务" : "开始任务"}</span></>
     )
 
   const verdictAction = async (action: "copy" | "wrong") => {
@@ -332,9 +334,9 @@ export function Detail() {
       : "运行中"
     : pendingCandidate
       ? "等待人工确认"
-      : archived
+      : run?.taskStatus === "archived"
         ? "已归档"
-        : accepted
+        : !!run?.acceptedFlag
           ? "已解出"
           : run
             ? "等待继续"
@@ -384,6 +386,11 @@ export function Detail() {
             {challenge.files.length} 个附件 · 独立任务 {challenge.runs.length}
             {run?.turns?.length ? ` · 已完成 ${run.turns.length} 轮` : run ? " · 进行中" : " · 未开始"}
           </p>
+          {challenge.runs.length > 1 && selectRun ? (
+            <select className="input" aria-label="任务历史" value={run?.id ?? ""} disabled={live} onChange={(event) => selectRun(event.target.value)}>
+              {[...challenge.runs].reverse().map((item) => <option key={item.id} value={item.id}>{item.id} · {item.taskStatus === "archived" ? "已归档" : item.stop === "running" ? "运行中" : item.stop === "queued" ? "排队中" : item.acceptedFlag ? "Flag 已确认" : "待继续"}</option>)}
+            </select>
+          ) : null}
         </div>
         <div className="ctf-header-metrics">
           <span><b>{compactNumber(run?.tokens ?? 0)}</b> tokens</span>

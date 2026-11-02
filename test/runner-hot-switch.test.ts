@@ -298,6 +298,25 @@ test("relaunches the runtime with the tier policy when worker model tiers change
   }
 })
 
+test("an external runtime lease survives configuration reload until it is released", async () => {
+  const fixture = await hotSwitchFixture()
+  const lease = await fixture.runner.acquireRuntime()
+  try {
+    await fixture.runner.applyLiveModelSettings({
+      economyModel: "openai/next", strongModel: "openai/old", consultModels: [],
+      blindReview: false, consultOnCompaction: false, network: "deny",
+    })
+    fixture.releaseTool()
+    await waitForIdle(fixture.runner)
+    expect(fixture.closed).not.toContain(1)
+    expect(fixture.runner.getRuntimeState().active).toBe(1)
+    lease.release()
+    lease.release()
+    expect(fixture.closed).toContain(1)
+    expect(fixture.runner.getRuntimeState().active).toBe(0)
+  } finally { lease.release(); await fixture.runner.close() }
+})
+
 test("adopts an unchanged tier policy without relaunching the runtime", async () => {
   const fixture = await hotSwitchFixture()
   try {

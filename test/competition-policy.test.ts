@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -309,6 +309,19 @@ test("stops submitting once a flag was accepted", async () => {
   const gate = gateSubmission({ ledger, candidate: "another", maxSubmissions: 15 })
   expect(gate.allowed).toBe(false)
   expect(gate).toMatchObject({ reason: expect.stringContaining("已有被平台接受") })
+})
+
+test("a corrupt or partially invalid ledger never resets the submission quota", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "boom-ledger-"))
+  roots.push(root)
+  const directory = path.join(root, "competition", "submissions")
+  await mkdir(directory, { recursive: true })
+  const target = path.join(directory, "one.json")
+  for (const raw of ["{broken", JSON.stringify({ version: 2, slug: "one", attempts: [] }),
+    JSON.stringify({ version: 1, slug: "one", attempts: [{ value: "used", verdict: "invalid", at: new Date().toISOString() }] })]) {
+    await writeFile(target, raw)
+    await expect(loadSubmissionLedger(root, "one")).rejects.toThrow("automatic submission is paused")
+  }
 })
 
 test("concurrent first adapter loads share one construction instead of a fake undefined", async () => {

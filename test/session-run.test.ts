@@ -145,6 +145,33 @@ beforeEach(() => {
 })
 
 describe("runChallenge integration seam", () => {
+  test("checks response-only usage and accumulates recovery costs", async () => {
+    const eighty = { input: 80, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+    promptResults = [
+      { ...finished, usage: eighty, finish: "length" },
+      { ...finished, usage: eighty },
+    ]
+    const outcome = await runChallenge(input({ limits: { tokens: 100, repeats: 5, timeout: 10_000 } }))
+    expect(outcome).toMatchObject({ stop: "budget", tokens: 160, billable: 160, cost: 0.5 })
+    expect(promptBodies).toHaveLength(2)
+  })
+
+  test("does not double-charge trailing step events against the final response", async () => {
+    eventStream = {
+      async *[Symbol.asyncIterator]() {
+        await Bun.sleep(10)
+        yield { type: "step-finish", sessionID: "session-1", usage: finished.usage!, cost: 0.25, reason: "stop" }
+      },
+    }
+    expect(await runChallenge(input())).toMatchObject({ tokens: 12, billable: 12, cost: 0.25 })
+  })
+
+  test("a response-only provider cannot report over-budget completion", async () => {
+    promptResults = [{ ...finished, usage: { input: 150, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }]
+    expect(await runChallenge(input({ limits: { tokens: 100, repeats: 5, timeout: 10_000 } })))
+      .toMatchObject({ stop: "budget", billable: 150 })
+    expect(promptBodies).toHaveLength(1)
+  })
   test("passes the hint to the first prompt and forwards normalized runtime events", async () => {
     eventStream = events([
       {
@@ -1232,9 +1259,8 @@ describe("runChallenge integration seam", () => {
     eventStream = {
       async *[Symbol.asyncIterator]() {
         while (promptBodies.length === 0) await pause()
-        // Two plain tools, then a durable note: the counter resets at the note, so the gate's
-        // threshold of three is never reached even though the turn runs many tools in total.
-        for (let index = 1; index <= 2; index += 1) {
+        // Reach the threshold first. A subsequent checkpoint must cancel the already pending gate.
+        for (let index = 1; index <= 3; index += 1) {
           yield {
             type: "tool-state",
             sessionID: "session-1",
@@ -1257,7 +1283,7 @@ describe("runChallenge integration seam", () => {
           tool: "ctf-note",
           state: { status: "completed", title: "note -> NOTES.md" },
         } as RuntimeEvent
-        for (let index = 3; index <= 4; index += 1) {
+        for (let index = 4; index <= 5; index += 1) {
           yield {
             type: "tool-state",
             sessionID: "session-1",
@@ -1275,15 +1301,19 @@ describe("runChallenge integration seam", () => {
         }
       },
     }
+    const seen: RunEvent[] = []
     const outcomePromise = runChallenge(input({
       purpose: "solve",
       limits: { tokens: 1_000, repeats: 5, timeout: 10_000, noteGateToolCalls: 3 },
+      onEvent: (event: RunEvent) => seen.push(event),
     }))
     await new Promise((resolve) => setTimeout(resolve, 100))
     resolvePrompt?.(finished)
     const outcome = await outcomePromise
 
     expect(promptBodies).toHaveLength(1)
+    expect(seen.some((event) => event.status === "note-gate")).toBe(true)
+    expect(seen.some((event) => event.status === "note-gate.hard")).toBe(false)
     expect(outcome).toMatchObject({ stop: "completed" })
   })
 })

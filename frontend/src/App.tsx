@@ -7,12 +7,14 @@ import {
   type MenuState,
 } from "./context"
 import { api } from "./api"
+import { READ_NOTICE_STORAGE_KEY, markRead, noticeScope, parseReadNotices, type ReadNotices } from "./notice-state"
 import { setNativeAppearance } from "./bridge"
 import {
   applyRunEvent,
   applyRunEventToDetail,
   applyRunnerNotification,
   currentRun,
+  detailRun,
   mergeRunEventState,
   orderedChallenges,
   resolveRunDetail,
@@ -37,37 +39,12 @@ import { ChallengeDialog } from "./challenge/ChallengeDialog"
 
 const REQUEST_TIMEOUT_MS = 10_000
 const EVENT_REPLAY_LIMIT = 2_000
-const READ_NOTICE_STORAGE_KEY = "boom-platform-read-notice-ids-v1"
-const LEGACY_READ_NOTICE_STORAGE_KEY = "boom-xihulunjian-read-notice-ids-v1"
-const MAX_REMEMBERED_NOTICE_IDS = 1_000
-
 function loadReadNoticeIDs() {
   try {
-    // Migrate the competition-era key on first read so previously read notices stay read.
-    if (localStorage.getItem(READ_NOTICE_STORAGE_KEY) === null && localStorage.getItem(LEGACY_READ_NOTICE_STORAGE_KEY) !== null)
-      localStorage.setItem(READ_NOTICE_STORAGE_KEY, localStorage.getItem(LEGACY_READ_NOTICE_STORAGE_KEY)!)
-    const stored = JSON.parse(localStorage.getItem(READ_NOTICE_STORAGE_KEY) ?? "[]")
-    if (!Array.isArray(stored)) return []
-    return [...new Set(stored.filter((id): id is number => Number.isSafeInteger(id) && id > 0))]
-      .slice(-MAX_REMEMBERED_NOTICE_IDS)
+    return parseReadNotices(localStorage.getItem(READ_NOTICE_STORAGE_KEY))
   } catch {
-    return []
+    return {}
   }
-}
-
-function detailRun(challenge: ChallengeGui, focused?: { slug: string; id: string } | null) {
-  const confirmed = [...challenge.runs].reverse().find(
-    (run) => run.taskStatus === "archived" || !!run.confirmedFlag,
-  )
-  const accepted = [...challenge.runs].reverse().find((run) => !!run.acceptedFlag)
-  return (
-    confirmed ??
-    accepted ??
-    [...challenge.runs].reverse().find((run) => run.stop === "running") ??
-    [...challenge.runs].reverse().find((run) => run.stop === "queued") ??
-    challenge.runs.find((run) => focused?.slug === challenge.slug && run.id === focused.id) ??
-    currentRun(challenge)
-  )
 }
 
 export default function App() {
@@ -75,6 +52,9 @@ export default function App() {
     localStorage.getItem("boom-theme") === "dark" ? "dark" : "light",
   )
   const [data, setData] = useState<GuiState | null>(null)
+  const [stateError, setStateError] = useState("")
+  const [refreshing, setRefreshing] = useState(true)
+  const stateErrorRef = useRef("")
   const [selected, setSelected] = useState("")
   const [detailSnapshot, setDetailSnapshot] = useState<RunDetailSnapshot | null>(null)
   const [filter, setFilter] = useState("")
@@ -89,7 +69,7 @@ export default function App() {
   const [now, setNow] = useState(Date.now())
   const [notices, setNotices] = useState<PlatformNotice[]>([])
   const [platform, setPlatform] = useState<PlatformSummary | null>(null)
-  const [readNoticeIDs, setReadNoticeIDs] = useState<number[]>(loadReadNoticeIDs)
+  const [readNoticeIDs, setReadNoticeIDs] = useState<ReadNotices>(loadReadNoticeIDs)
   const toastID = useRef(0)
   const dataRef = useRef<GuiState | null>(null)
   const selectedRef = useRef("")
@@ -97,6 +77,7 @@ export default function App() {
   const detailRequest = useRef(0)
   const detailAcceptedRequest = useRef(0)
   const detailSelectionEpoch = useRef(0)
+  const noticeRequest = useRef(0)
   const focusedRun = useRef<{ slug: string; id: string } | null>(null)
   const notificationLog = useRef<RunnerNotification[]>([])
   const sseDisconnected = useRef(false)
@@ -215,6 +196,7 @@ export default function App() {
       return
     }
     const operation = (async () => {
+      setRefreshing(true)
       try {
         do {
           refreshPending.current = false
@@ -269,6 +251,8 @@ export default function App() {
             const resetDetail = target !== current || (previousRoot !== undefined && previousRoot !== next.root)
             dataRef.current = next
             setData(next)
+            stateErrorRef.current = ""
+            setStateError("")
             if (target !== current) {
               selectedRef.current = target
               setSelected(target)
@@ -280,11 +264,6 @@ export default function App() {
               storeDetail(null)
             }
             const targetChallenge = next.challenges.find((challenge) => challenge.slug === target)
-            const resultTarget = targetChallenge
-              ? [...targetChallenge.runs].reverse().find(
-                  (run) => run.taskStatus === "archived" || !!run.confirmedFlag,
-                ) ?? [...targetChallenge.runs].reverse().find((run) => !!run.acceptedFlag)
-              : undefined
             const liveTarget = targetChallenge
               ? [...targetChallenge.runs].reverse().find((run) => run.stop === "running") ??
                 [...targetChallenge.runs].reverse().find((run) => run.stop === "queued")
@@ -294,8 +273,7 @@ export default function App() {
               targetChallenge.runs.some((run) => run.id === focusedRun.current?.id)
             const previousRunIDs = new Set(previousSelectedChallenge?.runs.map((run) => run.id) ?? [])
             const addedTarget = targetChallenge?.runs.findLast((run) => !previousRunIDs.has(run.id))
-            if (resultTarget) focusedRun.current = { slug: target, id: resultTarget.id }
-            else if (liveTarget) focusedRun.current = { slug: target, id: liveTarget.id }
+            if (liveTarget) focusedRun.current = { slug: target, id: liveTarget.id }
             else if (addedTarget) focusedRun.current = { slug: target, id: addedTarget.id }
             else if (!focusedStillExists) {
               const targetRun = currentRun(targetChallenge)
@@ -306,11 +284,15 @@ export default function App() {
             detailDirtyGeneration.current += 1
             void loadDetail(target)
           } catch (error) {
-            toast((error as Error).message, "error")
+            const message = error instanceof Error ? error.message : String(error)
+            if (dataRef.current && stateErrorRef.current !== message) toast(message, "error")
+            stateErrorRef.current = message
+            setStateError(message)
           }
         } while (refreshPending.current)
       } finally {
         refreshInFlight.current = null
+        setRefreshing(false)
       }
     })()
     refreshInFlight.current = operation
@@ -320,14 +302,17 @@ export default function App() {
   const refreshNotices = useCallback(async () => {
     // Notices are a competition-platform surface; the pentest workspace stays quiet about them.
     if (dataRef.current?.settings.mode === "pentest") return
+    const root = dataRef.current?.root
+    const request = ++noticeRequest.current
     try {
       const registry = await api<PlatformRegistry>("/api/platform", {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
-      setPlatform(registry.active)
       const result = await api<{ notices: PlatformNotice[] }>(`/api/platform/${registry.active.id}/notices`, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
+      if (request !== noticeRequest.current || root !== dataRef.current?.root) return
+      setPlatform(registry.active)
       setNotices(result.notices)
     } catch {
       // A missing credential or a transient platform error should not produce a toast every minute.
@@ -335,14 +320,12 @@ export default function App() {
     }
   }, [])
 
+  const noticeKey = noticeScope(data?.root ?? "", platform?.id ?? data?.settings.competition.platformId ?? "")
   const markNoticeRead = useCallback((id: number) => {
-    setReadNoticeIDs((current) => {
-      if (current.includes(id)) return current
-      return [...current].slice(-MAX_REMEMBERED_NOTICE_IDS)
-    })
-  }, [])
+    setReadNoticeIDs((current) => markRead(current, noticeKey, id))
+  }, [noticeKey])
 
-  const readNoticeIDSet = new Set(readNoticeIDs)
+  const readNoticeIDSet = new Set(readNoticeIDs[noticeKey] ?? [])
   const unreadNoticeCount = notices.reduce(
     (count, notice) => count + (readNoticeIDSet.has(notice.id) ? 0 : 1),
     0,
@@ -373,10 +356,13 @@ export default function App() {
   }, [refresh])
 
   useEffect(() => {
+    noticeRequest.current += 1
+    setNotices([])
+    setPlatform(null)
     void refreshNotices()
     const timer = window.setInterval(() => void refreshNotices(), 60_000)
-    return () => window.clearInterval(timer)
-  }, [refreshNotices])
+    return () => { window.clearInterval(timer); noticeRequest.current += 1 }
+  }, [refreshNotices, data?.root, data?.settings.mode, data?.settings.competition.platformId])
 
   useEffect(() => {
     try {
@@ -490,13 +476,25 @@ export default function App() {
     [loadDetail, storeDetail],
   )
 
+  const selectRun = useCallback((id: string) => {
+    const snapshot = dataRef.current
+    const slug = selectedRef.current
+    const run = snapshot?.challenges.find((item) => item.slug === slug)?.runs.find((item) => item.id === id)
+    if (!snapshot || !run) return
+    focusedRun.current = { slug, id }
+    detailSelectionEpoch.current += 1
+    detailAcceptedRequest.current = 0
+    storeDetail({ slug, run, instanceID: snapshot.instanceID, sequence: snapshot.sequence })
+    void loadDetail(slug)
+  }, [loadDetail, storeDetail])
+
   const toggleCollapsed = useCallback((category: string) => {
     setCollapsed((current) => {
       const next = new Set(current)
       if (next.has(category)) next.delete(category)
       else next.add(category)
       return next
-    })
+  })
   }, [])
 
   const openDialog = useCallback((name: Exclude<DialogName, null>) => {
@@ -526,12 +524,8 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (dialog) {
-        if (event.key === "Escape") {
-          if (!(event.target as HTMLElement).closest?.(".select")) setDialog(null)
-        }
-        return
-      }
+      // The dialog owns closing and its dirty/busy guard; global shortcuts must not bypass it.
+      if (dialog || event.defaultPrevented) return
       const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((event.target as HTMLElement).tagName)
       if (event.key === "Escape") {
         if (typing) (event.target as HTMLElement).blur()
@@ -597,6 +591,7 @@ export default function App() {
     platform,
     unreadNoticeCount,
     select,
+    selectRun,
     setFilter,
     toggleCollapsed,
     refresh,
@@ -619,14 +614,24 @@ export default function App() {
         <Rail />
         {data ? (
           pentest ? (
-            <PentestWorkspace />
+            <PentestWorkspace key={data.root} />
           ) : (
             <>
               <Queue />
               <Detail />
             </>
           )
-        ) : null}
+        ) : (
+          <main className="connection-state" aria-busy={refreshing}>
+            <div role={stateError ? "alert" : "status"}>
+              <h1>{stateError ? "暂时无法连接 Boom" : "正在连接 Boom…"}</h1>
+              <p>{stateError || "正在读取工作区与任务状态，请稍候。"}</p>
+              {stateError ? <button type="button" className="btn" disabled={refreshing} onClick={() => void refresh()}>
+                {refreshing ? "重试中…" : "重新连接"}
+              </button> : null}
+            </div>
+          </main>
+        )}
       </div>
       <ToastStack toasts={toasts} />
       <SettingsPopover />
@@ -637,7 +642,7 @@ export default function App() {
       {dialog === "notices" ? <NoticeDialog /> : null}
       {dialog === "armor" ? <ArmorPromptsDialog /> : null}
       {dialog === "delete" ? <DeleteDialog /> : null}
-      {dialog === "challenge" ? <ChallengeDialog /> : null}
+      {dialog === "challenge" ? <ChallengeDialog key={`${data?.root}:${challengeEditor?.mode === "edit" ? challengeEditor.slug : "new"}`} /> : null}
       {menu ? (
         <div
           className="menu-backdrop"

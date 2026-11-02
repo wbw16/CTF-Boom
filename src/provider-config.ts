@@ -4,6 +4,8 @@ import path from "node:path"
 import type { RuntimeModelPricing } from "./runtime-contract.ts"
 import { exactEndpointURL, isExactEndpoint } from "./runtime/provider-http.ts"
 import { boomHomeDirectory } from "./boom-home.ts"
+import { modelContext, runtimeModelLimits } from "./model-context.ts"
+export { BOOM_CONTEXT_LIMIT, DEFAULT_MODEL_CONTEXT } from "./model-context.ts"
 
 export type ManagedProviderDriver = "openai-compatible" | "openai" | "anthropic"
 
@@ -55,9 +57,6 @@ export type RuntimeProviderConfig = {
   disabled_providers?: string[]
   [key: string]: unknown
 }
-
-/** Boom's single declared model context window; the runtime compacts completed sessions at this boundary. */
-export const BOOM_CONTEXT_LIMIT = 300_000
 
 const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/
 const ARMOR_PROMPT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/
@@ -115,7 +114,7 @@ function model(value: unknown): ManagedModelConfig | undefined {
     id,
     ...(catalogID ? { catalogID } : {}),
     name: string(input.name) ?? id,
-    context: BOOM_CONTEXT_LIMIT,
+    context: modelContext(input.context),
     output: positiveInteger(input.output, 16_384),
     reasoning: input.reasoning === true,
     attachment: input.attachment === true,
@@ -362,7 +361,7 @@ export function mergeRuntimeProviderConfig(
           name: item.name,
           reasoning: item.reasoning,
           attachment: item.attachment,
-          limit: { context: BOOM_CONTEXT_LIMIT, output: item.output },
+          limit: runtimeModelLimits(item.context, item.output),
           modalities: {
             input: item.attachment ? ["text", "image"] : ["text"],
             output: ["text"],
@@ -392,8 +391,7 @@ export function mergeRuntimeProviderConfig(
       })(),
     }
   }
-  // Packaged and runtime-provided model entries must follow the same boundary as GUI-managed ones.
-  // Keep output limits provider-specific; only the total context window is product-owned here.
+  // Retain real capacity while bounding the input working window and reserving output/headroom.
   for (const [providerID, providerValue] of Object.entries(providers)) {
     const provider = object(providerValue)
     const models = object(provider?.models)
@@ -406,7 +404,8 @@ export function mergeRuntimeProviderConfig(
         const limit = object(configured.limit) ?? {}
         return [modelID, {
           ...configured,
-          limit: { ...limit, context: BOOM_CONTEXT_LIMIT },
+          limit: runtimeModelLimits(limit.context, positiveInteger(limit.output, 16_384),
+            typeof limit.input === "number" && limit.input > 0 ? limit.input : undefined),
         }]
       })),
     }

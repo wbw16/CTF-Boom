@@ -13,3 +13,8 @@ The optional benchmark under `benchmarks/ctftiny` is derived from the official
 [NYU-LLM-CTF/CTFTiny](https://github.com/NYU-LLM-CTF/CTFTiny) dataset. Its imported challenge
 material is licensed under GPL-2.0; the complete upstream license is retained as
 `benchmarks/ctftiny/LICENSE.CTFTINY`.
+
+The bundled `resources/runtime/skills/reverse-engineer-anything` skill is derived from REA
+([morluto/rea](https://github.com/morluto/rea), version 6.4.0). REA is distributed under the MIT
+License; the complete upstream license is retained in that skill directory. The skill text has been
+adapted for Boom's `rea_tools` / `rea_call` MCP bridge and its managed MCP configuration.
